@@ -23,10 +23,12 @@ from ddgs import DDGS
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+import memory
+
 app = FastAPI()
 
 LLAMA_SERVER_URL = "http://localhost:8080"
-MAX_TOOL_ITERATIONS = 5  # safety cap so a confused model can't loop forever
+MAX_TOOL_ITERATIONS = 8  # raised from 5 to allow longer reasoning chains
 
 # The ONLY folder the agent is allowed to read files from.
 SAFE_FILES_DIR = (Path(__file__).parent / "agent_files").resolve()
@@ -40,6 +42,24 @@ SAFE_FILES_DIR.mkdir(exist_ok=True)
 
 def get_current_time(args: dict) -> str:
     return datetime.now().strftime("%A, %Y-%m-%d %H:%M:%S")
+
+
+def calculate(args: dict) -> str:
+    expression = args.get("expression", "")
+    if not expression:
+        return "Error: no expression provided."
+
+    # Only allow digits, arithmetic operators, parentheses, decimals, and
+    # whitespace - blocks any attempt to run arbitrary Python via eval.
+    allowed = set("0123456789.+-*/() \t")
+    if not set(expression) <= allowed:
+        return "Error: expression contains characters that aren't allowed (only numbers and + - * / ( ) are permitted)."
+
+    try:
+        result = eval(expression, {"__builtins__": {}}, {})
+        return str(result)
+    except Exception as e:
+        return f"Error evaluating expression: {e}"
 
 
 def web_search(args: dict) -> str:
@@ -65,6 +85,71 @@ def list_files(args: dict) -> str:
     if not files:
         return f"No files in {SAFE_FILES_DIR}."
     return "\n".join(files)
+
+
+def get_weather(args: dict) -> str:
+    location = args.get("location", "")
+    if not location:
+        return "Error: no location provided."
+
+    try:
+        geo_resp = httpx.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": location, "count": 1},
+            timeout=10,
+        )
+        geo_results = geo_resp.json().get("results")
+        if not geo_results:
+            return f"Could not find a location matching '{location}'."
+
+        place = geo_results[0]
+        lat, lon = place["latitude"], place["longitude"]
+
+        weather_resp = httpx.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,weather_code,wind_speed_10m",
+            },
+            timeout=10,
+        )
+        current = weather_resp.json().get("current", {})
+        if "temperature_2m" not in current:
+            return "Weather service did not return current data."
+
+        name = place.get("name", location)
+        country = place.get("country", "")
+        return (
+            f"Current weather in {name}, {country}: "
+            f"{current['temperature_2m']}°C, "
+            f"wind {current.get('wind_speed_10m')} km/h "
+            f"(observed at {current.get('time')})"
+        )
+    except Exception as e:
+        return f"Weather lookup failed: {e}"
+
+
+def save_memory_tool(args: dict) -> str:
+    fact = args.get("fact", "")
+    if not fact:
+        return "Error: no fact provided."
+    memory.save_memory(fact)
+    return f"Saved to long-term memory: {fact}"
+
+
+def search_documents_tool(args: dict) -> str:
+    query = args.get("query", "")
+    if not query:
+        return "Error: no query provided."
+    results = memory.search_documents(query, SAFE_FILES_DIR)
+    if not results:
+        return "No relevant content found in the indexed documents."
+    lines = []
+    for source, text in results:
+        snippet = text.strip().replace("\n", " ")[:400]
+        lines.append(f"[{source}]: {snippet}")
+    return "\n".join(lines)
 
 
 def read_file(args: dict) -> str:
@@ -98,6 +183,20 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "calculate",
+            "description": "Evaluate an exact arithmetic expression (numbers and + - * / ( ) only). Always use this for any math instead of computing it yourself.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "e.g. '(2026 - 1889)'"}
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": "Search the web for current information not in your training data.",
             "parameters": {
@@ -112,9 +211,51 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_weather",
+            "description": "Get the current real-world weather and temperature for a specific place. Always use this instead of web_search for weather/temperature questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City and country, e.g. 'Amsterdam, Netherlands'."}
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_files",
             "description": "List the files available for reading.",
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": "Save an important fact about the user for recall in future conversations (e.g. their name, preferences, ongoing projects). Do not save trivial small talk.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string", "description": "The fact to remember, written as a standalone sentence."}
+                },
+                "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_documents",
+            "description": "Semantically search the user's uploaded .txt documents for relevant passages. Use this to find specific information within long or multiple documents, instead of read_file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to search for."}
+                },
+                "required": ["query"],
+            },
         },
     },
     {
@@ -135,9 +276,13 @@ TOOLS = [
 
 TOOL_FUNCTIONS = {
     "get_current_time": get_current_time,
+    "calculate": calculate,
     "web_search": web_search,
+    "get_weather": get_weather,
     "list_files": list_files,
     "read_file": read_file,
+    "save_memory": save_memory_tool,
+    "search_documents": search_documents_tool,
 }
 
 
@@ -162,6 +307,50 @@ async def chat_completions(request: Request):
     upstream_body["tools"] = TOOLS
     upstream_body["tool_choice"] = "auto"
 
+    tool_instruction = {
+        "role": "system",
+        "content": (
+            "You have tools available: get_current_time, calculate, web_search, "
+            "get_weather, list_files, read_file, save_memory, search_documents. "
+            "You MUST call the relevant tool whenever the user asks about current "
+            "events, real-time facts, dates/times, weather, exact arithmetic, or "
+            "anything you are not fully certain of from memory. For weather/"
+            "temperature questions, always use get_weather, never web_search. Use "
+            "search_documents (not read_file) when looking for specific "
+            "information inside long or multiple documents. Use calculate for any "
+            "arithmetic instead of computing it yourself. Call save_memory when "
+            "the user shares a durable fact about themselves worth remembering - "
+            "not for small talk. "
+            "IMPORTANT for multi-step questions: if answering fully requires "
+            "several pieces of information, call tools one at a time in sequence, "
+            "using each result to decide your next step, before giving your final "
+            "answer. Do not stop after one tool call if the question isn't fully "
+            "answered yet. Never guess or invent facts, dates, statistics, or "
+            "search results that a tool could actually check for you. If a tool "
+            "returns no useful result, say so honestly instead of making "
+            "something up."
+        ),
+    }
+    messages_to_prepend = [tool_instruction]
+
+    # Auto-recall: silently check if any saved memories are relevant to what
+    # the user just said, and inject them - no tool call needed for this part.
+    last_user_msg = next(
+        (m["content"] for m in reversed(body["messages"]) if m.get("role") == "user"),
+        None,
+    )
+    if last_user_msg:
+        relevant = await asyncio.to_thread(memory.search_memories, last_user_msg)
+        if relevant:
+            print(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
+            messages_to_prepend.append({
+                "role": "system",
+                "content": "Relevant things you remember about this user from past "
+                            "conversations:\n" + "\n".join(f"- {m}" for m in relevant),
+            })
+
+    upstream_body["messages"] = messages_to_prepend + upstream_body["messages"]
+
     final_data = None
 
     async with httpx.AsyncClient(timeout=None) as client:
@@ -175,8 +364,11 @@ async def chat_completions(request: Request):
             tool_calls = message.get("tool_calls")
             if not tool_calls:
                 # No tool requested -> this is the final answer.
+                print("[AGENT] Model answered directly, without calling any tool.")
                 final_data = data
                 break
+
+            print(f"[AGENT] Model requested {len(tool_calls)} tool call(s)")
 
             # The model wants to call one or more tools.
             # 1. Add its tool-call message to the conversation.
@@ -195,6 +387,9 @@ async def chat_completions(request: Request):
                     result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
                 else:
                     result = f"Error: unknown tool '{name}'"
+
+                print(f"[AGENT] {name}({args}) ->")
+                print(f"[AGENT]   {str(result)[:400]}")
 
                 upstream_body["messages"].append(
                     {
