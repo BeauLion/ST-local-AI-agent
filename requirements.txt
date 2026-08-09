@@ -4,3 +4,4 @@ httpx
 ddgs
 sentence-transformers
 numpy
+docker

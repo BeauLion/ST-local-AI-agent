@@ -15,8 +15,11 @@ Run with:
 
 import asyncio
 import json
+import tempfile
 from datetime import datetime
 from pathlib import Path
+
+import docker
 
 import httpx
 from ddgs import DDGS
@@ -152,6 +155,61 @@ def search_documents_tool(args: dict) -> str:
     return "\n".join(lines)
 
 
+_docker_client = None
+
+
+def _get_docker_client():
+    global _docker_client
+    if _docker_client is None:
+        _docker_client = docker.from_env()
+    return _docker_client
+
+
+def run_python(args: dict) -> str:
+    code = args.get("code", "")
+    if not code:
+        return "Error: no code provided."
+
+    try:
+        client = _get_docker_client()
+    except Exception as e:
+        return f"Error: Docker isn't available ({e}). Is Docker Desktop running?"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        script_path = Path(tmp_dir) / "snippet.py"
+        script_path.write_text(code, encoding="utf-8")
+
+        container = None
+        try:
+            container = client.containers.run(
+                "python:3.12-slim",
+                command=["python", "/sandbox/snippet.py"],
+                volumes={tmp_dir: {"bind": "/sandbox", "mode": "ro"}},
+                working_dir="/sandbox",
+                network_disabled=True,   # no internet access from inside
+                mem_limit="256m",
+                nano_cpus=1_000_000_000,  # capped at 1 CPU core
+                detach=True,
+            )
+            result = container.wait(timeout=10)
+            exit_code = result.get("StatusCode", 1)
+            logs = container.logs().decode("utf-8", errors="replace")[-3000:]
+        except docker.errors.ImageNotFound:
+            return "Error: python:3.12-slim image not found. Run 'docker pull python:3.12-slim' once."
+        except Exception as e:
+            return f"Error running sandboxed code: {e}"
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
+
+        if exit_code != 0:
+            return f"Exit code {exit_code}. Output:\n{logs}"
+        return logs or "(no output, nothing was printed)"
+
+
 def read_file(args: dict) -> str:
     filename = args.get("filename", "")
     if not filename:
@@ -261,6 +319,20 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "run_python",
+            "description": "Run a short Python snippet for calculations, data processing, or logic too complex for the calculate tool. Executes in an isolated Docker container with no network access and a 10-second timeout. Use print() for output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python code. Use print() to produce output."}
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
             "description": "Read the contents of a file from the allowed files folder.",
             "parameters": {
@@ -277,6 +349,7 @@ TOOLS = [
 TOOL_FUNCTIONS = {
     "get_current_time": get_current_time,
     "calculate": calculate,
+    "run_python": run_python,
     "web_search": web_search,
     "get_weather": get_weather,
     "list_files": list_files,
@@ -310,17 +383,17 @@ async def chat_completions(request: Request):
     tool_instruction = {
         "role": "system",
         "content": (
-            "You have tools available: get_current_time, calculate, web_search, "
-            "get_weather, list_files, read_file, save_memory, search_documents. "
-            "You MUST call the relevant tool whenever the user asks about current "
-            "events, real-time facts, dates/times, weather, exact arithmetic, or "
-            "anything you are not fully certain of from memory. For weather/"
-            "temperature questions, always use get_weather, never web_search. Use "
-            "search_documents (not read_file) when looking for specific "
-            "information inside long or multiple documents. Use calculate for any "
-            "arithmetic instead of computing it yourself. Call save_memory when "
-            "the user shares a durable fact about themselves worth remembering - "
-            "not for small talk. "
+            "You have tools available: get_current_time, calculate, run_python, "
+            "web_search, get_weather, list_files, read_file, save_memory, "
+            "search_documents. You MUST call the relevant tool whenever the user "
+            "asks about current events, real-time facts, dates/times, weather, "
+            "exact arithmetic, or anything you are not fully certain of from "
+            "memory. For weather/temperature questions, always use get_weather, "
+            "never web_search. Use search_documents (not read_file) when looking "
+            "for specific information inside long or multiple documents. Use "
+            "calculate for simple arithmetic, or run_python for anything needing "
+            "actual code logic. Call save_memory when the user shares a durable "
+            "fact about themselves worth remembering - not for small talk. "
             "IMPORTANT for multi-step questions: if answering fully requires "
             "several pieces of information, call tools one at a time in sequence, "
             "using each result to decide your next step, before giving your final "
