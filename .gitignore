@@ -1,0 +1,27 @@
+# Virtual environment (huge, machine-specific, never commit)
+venv/
+
+# Python cache/bytecode
+__pycache__/
+*.pyc
+
+# Model files (GGUF can be 5-15GB+, GitHub will reject pushes over 100MB anyway)
+*.gguf
+models/
+
+# Personal memory & RAG data (this is YOUR data, not code. Don't leak it to a public/shared repo)
+memory_data/
+
+# User-provided documents for RAG (same reasoning. Personal content)
+agent_files/*
+!agent_files/.gitkeep
+
+# Environment variables / secrets, if you ever add an .env file later
+.env
+
+# VS Code workspace settings (optional. Some people like sharing these, some don't)
+.vscode/
+
+# OS clutter
+.DS_Store
+Thumbs.db
