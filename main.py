@@ -427,8 +427,7 @@ async def agent_loop(upstream_body: dict):
                     if mode is None:
                         mode = "content"
                     content += delta_content
-                    if mode == "content":
-                        yield ("delta", delta_content)
+                    # buffered, not yielded here — see below
 
             if mode == "tool_calls" and tool_calls:
                 message = {
@@ -466,6 +465,8 @@ async def agent_loop(upstream_body: dict):
 
             # No tool call -> this is the final answer (already streamed above).
             print("[AGENT] Model answered directly, without calling any tool.")
+            if content:
+                yield ("delta", content)
             yield ("done", {"role": "assistant", "content": content})
             return
 
@@ -509,6 +510,10 @@ async def chat_completions(request: Request):
             "search results that a tool could actually check for you. If a tool "
             "returns no useful result, say so honestly instead of making "
             "something up."
+            "When you decide to call a tool, call it directly - "
+            "do not write any explanation, plan, or commentary before or "
+            "alongside the tool call. Save your explanation, if any, for your "
+            "final answer after the tool result comes back."
         ),
     }
     messages_to_prepend = [tool_instruction]
