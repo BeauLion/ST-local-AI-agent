@@ -19,7 +19,10 @@ import json
 from pathlib import Path
 
 import numpy as np
+from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
+
+DOC_EXTENSIONS = (".txt", ".pdf")
 
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 _model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
@@ -80,6 +83,23 @@ def search_memories(query: str, top_k: int = 3) -> list:
 
 # --------------------------- Document RAG ---------------------------
 
+def extract_text(file: Path, max_chars: int = None) -> str:
+    """Read a document's text. For PDFs, stops parsing pages once max_chars
+    is reached instead of extracting the whole file just to truncate it."""
+    if file.suffix.lower() == ".pdf":
+        reader = PdfReader(str(file))
+        parts = []
+        total = 0
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            parts.append(page_text)
+            total += len(page_text)
+            if max_chars is not None and total >= max_chars:
+                break
+        return "\n".join(parts)
+    return file.read_text(encoding="utf-8", errors="replace")
+
+
 def _load_doc_index() -> dict:
     if DOC_INDEX_FILE.exists():
         return json.loads(DOC_INDEX_FILE.read_text(encoding="utf-8"))
@@ -104,7 +124,8 @@ def _reindex_if_changed(folder: Path) -> dict:
     index = _load_doc_index()
     changed = False
 
-    current_files = {f.name for f in folder.glob("*.txt")}
+    doc_files = [f for f in folder.iterdir() if f.suffix.lower() in DOC_EXTENSIONS]
+    current_files = {f.name for f in doc_files}
 
     # Drop chunks for files that were deleted.
     removed = set(index["files"]) - current_files
@@ -114,13 +135,13 @@ def _reindex_if_changed(folder: Path) -> dict:
             del index["files"][name]
         changed = True
 
-    for file in folder.glob("*.txt"):
+    for file in doc_files:
         mtime = file.stat().st_mtime
         if index["files"].get(file.name) == mtime:
             continue  # unchanged since last index
 
         index["chunks"] = [c for c in index["chunks"] if c["source"] != file.name]
-        text = file.read_text(encoding="utf-8", errors="replace")
+        text = extract_text(file)
         for chunk in _chunk_text(text):
             index["chunks"].append({"source": file.name, "text": chunk, "embedding": embed(chunk)})
         index["files"][file.name] = mtime

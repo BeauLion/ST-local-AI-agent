@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 
 import docker
-from pypdf import PdfReader
 
 import httpx
 from ddgs import DDGS
@@ -225,12 +224,7 @@ def read_file(args: dict) -> str:
         return f"Error: '{filename}' not found."
 
     try:
-        if target.suffix.lower() == ".pdf":
-            reader = PdfReader(str(target))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        else:
-            text = target.read_text(encoding="utf-8", errors="replace")
-        return text[:5000]
+        return memory.extract_text(target, max_chars=5000)[:5000]
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -312,7 +306,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_documents",
-            "description": "Semantically search the user's uploaded .txt documents for relevant passages. Use this to find specific information within long or multiple documents, instead of read_file.",
+            "description": "Semantically search the user's uploaded .txt and .pdf documents for relevant passages. Use this to find specific information within long or multiple documents, instead of read_file.",
             "parameters": {
                 "type": "object",
                 "properties": {
