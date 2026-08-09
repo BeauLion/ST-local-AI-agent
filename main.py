@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 import docker
+from pypdf import PdfReader
 
 import httpx
 from ddgs import DDGS
@@ -224,7 +225,12 @@ def read_file(args: dict) -> str:
         return f"Error: '{filename}' not found."
 
     try:
-        return target.read_text(encoding="utf-8", errors="replace")[:5000]
+        if target.suffix.lower() == ".pdf":
+            reader = PdfReader(str(target))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        else:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        return text[:5000]
     except Exception as e:
         return f"Error reading file: {e}"
 
