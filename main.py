@@ -368,15 +368,122 @@ async def list_models():
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
 
+async def _stream_chat(client: httpx.AsyncClient, body: dict):
+    """POST one chat-completion request with stream=True and yield the
+    decoded JSON of each SSE chunk from llama-server."""
+    async with client.stream(
+        "POST", f"{LLAMA_SERVER_URL}/v1/chat/completions", json=body
+    ) as resp:
+        async for line in resp.aiter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):]
+            if payload.strip() == "[DONE]":
+                return
+            yield json.loads(payload)
+
+
+async def agent_loop(upstream_body: dict):
+    """
+    Drives the tool-calling loop against llama-server, streaming the whole
+    way. Yields:
+      ("delta", text)   - a piece of the FINAL answer, forwarded the moment
+                           it's clear this iteration isn't a tool call.
+      ("done", message) - the complete final assistant message (role +
+                           content), once the loop is finished.
+    Tool-call iterations are executed internally and never reach the caller
+    as deltas - only the model's eventual direct answer streams through.
+    """
+    async with httpx.AsyncClient(timeout=None) as client:
+        for _ in range(MAX_TOOL_ITERATIONS):
+            content = ""
+            tool_calls = {}
+            mode = None  # becomes "content" or "tool_calls" once known
+
+            async for chunk in _stream_chat(client, upstream_body):
+                delta = chunk["choices"][0].get("delta", {})
+
+                delta_tool_calls = delta.get("tool_calls")
+                if delta_tool_calls:
+                    mode = "tool_calls"
+                    for tc in delta_tool_calls:
+                        idx = tc.get("index", 0)
+                        entry = tool_calls.setdefault(
+                            idx,
+                            {"id": None, "type": "function",
+                             "function": {"name": "", "arguments": ""}},
+                        )
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            entry["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            entry["function"]["arguments"] += fn["arguments"]
+                    continue
+
+                delta_content = delta.get("content")
+                if delta_content:
+                    if mode is None:
+                        mode = "content"
+                    content += delta_content
+                    if mode == "content":
+                        yield ("delta", delta_content)
+
+            if mode == "tool_calls" and tool_calls:
+                message = {
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": [tool_calls[i] for i in sorted(tool_calls)],
+                }
+                print(f"[AGENT] Model requested {len(message['tool_calls'])} tool call(s)")
+                upstream_body["messages"].append(message)
+
+                for call in message["tool_calls"]:
+                    name = call["function"]["name"]
+                    try:
+                        args = json.loads(call["function"].get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    if name in TOOL_FUNCTIONS:
+                        # Run in a thread so a slow web search doesn't freeze the server.
+                        result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
+                    else:
+                        result = f"Error: unknown tool '{name}'"
+
+                    print(f"[AGENT] {name}({args}) ->")
+                    print(f"[AGENT]   {str(result)[:400]}")
+
+                    upstream_body["messages"].append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": str(result),
+                        }
+                    )
+                continue  # loop again so the model can use the tool result
+
+            # No tool call -> this is the final answer (already streamed above).
+            print("[AGENT] Model answered directly, without calling any tool.")
+            yield ("done", {"role": "assistant", "content": content})
+            return
+
+        # Hit MAX_TOOL_ITERATIONS without a final answer - bail out safely.
+        bail_message = "(Agent stopped: too many tool calls in a row.)"
+        yield ("delta", bail_message)
+        yield ("done", {"role": "assistant", "content": bail_message})
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
     client_wants_stream = body.get("stream", False)
 
-    # We handle streaming ourselves at the end, after the tool loop is done.
-    # This makes the loop logic far simpler.
+    # We always stream from llama-server internally (agent_loop needs deltas
+    # to detect tool calls early), regardless of what the client asked for.
     upstream_body = dict(body)
-    upstream_body["stream"] = False
+    upstream_body["stream"] = True
     upstream_body["tools"] = TOOLS
     upstream_body["tool_choice"] = "auto"
 
@@ -424,89 +531,30 @@ async def chat_completions(request: Request):
 
     upstream_body["messages"] = messages_to_prepend + upstream_body["messages"]
 
-    final_data = None
-
-    async with httpx.AsyncClient(timeout=None) as client:
-        for _ in range(MAX_TOOL_ITERATIONS):
-            resp = await client.post(
-                f"{LLAMA_SERVER_URL}/v1/chat/completions", json=upstream_body
-            )
-            data = resp.json()
-            message = data["choices"][0]["message"]
-
-            tool_calls = message.get("tool_calls")
-            if not tool_calls:
-                # No tool requested -> this is the final answer.
-                print("[AGENT] Model answered directly, without calling any tool.")
-                final_data = data
-                break
-
-            print(f"[AGENT] Model requested {len(tool_calls)} tool call(s)")
-
-            # The model wants to call one or more tools.
-            # 1. Add its tool-call message to the conversation.
-            upstream_body["messages"].append(message)
-
-            # 2. Execute each requested tool and add the result.
-            for call in tool_calls:
-                name = call["function"]["name"]
-                try:
-                    args = json.loads(call["function"].get("arguments") or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-
-                if name in TOOL_FUNCTIONS:
-                    # Run in a thread so a slow web search doesn't freeze the server.
-                    result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
-                else:
-                    result = f"Error: unknown tool '{name}'"
-
-                print(f"[AGENT] {name}({args}) ->")
-                print(f"[AGENT]   {str(result)[:400]}")
-
-                upstream_body["messages"].append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": str(result),
-                    }
-                )
-            # loop again so the model can use the tool result
-
-        if final_data is None:
-            # Hit MAX_TOOL_ITERATIONS without a final answer - bail out safely.
-            final_data = {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "(Agent stopped: too many tool calls in a row.)",
-                        },
-                        "finish_reason": "stop",
-                    }
-                ]
-            }
-
-    final_message = final_data["choices"][0]["message"]
-
     if not client_wants_stream:
+        final_message = {"role": "assistant", "content": ""}
+        async for kind, payload in agent_loop(upstream_body):
+            if kind == "done":
+                final_message = payload
+        final_data = {
+            "choices": [{"message": final_message, "finish_reason": "stop"}]
+        }
         return JSONResponse(content=final_data)
 
-    # Client wanted streaming - fake a single-chunk SSE stream so
-    # SillyTavern (which expects text/event-stream) still parses it correctly.
-    async def fake_stream():
-        chunk = {
-            "choices": [
-                {
-                    "delta": {"content": final_message.get("content", "")},
-                    "finish_reason": None,
+    # Client wants real streaming: forward each content delta to SillyTavern
+    # the moment it arrives from llama-server.
+    async def event_stream():
+        async for kind, payload in agent_loop(upstream_body):
+            if kind == "delta":
+                chunk = {
+                    "choices": [{"delta": {"content": payload}, "finish_reason": None}]
                 }
-            ]
-        }
-        yield f"data: {json.dumps(chunk)}\n\n".encode()
+                yield f"data: {json.dumps(chunk)}\n\n".encode()
+            # "done" carries the full message for the non-streaming path only;
+            # its content has already been sent as deltas above.
 
         done_chunk = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
         yield f"data: {json.dumps(done_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(fake_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
