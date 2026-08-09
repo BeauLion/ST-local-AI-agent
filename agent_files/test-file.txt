@@ -1,8 +1,0 @@
-Roadmap (phases, each one working and testable before the next):
-
-1. Environment + baseline — CUDA toolkit, build llama.cpp, download model, run llama-server, connect SillyTavern directly to it (no agent yet) to confirm the raw pipeline works.
-2. Agent skeleton — FastAPI server that proxies chat between SillyTavern and llama-server, speaking OpenAI's /v1/chat/completions format. SillyTavern points here instead.
-3. Tool-calling loop — model requests a tool → agent executes it → feeds result back → model continues, until it gives a final answer.
-4. Memory/RAG — embeddings + local vector store so the agent recalls past conversations and can search your own files.
-5. Real tools — web search, file access, sandboxed code execution.
-6. Polish — streaming, error handling, maybe a small config file instead of hardcoded values.
