@@ -1,3 +1,6 @@
+#llama.ccp folder
+llama.cpp/
+
 # Virtual environment (huge, machine-specific, never commit)
 venv/
 

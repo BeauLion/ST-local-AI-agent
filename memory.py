@@ -22,12 +22,18 @@ import numpy as np
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
+from config import (
+    DOCUMENT_SIMILARITY_THRESHOLD,
+    EMBEDDING_MODEL,
+    MEMORY_DATA_DIR,
+    MEMORY_SIMILARITY_THRESHOLD,
+)
+
 DOC_EXTENSIONS = (".txt", ".pdf")
 
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-_model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
+_model = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
 
-DATA_DIR = Path(__file__).parent / "memory_data"
+DATA_DIR = Path(MEMORY_DATA_DIR)
 DATA_DIR.mkdir(exist_ok=True)
 
 MEMORY_FILE = DATA_DIR / "memories.json"
@@ -70,7 +76,7 @@ def save_memory(text: str):
 
 def search_memories(query: str, top_k: int = 3) -> list:
     memories = _load_memories()
-    results = _cosine_search(embed(query), memories, top_k=top_k, min_score=0.15)
+    results = _cosine_search(embed(query), memories, top_k=top_k, min_score=MEMORY_SIMILARITY_THRESHOLD)
     print(f"[MEMORY] Query: {query!r}")
     for m, score in results:
         print(f"[MEMORY]   {score:.3f}  {m['text']}")
@@ -154,5 +160,5 @@ def _reindex_if_changed(folder: Path) -> dict:
 
 def search_documents(query: str, folder: Path, top_k: int = 4) -> list:
     index = _reindex_if_changed(folder)
-    results = _cosine_search(embed(query), index["chunks"], top_k=top_k)
+    results = _cosine_search(embed(query), index["chunks"], top_k=top_k, min_score=DOCUMENT_SIMILARITY_THRESHOLD)
     return [(r["source"], r["text"]) for r, score in results]
