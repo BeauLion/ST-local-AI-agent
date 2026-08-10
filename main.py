@@ -840,7 +840,7 @@ async def agent_loop(upstream_body: dict):
                         idx = tc.get("index", 0)
                         entry = tool_calls.setdefault(
                             idx,
-                            {"id": None, "type": "function",
+                            {"index": idx, "id": None, "type": "function",
                              "function": {"name": "", "arguments": ""}},
                         )
                         if tc.get("id"):
