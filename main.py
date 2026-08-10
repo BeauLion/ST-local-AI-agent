@@ -797,12 +797,32 @@ async def agent_loop(upstream_body: dict):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
     way. Yields:
-      ("delta", text)   - a piece of the FINAL answer, forwarded the moment
-                           it's clear this iteration isn't a tool call.
-      ("done", message) - the complete final assistant message (role +
-                           content), once the loop is finished.
-    Tool-call iterations are executed internally and never reach the caller
-    as deltas - only the model's eventual direct answer streams through.
+      ("delta", text)    - a piece of the FINAL answer, forwarded the
+                            moment it's clear this iteration isn't a tool
+                            call.
+      ("done", message)  - the complete final assistant message (role +
+                            content), once the loop is finished.
+      ("handoff", message) - the model wants to call one or more tools this
+                            server doesn't own (registered client-side by a
+                            SillyTavern extension, e.g. the check-ins
+                            extension's schedule_character_action). Passed
+                            back to the caller UNRESOLVED, exactly as
+                            llama-server produced it, so SillyTavern can run
+                            its own registered handler and continue the
+                            conversation itself. The loop stops here - this
+                            server never guesses at a client tool's result.
+
+    Tool-call iterations for tools this server DOES own are executed
+    internally and never reach the caller as deltas - only the model's
+    eventual direct answer, or a handoff, does.
+
+    Simplification: if a single model turn requests a MIX of server-owned
+    and client-owned tools together, the whole turn is handed off unresolved
+    rather than partially executed - partially resolving would leave some
+    tool_call_ids answered and others not, which breaks the next request.
+    This is rare in practice (mixed-origin tool calls in one turn); if it
+    happens, the server-owned tools simply get called again next turn once
+    the client resolves its half and sends the follow-up request.
     """
     async with httpx.AsyncClient(timeout=None) as client:
         for _ in range(MAX_TOOL_ITERATIONS):
@@ -840,26 +860,28 @@ async def agent_loop(upstream_body: dict):
                     # buffered, not yielded here — see below
 
             if mode == "tool_calls" and tool_calls:
-                message = {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": [tool_calls[i] for i in sorted(tool_calls)],
-                }
-                print(f"[AGENT] Model requested {len(message['tool_calls'])} tool call(s)")
+                calls = [tool_calls[i] for i in sorted(tool_calls)]
+                message = {"role": "assistant", "content": content or None, "tool_calls": calls}
+
+                unknown = [c for c in calls if c["function"]["name"] not in TOOL_FUNCTIONS]
+                if unknown:
+                    names = [c["function"]["name"] for c in unknown]
+                    print(f"[AGENT] Handing off {len(unknown)} client-owned tool call(s) to SillyTavern: {names}")
+                    yield ("handoff", message)
+                    return
+
+                print(f"[AGENT] Model requested {len(calls)} tool call(s)")
                 upstream_body["messages"].append(message)
 
-                for call in message["tool_calls"]:
+                for call in calls:
                     name = call["function"]["name"]
                     try:
                         args = json.loads(call["function"].get("arguments") or "{}")
                     except json.JSONDecodeError:
                         args = {}
 
-                    if name in TOOL_FUNCTIONS:
-                        # Run in a thread so a slow web search doesn't freeze the server.
-                        result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
-                    else:
-                        result = f"Error: unknown tool '{name}'"
+                    # Run in a thread so a slow web search doesn't freeze the server.
+                    result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
 
                     print(f"[AGENT] {name}({args}) ->")
                     print(f"[AGENT]   {str(result)[:400]}")
@@ -891,11 +913,25 @@ async def chat_completions(request: Request):
     body = await request.json()
     client_wants_stream = body.get("stream", False)
 
+    # SillyTavern extensions can register their own tools (e.g. the
+    # check-ins extension's schedule_character_action) - these arrive as
+    # `tools` on the incoming request. Merge them in alongside this
+    # server's own list instead of discarding them: any client tool whose
+    # name doesn't collide with one of ours gets added, so the model can
+    # call it. Calls to these are handed back to SillyTavern unresolved by
+    # agent_loop (see "handoff" above) instead of this server guessing at
+    # an answer.
+    client_tools = [
+        t for t in (body.get("tools") or [])
+        if isinstance(t, dict) and t.get("function", {}).get("name") not in TOOL_FUNCTIONS
+    ]
+    client_tool_names = {t["function"]["name"] for t in client_tools if t.get("function", {}).get("name")}
+
     # We always stream from llama-server internally (agent_loop needs deltas
     # to detect tool calls early), regardless of what the client asked for.
     upstream_body = dict(body)
     upstream_body["stream"] = True
-    upstream_body["tools"] = TOOLS
+    upstream_body["tools"] = TOOLS + client_tools
     upstream_body["tool_choice"] = "auto"
 
     tool_instruction = {
@@ -931,6 +967,13 @@ async def chat_completions(request: Request):
             "Project-manager changes apply immediately - there is no separate "
             "confirmation step, so only call these tools when the user's intent is "
             "unambiguous. "
+            + (
+                f"Additional tools provided by the connected frontend are also "
+                f"available this turn: {', '.join(sorted(client_tool_names))}. Call "
+                f"them normally, following their own descriptions, when they fit "
+                f"the user's request. "
+                if client_tool_names else ""
+            ) +
             "IMPORTANT for multi-step questions: if answering fully requires "
             "several pieces of information, call tools one at a time in sequence, "
             "using each result to decide your next step, before giving your final "
@@ -975,28 +1018,47 @@ async def chat_completions(request: Request):
 
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
+        finish_reason = "stop"
         async for kind, payload in agent_loop(upstream_body):
-            if kind == "done":
+            if kind in ("done", "handoff"):
                 final_message = payload
+                finish_reason = "tool_calls" if kind == "handoff" else "stop"
         final_data = {
-            "choices": [{"message": final_message, "finish_reason": "stop"}]
+            "choices": [{"message": final_message, "finish_reason": finish_reason}]
         }
         return JSONResponse(content=final_data)
 
     # Client wants real streaming: forward each content delta to SillyTavern
     # the moment it arrives from llama-server.
+    def sse(payload: dict) -> bytes:
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
     async def event_stream():
         async for kind, payload in agent_loop(upstream_body):
             if kind == "delta":
                 chunk = {
                     "choices": [{"delta": {"content": payload}, "finish_reason": None}]
                 }
-                yield f"data: {json.dumps(chunk)}\n\n".encode()
+                yield sse(chunk)
+                continue
+
+            if kind == "handoff":
+                # Emit the whole unresolved tool_calls list in one delta -
+                # we already have it fully assembled server-side, so there's
+                # no need to fake incremental streaming for it. SillyTavern
+                # accumulates tool_calls by index either way.
+                delta = {"tool_calls": payload["tool_calls"]}
+                if payload.get("content"):
+                    delta["content"] = payload["content"]
+                yield sse({"choices": [{"delta": delta, "finish_reason": None}]})
+                yield sse({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+                yield b"data: [DONE]\n\n"
+                return
             # "done" carries the full message for the non-streaming path only;
             # its content has already been sent as deltas above.
 
         done_chunk = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
-        yield f"data: {json.dumps(done_chunk)}\n\n".encode()
+        yield sse(done_chunk)
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
