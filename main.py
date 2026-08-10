@@ -16,6 +16,8 @@ Run with:
 import asyncio
 import json
 import tempfile
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -1015,6 +1017,18 @@ async def chat_completions(request: Request):
             })
 
     upstream_body["messages"] = messages_to_prepend + upstream_body["messages"]
+    # Full OpenAI chat-completion responses carry an id/object/created/model
+    # envelope alongside "choices", and each choice normally has its own
+    # "index". Plain text replies apparently don't need this for SillyTavern
+    # to just pull out choices[0].message.content, but its tool-calling
+    # logic may specifically check for these fields before trusting/
+    # executing a tool call - and until this session, no response with
+    # tool_calls had ever actually reached a real client, so this gap was
+    # never exercised. Adding the full envelope is cheap and brings us to
+    # spec regardless of whether this turns out to be the actual cause.
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_ts = int(time.time())
+    model_name = body.get("model") or "agent"
 
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
@@ -1024,22 +1038,31 @@ async def chat_completions(request: Request):
                 final_message = payload
                 finish_reason = "tool_calls" if kind == "handoff" else "stop"
         final_data = {
-            "choices": [{"message": final_message, "finish_reason": finish_reason}]
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": model_name,
+            "choices": [{"index": 0, "message": final_message, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
         return JSONResponse(content=final_data)
 
     # Client wants real streaming: forward each content delta to SillyTavern
     # the moment it arrives from llama-server.
-    def sse(payload: dict) -> bytes:
+    def sse(choice: dict) -> bytes:
+        payload = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": model_name,
+            "choices": [choice],
+        }
         return f"data: {json.dumps(payload)}\n\n".encode()
 
     async def event_stream():
         async for kind, payload in agent_loop(upstream_body):
             if kind == "delta":
-                chunk = {
-                    "choices": [{"delta": {"content": payload}, "finish_reason": None}]
-                }
-                yield sse(chunk)
+                yield sse({"index": 0, "delta": {"content": payload}, "finish_reason": None})
                 continue
 
             if kind == "handoff":
@@ -1050,15 +1073,14 @@ async def chat_completions(request: Request):
                 delta = {"tool_calls": payload["tool_calls"]}
                 if payload.get("content"):
                     delta["content"] = payload["content"]
-                yield sse({"choices": [{"delta": delta, "finish_reason": None}]})
-                yield sse({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+                yield sse({"index": 0, "delta": delta, "finish_reason": None})
+                yield sse({"index": 0, "delta": {}, "finish_reason": "tool_calls"})
                 yield b"data: [DONE]\n\n"
                 return
             # "done" carries the full message for the non-streaming path only;
             # its content has already been sent as deltas above.
 
-        done_chunk = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
-        yield sse(done_chunk)
+        yield sse({"index": 0, "delta": {}, "finish_reason": "stop"})
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
