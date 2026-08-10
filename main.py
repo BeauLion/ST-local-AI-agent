@@ -27,14 +27,23 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 import memory
+from config import (
+    DOCKER_CPU_COUNT,
+    DOCKER_IMAGE,
+    DOCKER_MEM_LIMIT,
+    DOCKER_NETWORK_DISABLED,
+    DOCKER_TIMEOUT_SECONDS,
+    LLAMA_SERVER_URL,
+    MAX_TOOL_ITERATIONS,
+    SAFE_FILES_DIR,
+    WRITE_FILE_ALLOWED_EXTENSIONS,
+    WRITE_FILE_MAX_CHARS,
+)
 
 app = FastAPI()
 
-LLAMA_SERVER_URL = "http://localhost:8080"
-MAX_TOOL_ITERATIONS = 8  # raised from 5 to allow longer reasoning chains
-
 # The ONLY folder the agent is allowed to read files from.
-SAFE_FILES_DIR = (Path(__file__).parent / "agent_files").resolve()
+SAFE_FILES_DIR = Path(SAFE_FILES_DIR).resolve()
 SAFE_FILES_DIR.mkdir(exist_ok=True)
 
 
@@ -182,20 +191,20 @@ def run_python(args: dict) -> str:
         container = None
         try:
             container = client.containers.run(
-                "python:3.12-slim",
+                DOCKER_IMAGE,
                 command=["python", "/sandbox/snippet.py"],
                 volumes={tmp_dir: {"bind": "/sandbox", "mode": "ro"}},
                 working_dir="/sandbox",
-                network_disabled=True,   # no internet access from inside
-                mem_limit="256m",
-                nano_cpus=1_000_000_000,  # capped at 1 CPU core
+                network_disabled=DOCKER_NETWORK_DISABLED,   # no internet access from inside
+                mem_limit=DOCKER_MEM_LIMIT,
+                nano_cpus=DOCKER_CPU_COUNT * 1_000_000_000,  # capped at DOCKER_CPU_COUNT CPU core(s)
                 detach=True,
             )
-            result = container.wait(timeout=10)
+            result = container.wait(timeout=DOCKER_TIMEOUT_SECONDS)
             exit_code = result.get("StatusCode", 1)
             logs = container.logs().decode("utf-8", errors="replace")[-3000:]
         except docker.errors.ImageNotFound:
-            return "Error: python:3.12-slim image not found. Run 'docker pull python:3.12-slim' once."
+            return f"Error: {DOCKER_IMAGE} image not found. Run 'docker pull {DOCKER_IMAGE}' once."
         except Exception as e:
             return f"Error running sandboxed code: {e}"
         finally:
@@ -238,15 +247,14 @@ def write_file(args: dict) -> str:
     if mode not in ("overwrite", "append"):
         return f"Error: mode must be 'overwrite' or 'append', got '{mode}'."
 
-    MAX_WRITE_CHARS = 20000
-    if len(content) > MAX_WRITE_CHARS:
-        return f"Error: content too long ({len(content)} chars, max {MAX_WRITE_CHARS})."
+    if len(content) > WRITE_FILE_MAX_CHARS:
+        return f"Error: content too long ({len(content)} chars, max {WRITE_FILE_MAX_CHARS})."
 
     target = (SAFE_FILES_DIR / filename).resolve()
     if SAFE_FILES_DIR not in target.parents and target != SAFE_FILES_DIR:
         return "Error: access denied outside the allowed folder."
 
-    if target.suffix.lower() not in (".txt", ".md"):
+    if target.suffix.lower() not in WRITE_FILE_ALLOWED_EXTENSIONS:
         return "Error: write_file only supports .txt or .md files."
 
     try:
@@ -349,7 +357,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "run_python",
-            "description": "Run a short Python snippet for calculations, data processing, or logic too complex for the calculate tool. Executes in an isolated Docker container with no network access and a 10-second timeout. Use print() for output.",
+            "description": f"Run a short Python snippet for calculations, data processing, or logic too complex for the calculate tool. Executes in an isolated Docker container with no network access and a {DOCKER_TIMEOUT_SECONDS}-second timeout. Use print() for output.",
             "parameters": {
                 "type": "object",
                 "properties": {
