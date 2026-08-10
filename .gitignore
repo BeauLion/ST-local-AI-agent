@@ -15,6 +15,9 @@ models/
 # Personal memory & RAG data (this is YOUR data, not code. Don't leak it to a public/shared repo)
 memory_data/
 
+# Project manager data (projects.json - also personal data)
+project_data/
+
 # User-provided documents for RAG (same reasoning. Personal content)
 agent_files/*
 !agent_files/.gitkeep

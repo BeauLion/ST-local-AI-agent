@@ -23,11 +23,15 @@ import docker
 
 import httpx
 from ddgs import DDGS
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 import memory
+import project_manager
+from project_manager import ProjectManagerError
 from config import (
+    CORS_ALLOWED_ORIGINS,
     DOCKER_CPU_COUNT,
     DOCKER_IMAGE,
     DOCKER_MEM_LIMIT,
@@ -41,6 +45,15 @@ from config import (
 )
 
 app = FastAPI()
+
+# Lets the SillyTavern extension's browser-side fetch() calls (a different
+# origin/port than this server) reach the /projects endpoints below.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # The ONLY folder the agent is allowed to read files from.
 SAFE_FILES_DIR = Path(SAFE_FILES_DIR).resolve()
@@ -266,6 +279,88 @@ def write_file(args: dict) -> str:
     except Exception as e:
         return f"Error writing file: {e}"
 
+# ---------------------------------------------------------------------------
+# Project manager tools (formerly the SillyTavern extension's client-side
+# tools - see project_manager.py for the actual data model/logic). Each
+# wrapper here just translates tool args <-> project_manager calls and turns
+# ProjectManagerError into a plain string the model can read and react to,
+# the same pattern the file tools above use.
+# ---------------------------------------------------------------------------
+
+def project_manager_get_overview(args: dict) -> str:
+    state = project_manager._load()
+    overview = project_manager.project_overview(state)
+    if not overview["projects"]:
+        return "No projects exist."
+    return json.dumps(overview, ensure_ascii=False)
+
+
+def project_manager_create_task(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        task = project_manager.create_task(project["id"], args.get("title", ""))
+        return f"Created task {task['short_id']}: {task['title']}"
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_update_task_status(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        task = project_manager.get_task(project, args.get("task"))
+        if not task:
+            return "Error: Task not found or ambiguous. Call project_manager_get_overview and use an exact task ID."
+        status = args.get("status")
+        if task["status"] == status:
+            return f"No change needed; \u201c{task['title']}\u201d is already {status}."
+        updated = project_manager.set_task_status(project["id"], task["id"], status)
+        return f"Set {updated['short_id']} (\u201c{updated['title']}\u201d) to {status}."
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_update_task_notes(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        task = project_manager.get_task(project, args.get("task"))
+        if not task:
+            return "Error: Task not found or ambiguous. Call project_manager_get_overview and use an exact task ID."
+        updated = project_manager.update_task_notes(
+            project["id"], task["id"], args.get("mode", "replace"), args.get("text", "")
+        )
+        return f"Updated notes for {updated['short_id']} (\u201c{updated['title']}\u201d)."
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_set_all_tasks_status(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        status = args.get("status")
+        applied = project_manager.set_all_tasks_status(project["id"], status)
+        if not applied:
+            return f"No change needed; every non-archived task in {project['short_code']} \u2014 {project['name']} is already {status}."
+        return f"Set {len(applied)} task(s) in {project['short_code']} to {status}:\n" + "\n".join(applied)
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_batch_update(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        applied = project_manager.batch_update(project["id"], args.get("operations", []))
+        if not applied:
+            return "No change needed; every requested batch operation is already satisfied."
+        return f"Applied {len(applied)} change(s) to {project['short_code']}:\n" + "\n".join(applied)
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
 TOOLS = [
     {
         "type": "function",
@@ -401,7 +496,108 @@ TOOLS = [
             },
         },
     },
-    
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_get_overview",
+            "description": "Read the authoritative persistent project/task overview. Call this before proposing project or task changes whenever the relevant project or task is uncertain.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_create_task",
+            "description": "Create a concrete actionable task only when the user clearly states an intention, obligation, or requested action. Do not create tasks from hypotheticals, examples, general discussion, or vague wishes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "title": {"type": "string", "description": "Short, concrete, verb-led task title."},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_update_task_status",
+            "description": "Update an existing task's status only when the user clearly says it was started, blocked, completed, cancelled, or returned to pending. Never infer completion from phrases such as 'almost finished'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
+                    "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
+                },
+                "required": ["task", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_update_task_notes",
+            "description": "Replace, append to, or clear the notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
+                    "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
+                    "text": {"type": "string", "description": "Note text. Required for replace and append; omit for clear."},
+                },
+                "required": ["task", "mode"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_set_all_tasks_status",
+            "description": "Set every non-archived task in one project to the same status in a single operation. Use this for requests such as 'mark every task in the current project as done'. Do not enumerate tasks or use the batch tool for this. Tasks already in the requested status are skipped. This never changes the project's own status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit when the focused project is intended."},
+                    "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
+                },
+                "required": ["status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_batch_update",
+            "description": "Combine multiple concrete changes from one user message into one atomic project update. Prefer this over separate tool calls when the changes concern the same project. Already-satisfied operations are safely skipped.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "operations": {
+                        "type": "array", "minItems": 1, "maxItems": 25,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["create_task", "update_task_status", "update_task_notes"]},
+                                "title": {"type": "string", "description": "For create_task."},
+                                "priority": {"type": "string", "enum": ["low", "normal", "high"]},
+                                "notes": {"type": "string"},
+                                "task": {"type": "string", "description": "For status or note updates: task ID, short ID, or unambiguous title."},
+                                "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
+                                "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
+                                "text": {"type": "string"},
+                            },
+                            "required": ["type"],
+                        },
+                    },
+                },
+                "required": ["operations"],
+            },
+        },
+    },
 ]
 
 TOOL_FUNCTIONS = {
@@ -415,6 +611,12 @@ TOOL_FUNCTIONS = {
     "save_memory": save_memory_tool,
     "search_documents": search_documents_tool,
     "write_file": write_file,
+    "project_manager_get_overview": project_manager_get_overview,
+    "project_manager_create_task": project_manager_create_task,
+    "project_manager_update_task_status": project_manager_update_task_status,
+    "project_manager_update_task_notes": project_manager_update_task_notes,
+    "project_manager_set_all_tasks_status": project_manager_set_all_tasks_status,
+    "project_manager_batch_update": project_manager_batch_update,
 }
 
 
@@ -425,6 +627,155 @@ async def list_models():
     async with httpx.AsyncClient() as client:
         resp = await client.get(f"{LLAMA_SERVER_URL}/v1/models")
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+# ---------------------------------------------------------------------------
+# Project manager HTTP API - what the SillyTavern extension's UI talks to.
+# Plain REST, no tool-schema wrapping: these are user clicks, not model
+# calls. Every write here uses the exact same project_manager functions the
+# model's tools use above, so the UI and the model can never disagree about
+# what's a valid change.
+# ---------------------------------------------------------------------------
+
+def _pm_error(e: ProjectManagerError):
+    raise HTTPException(status_code=400, detail=str(e))
+
+
+def _serialize_task(task: dict) -> dict:
+    return task
+
+
+def _serialize_project(project: dict, *, include_tasks: bool = True) -> dict:
+    data = {k: v for k, v in project.items() if k != "tasks"}
+    if include_tasks:
+        data["tasks"] = [_serialize_task(t) for t in project["tasks"].values()]
+    return data
+
+
+@app.get("/projects")
+async def api_list_projects():
+    state = await asyncio.to_thread(project_manager._load)
+    return {
+        "focused_project_id": state.get("focused_project_id"),
+        "projects": [_serialize_project(p) for p in project_manager.get_projects(state)],
+    }
+
+
+@app.post("/projects")
+async def api_create_project(request: Request):
+    body = await request.json()
+    try:
+        project = await asyncio.to_thread(project_manager.create_project, body.get("name", ""))
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_project(project)
+
+
+@app.get("/projects/{project_id}")
+async def api_get_project(project_id: str):
+    state = await asyncio.to_thread(project_manager._load)
+    project = state["projects"].get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return _serialize_project(project)
+
+
+@app.patch("/projects/{project_id}")
+async def api_update_project(project_id: str, request: Request):
+    body = await request.json()
+    try:
+        project = None
+        if "name" in body:
+            project = await asyncio.to_thread(project_manager.rename_project, project_id, body["name"])
+        if "status" in body:
+            project = await asyncio.to_thread(project_manager.set_project_status, project_id, body["status"])
+        if project is None:
+            state = await asyncio.to_thread(project_manager._load)
+            project = state["projects"].get(project_id)
+            if not project:
+                raise HTTPException(status_code=404, detail="Project not found.")
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_project(project)
+
+
+@app.post("/projects/{project_id}/focus")
+async def api_focus_project(project_id: str):
+    try:
+        project = await asyncio.to_thread(project_manager.set_focused_project, project_id)
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_project(project)
+
+
+@app.delete("/projects/{project_id}")
+async def api_delete_project(project_id: str):
+    try:
+        await asyncio.to_thread(project_manager.delete_project, project_id)
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return {"deleted": project_id}
+
+
+@app.post("/projects/{project_id}/tasks")
+async def api_create_task(project_id: str, request: Request):
+    body = await request.json()
+    try:
+        task = await asyncio.to_thread(
+            project_manager.create_task,
+            project_id, body.get("title", ""),
+            priority=body.get("priority", "normal"), notes=body.get("notes", ""),
+        )
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_task(task)
+
+
+@app.patch("/projects/{project_id}/tasks/{task_id}")
+async def api_update_task(project_id: str, task_id: str, request: Request):
+    body = await request.json()
+    try:
+        task = None
+        if "status" in body:
+            task = await asyncio.to_thread(project_manager.set_task_status, project_id, task_id, body["status"])
+        if any(k in body for k in ("title", "priority", "notes")):
+            task = await asyncio.to_thread(
+                project_manager.update_task_details, project_id, task_id,
+                title=body.get("title"), priority=body.get("priority"), notes=body.get("notes"),
+            )
+        if "notes_mode" in body:
+            task = await asyncio.to_thread(
+                project_manager.update_task_notes, project_id, task_id,
+                body["notes_mode"], body.get("text", ""),
+            )
+        if task is None:
+            raise HTTPException(status_code=400, detail="No recognized fields to update.")
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_task(task)
+
+
+@app.delete("/projects/{project_id}/tasks/{task_id}")
+async def api_delete_task(project_id: str, task_id: str):
+    try:
+        await asyncio.to_thread(project_manager.delete_task, project_id, task_id)
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return {"deleted": task_id}
+
+
+@app.post("/projects/{project_id}/tasks/reorder")
+async def api_reorder_tasks(project_id: str, request: Request):
+    body = await request.json()
+    try:
+        await asyncio.to_thread(project_manager.reorder_tasks, project_id, body.get("ordered_task_ids", []))
+        state = await asyncio.to_thread(project_manager._load)
+        project = state["projects"].get(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_project(project)
 
 
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
@@ -552,7 +903,10 @@ async def chat_completions(request: Request):
         "content": (
             "You have tools available: get_current_time, calculate, run_python, "
             "web_search, get_weather, list_files, read_file, save_memory, write_file, "
-            "search_documents. You MUST call the relevant tool whenever the user "
+            "search_documents, project_manager_get_overview, project_manager_create_task, "
+            "project_manager_update_task_status, project_manager_update_task_notes, "
+            "project_manager_set_all_tasks_status, project_manager_batch_update. "
+            "You MUST call the relevant tool whenever the user "
             "asks about current events, real-time facts, dates/times, weather, "
             "exact arithmetic, or anything you are not fully certain of from "
             "memory. For weather/temperature questions, always use get_weather, "
@@ -564,7 +918,19 @@ async def chat_completions(request: Request):
             "Use write_file when the user asks you to create, save, write out, or "
             "update a .txt or .md file - use mode 'overwrite' to replace a file's "
             "contents (or create a new one) and mode 'append' to add to the end of "
-            "an existing file without erasing it."
+            "an existing file without erasing it. "
+            "Use the project_manager_* tools only when the user clearly states a "
+            "concrete project/task action (create, start, block, complete, cancel, "
+            "or annotate a task) - never from hypotheticals or vague wishes. Call "
+            "project_manager_get_overview first if which project or task is meant "
+            "isn't already clear from the persistent project state below. When one "
+            "message contains several concrete changes for the same project, use "
+            "project_manager_batch_update once instead of separate calls; for "
+            "'mark everything as done'-style requests, use "
+            "project_manager_set_all_tasks_status once instead of enumerating tasks. "
+            "Project-manager changes apply immediately - there is no separate "
+            "confirmation step, so only call these tools when the user's intent is "
+            "unambiguous. "
             "IMPORTANT for multi-step questions: if answering fully requires "
             "several pieces of information, call tools one at a time in sequence, "
             "using each result to decide your next step, before giving your final "
@@ -580,6 +946,14 @@ async def chat_completions(request: Request):
         ),
     }
     messages_to_prepend = [tool_instruction]
+
+    # Server-side equivalent of the old extension's setExtensionPrompt():
+    # inject the focused project's state directly, no tool call needed.
+    project_state_text = await asyncio.to_thread(
+        lambda: project_manager.build_context_text(project_manager._load())
+    )
+    if project_state_text:
+        messages_to_prepend.append({"role": "system", "content": project_state_text})
 
     # Auto-recall: silently check if any saved memories are relevant to what
     # the user just said, and inject them - no tool call needed for this part.

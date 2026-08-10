@@ -27,6 +27,9 @@ SAFE_FILES_DIR = os.path.join(PROJECT_ROOT, "agent_files")
 # Where memory.py stores its JSON files (memories.json, doc_index.json).
 MEMORY_DATA_DIR = os.path.join(PROJECT_ROOT, "memory_data")
 
+# Where project_manager.py stores its JSON file (projects.json).
+PROJECT_DATA_DIR = os.path.join(PROJECT_ROOT, "project_data")
+
 
 # ─────────────────────────────────────────────────────────────
 # llama-server (the local inference engine, port 8080)
@@ -103,6 +106,35 @@ DOCUMENT_SIMILARITY_THRESHOLD = 0.3
 
 WRITE_FILE_ALLOWED_EXTENSIONS = (".txt", ".md")
 WRITE_FILE_MAX_CHARS = 20_000
+
+
+# ─────────────────────────────────────────────────────────────
+# Project manager (project_manager.py) — formerly the SillyTavern
+# "Lightweight Project Manager" extension. State, validation, and the
+# model tools now live entirely on the backend; the extension is a thin
+# UI that reads/writes this server over HTTP. See handover notes.
+# ─────────────────────────────────────────────────────────────
+
+MAX_PROJECT_NAME_LENGTH = 120
+MAX_TASK_TITLE_LENGTH = 240
+MAX_PROJECT_CODE_LENGTH = 6
+MAX_TASK_NOTE_LENGTH = 2000
+MAX_BATCH_OPERATIONS = 25
+
+# How many of the focused project's tasks get injected into the model's
+# system prompt on every request (see main.py's project context block).
+MAX_TASKS_IN_CONTEXT = 8
+
+PROJECT_STATUSES = ("active", "paused", "completed")
+TASK_STATUSES = ("pending", "active", "blocked", "done", "cancelled")
+TASK_PRIORITIES = ("low", "normal", "high")
+
+# Origins allowed to call the agent server's HTTP API from the browser.
+# SillyTavern's own page (wherever it's hosted) needs to be listed here for
+# the project-manager extension's fetch() calls to be allowed by CORS.
+# "*" is fine for a single-user local setup; tighten this if you ever expose
+# the agent server beyond localhost.
+CORS_ALLOWED_ORIGINS = ["*"]
 
 
 # ─────────────────────────────────────────────────────────────
