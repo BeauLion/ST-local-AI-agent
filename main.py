@@ -16,6 +16,8 @@ Run with:
 import asyncio
 import json
 import tempfile
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -23,11 +25,16 @@ import docker
 
 import httpx
 from ddgs import DDGS
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 import memory
+import project_manager
+from project_manager import ProjectManagerError
 from config import (
+    CORS_ALLOWED_ORIGINS,
+    DELETE_FILE_ALLOWED_EXTENSIONS,
     DOCKER_CPU_COUNT,
     DOCKER_IMAGE,
     DOCKER_MEM_LIMIT,
@@ -41,6 +48,36 @@ from config import (
 )
 
 app = FastAPI()
+
+
+class LlamaServerError(Exception):
+    """Raised when llama-server can't be reached, or drops the connection
+    mid-response. Caught in agent_loop and turned into a friendly message
+    instead of an unhandled 500."""
+
+
+# Prefixes used across the tool functions above to signal failure. Not
+# fully consistent historically (most use "Error:", but web_search uses
+# "Search failed:" and get_weather uses "Weather lookup failed:") - this
+# widens detection to catch all of them rather than fixing every tool
+# function's wording, which would be a larger, riskier change.
+_FAILURE_PREFIXES = ("Error:", "Error running", "Error evaluating", "Error reading", "Error writing",
+                     "Exit code", "Search failed:", "Weather lookup failed:")
+
+
+def _tool_call_failed(result) -> bool:
+    text = str(result)
+    return any(text.startswith(p) for p in _FAILURE_PREFIXES)
+
+
+# Lets the SillyTavern extension's browser-side fetch() calls (a different
+# origin/port than this server) reach the /projects endpoints below.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # The ONLY folder the agent is allowed to read files from.
 SAFE_FILES_DIR = Path(SAFE_FILES_DIR).resolve()
@@ -175,6 +212,7 @@ def _get_docker_client():
 
 
 def run_python(args: dict) -> str:
+    global _docker_client
     code = args.get("code", "")
     if not code:
         return "Error: no code provided."
@@ -206,7 +244,11 @@ def run_python(args: dict) -> str:
         except docker.errors.ImageNotFound:
             return f"Error: {DOCKER_IMAGE} image not found. Run 'docker pull {DOCKER_IMAGE}' once."
         except Exception as e:
-            return f"Error running sandboxed code: {e}"
+            # Covers the daemon being stopped/restarted mid-session, a crashed
+            # container, etc. Drop the cached client so the *next* call
+            # reconnects fresh instead of reusing one pointed at a dead daemon.
+            _docker_client = None
+            return f"Error running sandboxed code: {e}. If Docker Desktop was closed or restarted, try again."
         finally:
             if container is not None:
                 try:
@@ -265,6 +307,149 @@ def write_file(args: dict) -> str:
         return f"{action} '{filename}' ({len(content)} chars)."
     except Exception as e:
         return f"Error writing file: {e}"
+
+
+def edit_file(args: dict) -> str:
+    filename = args.get("filename", "")
+    old_text = args.get("old_text", "")
+    new_text = args.get("new_text", "")
+
+    if not filename:
+        return "Error: no filename provided."
+    if not old_text:
+        return "Error: no old_text provided to find."
+
+    target = (SAFE_FILES_DIR / filename).resolve()
+    if SAFE_FILES_DIR not in target.parents and target != SAFE_FILES_DIR:
+        return "Error: access denied outside the allowed folder."
+    if not target.is_file():
+        return f"Error: '{filename}' not found."
+    if target.suffix.lower() not in WRITE_FILE_ALLOWED_EXTENSIONS:
+        return "Error: edit_file only supports .txt or .md files."
+
+    try:
+        current = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    count = current.count(old_text)
+    if count == 0:
+        return f"Error: old_text not found in '{filename}'. Nothing was changed."
+    if count > 1:
+        return (f"Error: old_text appears {count} times in '{filename}' - it must be "
+                f"unique. Include more surrounding context and try again.")
+
+    updated = current.replace(old_text, new_text, 1)
+    if len(updated) > WRITE_FILE_MAX_CHARS:
+        return f"Error: resulting file would be too long ({len(updated)} chars, max {WRITE_FILE_MAX_CHARS})."
+
+    try:
+        target.write_text(updated, encoding="utf-8")
+        return f"Edited '{filename}': replaced 1 occurrence."
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+
+def delete_file(args: dict) -> str:
+    filename = args.get("filename", "")
+    if not filename:
+        return "Error: no filename provided."
+
+    target = (SAFE_FILES_DIR / filename).resolve()
+    if SAFE_FILES_DIR not in target.parents and target != SAFE_FILES_DIR:
+        return "Error: access denied outside the allowed folder."
+    if not target.is_file():
+        return f"Error: '{filename}' not found."
+    if target.suffix.lower() not in DELETE_FILE_ALLOWED_EXTENSIONS:
+        return f"Error: delete_file only supports {', '.join(DELETE_FILE_ALLOWED_EXTENSIONS)} files."
+
+    try:
+        target.unlink()
+        return f"Deleted '{filename}'."
+    except Exception as e:
+        return f"Error deleting file: {e}"
+
+# ---------------------------------------------------------------------------
+# Project manager tools (formerly the SillyTavern extension's client-side
+# tools - see project_manager.py for the actual data model/logic). Each
+# wrapper here just translates tool args <-> project_manager calls and turns
+# ProjectManagerError into a plain string the model can read and react to,
+# the same pattern the file tools above use.
+# ---------------------------------------------------------------------------
+
+def project_manager_get_overview(args: dict) -> str:
+    state = project_manager._load()
+    overview = project_manager.project_overview(state)
+    if not overview["projects"]:
+        return "No projects exist."
+    return json.dumps(overview, ensure_ascii=False)
+
+
+def project_manager_create_task(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        task = project_manager.create_task(project["id"], args.get("title", ""))
+        return f"Created task {task['short_id']}: {task['title']}"
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_update_task_status(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        task = project_manager.get_task(project, args.get("task"))
+        if not task:
+            return "Error: Task not found or ambiguous. Call project_manager_get_overview and use an exact task ID."
+        status = args.get("status")
+        if task["status"] == status:
+            return f"No change needed; \u201c{task['title']}\u201d is already {status}."
+        updated = project_manager.set_task_status(project["id"], task["id"], status)
+        return f"Set {updated['short_id']} (\u201c{updated['title']}\u201d) to {status}."
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_update_task_notes(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        task = project_manager.get_task(project, args.get("task"))
+        if not task:
+            return "Error: Task not found or ambiguous. Call project_manager_get_overview and use an exact task ID."
+        updated = project_manager.update_task_notes(
+            project["id"], task["id"], args.get("mode", "replace"), args.get("text", "")
+        )
+        return f"Updated notes for {updated['short_id']} (\u201c{updated['title']}\u201d)."
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_set_all_tasks_status(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        status = args.get("status")
+        applied = project_manager.set_all_tasks_status(project["id"], status)
+        if not applied:
+            return f"No change needed; every non-archived task in {project['short_code']} \u2014 {project['name']} is already {status}."
+        return f"Set {len(applied)} task(s) in {project['short_code']} to {status}:\n" + "\n".join(applied)
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_batch_update(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        applied = project_manager.batch_update(project["id"], args.get("operations", []))
+        if not applied:
+            return "No change needed; every requested batch operation is already satisfied."
+        return f"Applied {len(applied)} change(s) to {project['short_code']}:\n" + "\n".join(applied)
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
 
 TOOLS = [
     {
@@ -401,7 +586,138 @@ TOOLS = [
             },
         },
     },
-    
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Make a targeted edit to an existing .txt or .md file by replacing one exact, unique piece of text with new text. Use this instead of write_file when only part of a file needs to change.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Name of the existing file to edit."},
+                    "old_text": {"type": "string", "description": "The exact existing text to find and replace. Must be unique within the file - include surrounding context if needed."},
+                    "new_text": {"type": "string", "description": "The text to replace it with."},
+                },
+                "required": ["filename", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "Permanently delete an existing file from the allowed files folder. This cannot be undone - only call this when the user clearly and explicitly asks to delete a specific named file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Name of the file to delete."}
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_get_overview",
+            "description": "Read the authoritative persistent project/task overview. Call this before proposing project or task changes whenever the relevant project or task is uncertain.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_create_task",
+            "description": "Create a concrete actionable task only when the user clearly states an intention, obligation, or requested action. Do not create tasks from hypotheticals, examples, general discussion, or vague wishes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "title": {"type": "string", "description": "Short, concrete, verb-led task title."},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_update_task_status",
+            "description": "Update an existing task's status only when the user clearly says it was started, blocked, completed, cancelled, or returned to pending. Never infer completion from phrases such as 'almost finished'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
+                    "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
+                },
+                "required": ["task", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_update_task_notes",
+            "description": "Replace, append to, or clear the notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
+                    "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
+                    "text": {"type": "string", "description": "Note text. Required for replace and append; omit for clear."},
+                },
+                "required": ["task", "mode"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_set_all_tasks_status",
+            "description": "Set every non-archived task in one project to the same status in a single operation. Use this for requests such as 'mark every task in the current project as done'. Do not enumerate tasks or use the batch tool for this. Tasks already in the requested status are skipped. This never changes the project's own status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit when the focused project is intended."},
+                    "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
+                },
+                "required": ["status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_batch_update",
+            "description": "Combine multiple concrete changes from one user message into one atomic project update. Prefer this over separate tool calls when the changes concern the same project. Already-satisfied operations are safely skipped.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "operations": {
+                        "type": "array", "minItems": 1, "maxItems": 25,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["create_task", "update_task_status", "update_task_notes"]},
+                                "title": {"type": "string", "description": "For create_task."},
+                                "priority": {"type": "string", "enum": ["low", "normal", "high"]},
+                                "notes": {"type": "string"},
+                                "task": {"type": "string", "description": "For status or note updates: task ID, short ID, or unambiguous title."},
+                                "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
+                                "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
+                                "text": {"type": "string"},
+                            },
+                            "required": ["type"],
+                        },
+                    },
+                },
+                "required": ["operations"],
+            },
+        },
+    },
 ]
 
 TOOL_FUNCTIONS = {
@@ -415,6 +731,14 @@ TOOL_FUNCTIONS = {
     "save_memory": save_memory_tool,
     "search_documents": search_documents_tool,
     "write_file": write_file,
+    "edit_file": edit_file,
+    "delete_file": delete_file,
+    "project_manager_get_overview": project_manager_get_overview,
+    "project_manager_create_task": project_manager_create_task,
+    "project_manager_update_task_status": project_manager_update_task_status,
+    "project_manager_update_task_notes": project_manager_update_task_notes,
+    "project_manager_set_all_tasks_status": project_manager_set_all_tasks_status,
+    "project_manager_batch_update": project_manager_batch_update,
 }
 
 
@@ -427,31 +751,220 @@ async def list_models():
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
 
+# ---------------------------------------------------------------------------
+# Project manager HTTP API - what the SillyTavern extension's UI talks to.
+# Plain REST, no tool-schema wrapping: these are user clicks, not model
+# calls. Every write here uses the exact same project_manager functions the
+# model's tools use above, so the UI and the model can never disagree about
+# what's a valid change.
+# ---------------------------------------------------------------------------
+
+def _pm_error(e: ProjectManagerError):
+    raise HTTPException(status_code=400, detail=str(e))
+
+
+def _serialize_task(task: dict) -> dict:
+    return task
+
+
+def _serialize_project(project: dict, *, include_tasks: bool = True) -> dict:
+    data = {k: v for k, v in project.items() if k != "tasks"}
+    if include_tasks:
+        data["tasks"] = [_serialize_task(t) for t in project["tasks"].values()]
+    return data
+
+
+@app.get("/projects")
+async def api_list_projects():
+    state = await asyncio.to_thread(project_manager._load)
+    return {
+        "focused_project_id": state.get("focused_project_id"),
+        "projects": [_serialize_project(p) for p in project_manager.get_projects(state)],
+    }
+
+
+@app.post("/projects")
+async def api_create_project(request: Request):
+    body = await request.json()
+    try:
+        project = await asyncio.to_thread(project_manager.create_project, body.get("name", ""))
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_project(project)
+
+
+@app.get("/projects/{project_id}")
+async def api_get_project(project_id: str):
+    state = await asyncio.to_thread(project_manager._load)
+    project = state["projects"].get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return _serialize_project(project)
+
+
+@app.patch("/projects/{project_id}")
+async def api_update_project(project_id: str, request: Request):
+    body = await request.json()
+    try:
+        project = None
+        if "name" in body:
+            project = await asyncio.to_thread(project_manager.rename_project, project_id, body["name"])
+        if "status" in body:
+            project = await asyncio.to_thread(project_manager.set_project_status, project_id, body["status"])
+        if project is None:
+            state = await asyncio.to_thread(project_manager._load)
+            project = state["projects"].get(project_id)
+            if not project:
+                raise HTTPException(status_code=404, detail="Project not found.")
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_project(project)
+
+
+@app.post("/projects/{project_id}/focus")
+async def api_focus_project(project_id: str):
+    try:
+        project = await asyncio.to_thread(project_manager.set_focused_project, project_id)
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_project(project)
+
+
+@app.delete("/projects/{project_id}")
+async def api_delete_project(project_id: str):
+    try:
+        await asyncio.to_thread(project_manager.delete_project, project_id)
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return {"deleted": project_id}
+
+
+@app.post("/projects/{project_id}/tasks")
+async def api_create_task(project_id: str, request: Request):
+    body = await request.json()
+    try:
+        task = await asyncio.to_thread(
+            project_manager.create_task,
+            project_id, body.get("title", ""),
+            priority=body.get("priority", "normal"), notes=body.get("notes", ""),
+        )
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_task(task)
+
+
+@app.patch("/projects/{project_id}/tasks/{task_id}")
+async def api_update_task(project_id: str, task_id: str, request: Request):
+    body = await request.json()
+    try:
+        task = None
+        if "status" in body:
+            task = await asyncio.to_thread(project_manager.set_task_status, project_id, task_id, body["status"])
+        if any(k in body for k in ("title", "priority", "notes")):
+            task = await asyncio.to_thread(
+                project_manager.update_task_details, project_id, task_id,
+                title=body.get("title"), priority=body.get("priority"), notes=body.get("notes"),
+            )
+        if "notes_mode" in body:
+            task = await asyncio.to_thread(
+                project_manager.update_task_notes, project_id, task_id,
+                body["notes_mode"], body.get("text", ""),
+            )
+        if task is None:
+            raise HTTPException(status_code=400, detail="No recognized fields to update.")
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_task(task)
+
+
+@app.delete("/projects/{project_id}/tasks/{task_id}")
+async def api_delete_task(project_id: str, task_id: str):
+    try:
+        await asyncio.to_thread(project_manager.delete_task, project_id, task_id)
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return {"deleted": task_id}
+
+
+@app.post("/projects/{project_id}/tasks/reorder")
+async def api_reorder_tasks(project_id: str, request: Request):
+    body = await request.json()
+    try:
+        await asyncio.to_thread(project_manager.reorder_tasks, project_id, body.get("ordered_task_ids", []))
+        state = await asyncio.to_thread(project_manager._load)
+        project = state["projects"].get(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+    except ProjectManagerError as e:
+        _pm_error(e)
+    return _serialize_project(project)
+
+
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
     """POST one chat-completion request with stream=True and yield the
     decoded JSON of each SSE chunk from llama-server."""
-    async with client.stream(
-        "POST", f"{LLAMA_SERVER_URL}/v1/chat/completions", json=body
-    ) as resp:
-        async for line in resp.aiter_lines():
-            if not line.startswith("data: "):
-                continue
-            payload = line[len("data: "):]
-            if payload.strip() == "[DONE]":
-                return
-            yield json.loads(payload)
+    try:
+        async with client.stream(
+            "POST", f"{LLAMA_SERVER_URL}/v1/chat/completions", json=body
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):]
+                if payload.strip() == "[DONE]":
+                    return
+                yield json.loads(payload)
+    except httpx.ConnectError as e:
+        raise LlamaServerError(
+            "Could not connect to llama-server. Is it still running?"
+        ) from e
+    except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+        raise LlamaServerError(
+            "Lost connection to llama-server mid-response (it may have crashed)."
+        ) from e
+    except httpx.TimeoutException as e:
+        raise LlamaServerError("llama-server timed out responding.") from e
+    except httpx.HTTPStatusError as e:
+        raise LlamaServerError(
+            f"llama-server returned an error (HTTP {e.response.status_code})."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise LlamaServerError(
+            "llama-server sent a malformed response (it may have crashed mid-reply)."
+        ) from e
 
 
 async def agent_loop(upstream_body: dict):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
     way. Yields:
-      ("delta", text)   - a piece of the FINAL answer, forwarded the moment
-                           it's clear this iteration isn't a tool call.
-      ("done", message) - the complete final assistant message (role +
-                           content), once the loop is finished.
-    Tool-call iterations are executed internally and never reach the caller
-    as deltas - only the model's eventual direct answer streams through.
+      ("delta", text)    - a piece of the FINAL answer, forwarded the
+                            moment it's clear this iteration isn't a tool
+                            call.
+      ("done", message)  - the complete final assistant message (role +
+                            content), once the loop is finished.
+      ("handoff", message) - the model wants to call one or more tools this
+                            server doesn't own (registered client-side by a
+                            SillyTavern extension, e.g. the check-ins
+                            extension's schedule_character_action). Passed
+                            back to the caller UNRESOLVED, exactly as
+                            llama-server produced it, so SillyTavern can run
+                            its own registered handler and continue the
+                            conversation itself. The loop stops here - this
+                            server never guesses at a client tool's result.
+
+    Tool-call iterations for tools this server DOES own are executed
+    internally and never reach the caller as deltas - only the model's
+    eventual direct answer, or a handoff, does.
+
+    Simplification: if a single model turn requests a MIX of server-owned
+    and client-owned tools together, the whole turn is handed off unresolved
+    rather than partially executed - partially resolving would leave some
+    tool_call_ids answered and others not, which breaks the next request.
+    This is rare in practice (mixed-origin tool calls in one turn); if it
+    happens, the server-owned tools simply get called again next turn once
+    the client resolves its half and sends the follow-up request.
     """
     async with httpx.AsyncClient(timeout=None) as client:
         for _ in range(MAX_TOOL_ITERATIONS):
@@ -459,56 +972,64 @@ async def agent_loop(upstream_body: dict):
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
 
-            async for chunk in _stream_chat(client, upstream_body):
-                delta = chunk["choices"][0].get("delta", {})
+            try:
+                async for chunk in _stream_chat(client, upstream_body):
+                    delta = chunk["choices"][0].get("delta", {})
 
-                delta_tool_calls = delta.get("tool_calls")
-                if delta_tool_calls:
-                    mode = "tool_calls"
-                    for tc in delta_tool_calls:
-                        idx = tc.get("index", 0)
-                        entry = tool_calls.setdefault(
-                            idx,
-                            {"id": None, "type": "function",
-                             "function": {"name": "", "arguments": ""}},
-                        )
-                        if tc.get("id"):
-                            entry["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            entry["function"]["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            entry["function"]["arguments"] += fn["arguments"]
-                    continue
+                    delta_tool_calls = delta.get("tool_calls")
+                    if delta_tool_calls:
+                        mode = "tool_calls"
+                        for tc in delta_tool_calls:
+                            idx = tc.get("index", 0)
+                            entry = tool_calls.setdefault(
+                                idx,
+                                {"index": idx, "id": None, "type": "function",
+                                 "function": {"name": "", "arguments": ""}},
+                            )
+                            if tc.get("id"):
+                                entry["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                entry["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                entry["function"]["arguments"] += fn["arguments"]
+                        continue
 
-                delta_content = delta.get("content")
-                if delta_content:
-                    if mode is None:
-                        mode = "content"
-                    content += delta_content
-                    # buffered, not yielded here — see below
+                    delta_content = delta.get("content")
+                    if delta_content:
+                        if mode is None:
+                            mode = "content"
+                        content += delta_content
+                        # buffered, not yielded here — see below
+            except LlamaServerError as e:
+                print(f"[AGENT] {e}")
+                yield ("delta", f"⚠️ {e}")
+                yield ("done", {"role": "assistant", "content": str(e)})
+                return
 
             if mode == "tool_calls" and tool_calls:
-                message = {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": [tool_calls[i] for i in sorted(tool_calls)],
-                }
-                print(f"[AGENT] Model requested {len(message['tool_calls'])} tool call(s)")
+                calls = [tool_calls[i] for i in sorted(tool_calls)]
+                message = {"role": "assistant", "content": content or None, "tool_calls": calls}
+
+                unknown = [c for c in calls if c["function"]["name"] not in TOOL_FUNCTIONS]
+                if unknown:
+                    names = [c["function"]["name"] for c in unknown]
+                    print(f"[AGENT] Handing off {len(unknown)} client-owned tool call(s) to SillyTavern: {names}")
+                    yield ("handoff", message)
+                    return
+
+                print(f"[AGENT] Model requested {len(calls)} tool call(s)")
                 upstream_body["messages"].append(message)
 
-                for call in message["tool_calls"]:
+                for call in calls:
                     name = call["function"]["name"]
                     try:
                         args = json.loads(call["function"].get("arguments") or "{}")
                     except json.JSONDecodeError:
                         args = {}
 
-                    if name in TOOL_FUNCTIONS:
-                        # Run in a thread so a slow web search doesn't freeze the server.
-                        result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
-                    else:
-                        result = f"Error: unknown tool '{name}'"
+                    # Run in a thread so a slow web search doesn't freeze the server.
+                    result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
 
                     print(f"[AGENT] {name}({args}) ->")
                     print(f"[AGENT]   {str(result)[:400]}")
@@ -520,6 +1041,24 @@ async def agent_loop(upstream_body: dict):
                             "content": str(result),
                         }
                     )
+
+                    # Placement fix (handover-9): a failure-honesty clause
+                    # sitting once in the system prompt wasn't reliably
+                    # followed (handover-7). Injecting a short reminder
+                    # right next to the failed result, every time, is more
+                    # effective for a 14B model than one buried instruction.
+                    if _tool_call_failed(result):
+                        upstream_body["messages"].append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "The tool call above FAILED. Tell the user honestly that "
+                                    "it failed and why. Do not invent, guess, or substitute "
+                                    "any numbers, facts, or output in its place - not even as "
+                                    "an example or hypothetical."
+                                ),
+                            }
+                        )
                 continue  # loop again so the model can use the tool result
 
             # No tool call -> this is the final answer (already streamed above).
@@ -540,11 +1079,25 @@ async def chat_completions(request: Request):
     body = await request.json()
     client_wants_stream = body.get("stream", False)
 
+    # SillyTavern extensions can register their own tools (e.g. the
+    # check-ins extension's schedule_character_action) - these arrive as
+    # `tools` on the incoming request. Merge them in alongside this
+    # server's own list instead of discarding them: any client tool whose
+    # name doesn't collide with one of ours gets added, so the model can
+    # call it. Calls to these are handed back to SillyTavern unresolved by
+    # agent_loop (see "handoff" above) instead of this server guessing at
+    # an answer.
+    client_tools = [
+        t for t in (body.get("tools") or [])
+        if isinstance(t, dict) and t.get("function", {}).get("name") not in TOOL_FUNCTIONS
+    ]
+    client_tool_names = {t["function"]["name"] for t in client_tools if t.get("function", {}).get("name")}
+
     # We always stream from llama-server internally (agent_loop needs deltas
     # to detect tool calls early), regardless of what the client asked for.
     upstream_body = dict(body)
     upstream_body["stream"] = True
-    upstream_body["tools"] = TOOLS
+    upstream_body["tools"] = TOOLS + client_tools
     upstream_body["tool_choice"] = "auto"
 
     tool_instruction = {
@@ -552,7 +1105,10 @@ async def chat_completions(request: Request):
         "content": (
             "You have tools available: get_current_time, calculate, run_python, "
             "web_search, get_weather, list_files, read_file, save_memory, write_file, "
-            "search_documents. You MUST call the relevant tool whenever the user "
+            "edit_file, delete_file, search_documents, project_manager_get_overview, project_manager_create_task, "
+            "project_manager_update_task_status, project_manager_update_task_notes, "
+            "project_manager_set_all_tasks_status, project_manager_batch_update. "
+            "You MUST call the relevant tool whenever the user "
             "asks about current events, real-time facts, dates/times, weather, "
             "exact arithmetic, or anything you are not fully certain of from "
             "memory. For weather/temperature questions, always use get_weather, "
@@ -564,7 +1120,31 @@ async def chat_completions(request: Request):
             "Use write_file when the user asks you to create, save, write out, or "
             "update a .txt or .md file - use mode 'overwrite' to replace a file's "
             "contents (or create a new one) and mode 'append' to add to the end of "
-            "an existing file without erasing it."
+            "an existing file without erasing it. "
+            "Use edit_file for a small targeted change inside an existing file instead "
+            "of rewriting the whole thing with write_file. Only call delete_file when "
+            "the user clearly and explicitly asks to delete a specific named file - "
+            "never as a side effect of another request, and never guess the filename "
+            "if it's ambiguous; ask the user to confirm instead. "
+            "Use the project_manager_* tools only when the user clearly states a "
+            "concrete project/task action (create, start, block, complete, cancel, "
+            "or annotate a task) - never from hypotheticals or vague wishes. Call "
+            "project_manager_get_overview first if which project or task is meant "
+            "isn't already clear from the persistent project state below. When one "
+            "message contains several concrete changes for the same project, use "
+            "project_manager_batch_update once instead of separate calls; for "
+            "'mark everything as done'-style requests, use "
+            "project_manager_set_all_tasks_status once instead of enumerating tasks. "
+            "Project-manager changes apply immediately - there is no separate "
+            "confirmation step, so only call these tools when the user's intent is "
+            "unambiguous. "
+            + (
+                f"Additional tools provided by the connected frontend are also "
+                f"available this turn: {', '.join(sorted(client_tool_names))}. Call "
+                f"them normally, following their own descriptions, when they fit "
+                f"the user's request. "
+                if client_tool_names else ""
+            ) +
             "IMPORTANT for multi-step questions: if answering fully requires "
             "several pieces of information, call tools one at a time in sequence, "
             "using each result to decide your next step, before giving your final "
@@ -572,7 +1152,11 @@ async def chat_completions(request: Request):
             "answered yet. Never guess or invent facts, dates, statistics, or "
             "search results that a tool could actually check for you. If a tool "
             "returns no useful result, say so honestly instead of making "
-            "something up."
+            "something up. If a tool result begins with 'Error:', the tool call "
+            "FAILED - you must tell the user it failed and relay the reason "
+            "(e.g. 'Docker isn't running'). Never substitute your own guessed "
+            "numbers, facts, or output in place of a failed tool's result, even "
+            "if you present it as an example or hypothetical."
             "When you decide to call a tool, call it directly - "
             "do not write any explanation, plan, or commentary before or "
             "alongside the tool call. Save your explanation, if any, for your "
@@ -580,6 +1164,15 @@ async def chat_completions(request: Request):
         ),
     }
     messages_to_prepend = [tool_instruction]
+
+    # Server-side equivalent of the old extension's setExtensionPrompt():
+    # inject the focused project's state directly, no tool call needed.
+    project_state_text = await asyncio.to_thread(
+        lambda: project_manager.build_context_text(project_manager._load())
+    )
+    if project_state_text:
+        messages_to_prepend.append({"role": "system", "content": project_state_text})
+    print(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
 
     # Auto-recall: silently check if any saved memories are relevant to what
     # the user just said, and inject them - no tool call needed for this part.
@@ -598,31 +1191,70 @@ async def chat_completions(request: Request):
             })
 
     upstream_body["messages"] = messages_to_prepend + upstream_body["messages"]
+    # Full OpenAI chat-completion responses carry an id/object/created/model
+    # envelope alongside "choices", and each choice normally has its own
+    # "index". Plain text replies apparently don't need this for SillyTavern
+    # to just pull out choices[0].message.content, but its tool-calling
+    # logic may specifically check for these fields before trusting/
+    # executing a tool call - and until this session, no response with
+    # tool_calls had ever actually reached a real client, so this gap was
+    # never exercised. Adding the full envelope is cheap and brings us to
+    # spec regardless of whether this turns out to be the actual cause.
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_ts = int(time.time())
+    model_name = body.get("model") or "agent"
 
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
+        finish_reason = "stop"
         async for kind, payload in agent_loop(upstream_body):
-            if kind == "done":
+            if kind in ("done", "handoff"):
                 final_message = payload
+                finish_reason = "tool_calls" if kind == "handoff" else "stop"
         final_data = {
-            "choices": [{"message": final_message, "finish_reason": "stop"}]
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": model_name,
+            "choices": [{"index": 0, "message": final_message, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
         return JSONResponse(content=final_data)
 
     # Client wants real streaming: forward each content delta to SillyTavern
     # the moment it arrives from llama-server.
+    def sse(choice: dict) -> bytes:
+        payload = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": model_name,
+            "choices": [choice],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
     async def event_stream():
         async for kind, payload in agent_loop(upstream_body):
             if kind == "delta":
-                chunk = {
-                    "choices": [{"delta": {"content": payload}, "finish_reason": None}]
-                }
-                yield f"data: {json.dumps(chunk)}\n\n".encode()
+                yield sse({"index": 0, "delta": {"content": payload}, "finish_reason": None})
+                continue
+
+            if kind == "handoff":
+                # Emit the whole unresolved tool_calls list in one delta -
+                # we already have it fully assembled server-side, so there's
+                # no need to fake incremental streaming for it. SillyTavern
+                # accumulates tool_calls by index either way.
+                delta = {"tool_calls": payload["tool_calls"]}
+                if payload.get("content"):
+                    delta["content"] = payload["content"]
+                yield sse({"index": 0, "delta": delta, "finish_reason": None})
+                yield sse({"index": 0, "delta": {}, "finish_reason": "tool_calls"})
+                yield b"data: [DONE]\n\n"
+                return
             # "done" carries the full message for the non-streaming path only;
             # its content has already been sent as deltas above.
 
-        done_chunk = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
-        yield f"data: {json.dumps(done_chunk)}\n\n".encode()
+        yield sse({"index": 0, "delta": {}, "finish_reason": "stop"})
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -21,7 +21,7 @@ import sys
 import time
 import signal
 import threading
-
+import os
 import httpx
 
 import config
@@ -84,7 +84,20 @@ def start_agent_server() -> subprocess.Popen:
         "--reload",
     ]
     print(f"[start.py] Launching agent server:\n  {' '.join(cmd)}\n")
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+    # Force unbuffered stdout on the child process. Without this, print()
+    # statements in main.py (our [AGENT] logs) get block-buffered because
+    # stdout is a pipe, not a terminal — they can sit invisible for a long
+    # time while uvicorn's own logging-based access log lines (which flush
+    # immediately) show up right away. This made it look like nothing was
+    # happening when it actually was.
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    return subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=env,
+    )
 
 
 def main():
