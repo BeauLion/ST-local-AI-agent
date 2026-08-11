@@ -48,6 +48,13 @@ from config import (
 
 app = FastAPI()
 
+
+class LlamaServerError(Exception):
+    """Raised when llama-server can't be reached, or drops the connection
+    mid-response. Caught in agent_loop and turned into a friendly message
+    instead of an unhandled 500."""
+
+
 # Lets the SillyTavern extension's browser-side fetch() calls (a different
 # origin/port than this server) reach the /projects endpoints below.
 app.add_middleware(
@@ -190,6 +197,7 @@ def _get_docker_client():
 
 
 def run_python(args: dict) -> str:
+    global _docker_client
     code = args.get("code", "")
     if not code:
         return "Error: no code provided."
@@ -221,7 +229,11 @@ def run_python(args: dict) -> str:
         except docker.errors.ImageNotFound:
             return f"Error: {DOCKER_IMAGE} image not found. Run 'docker pull {DOCKER_IMAGE}' once."
         except Exception as e:
-            return f"Error running sandboxed code: {e}"
+            # Covers the daemon being stopped/restarted mid-session, a crashed
+            # container, etc. Drop the cached client so the *next* call
+            # reconnects fresh instead of reusing one pointed at a dead daemon.
+            _docker_client = None
+            return f"Error running sandboxed code: {e}. If Docker Desktop was closed or restarted, try again."
         finally:
             if container is not None:
                 try:
@@ -783,16 +795,36 @@ async def api_reorder_tasks(project_id: str, request: Request):
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
     """POST one chat-completion request with stream=True and yield the
     decoded JSON of each SSE chunk from llama-server."""
-    async with client.stream(
-        "POST", f"{LLAMA_SERVER_URL}/v1/chat/completions", json=body
-    ) as resp:
-        async for line in resp.aiter_lines():
-            if not line.startswith("data: "):
-                continue
-            payload = line[len("data: "):]
-            if payload.strip() == "[DONE]":
-                return
-            yield json.loads(payload)
+    try:
+        async with client.stream(
+            "POST", f"{LLAMA_SERVER_URL}/v1/chat/completions", json=body
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):]
+                if payload.strip() == "[DONE]":
+                    return
+                yield json.loads(payload)
+    except httpx.ConnectError as e:
+        raise LlamaServerError(
+            "Could not connect to llama-server. Is it still running?"
+        ) from e
+    except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+        raise LlamaServerError(
+            "Lost connection to llama-server mid-response (it may have crashed)."
+        ) from e
+    except httpx.TimeoutException as e:
+        raise LlamaServerError("llama-server timed out responding.") from e
+    except httpx.HTTPStatusError as e:
+        raise LlamaServerError(
+            f"llama-server returned an error (HTTP {e.response.status_code})."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise LlamaServerError(
+            "llama-server sent a malformed response (it may have crashed mid-reply)."
+        ) from e
 
 
 async def agent_loop(upstream_body: dict):
@@ -832,34 +864,40 @@ async def agent_loop(upstream_body: dict):
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
 
-            async for chunk in _stream_chat(client, upstream_body):
-                delta = chunk["choices"][0].get("delta", {})
+            try:
+                async for chunk in _stream_chat(client, upstream_body):
+                    delta = chunk["choices"][0].get("delta", {})
 
-                delta_tool_calls = delta.get("tool_calls")
-                if delta_tool_calls:
-                    mode = "tool_calls"
-                    for tc in delta_tool_calls:
-                        idx = tc.get("index", 0)
-                        entry = tool_calls.setdefault(
-                            idx,
-                            {"index": idx, "id": None, "type": "function",
-                             "function": {"name": "", "arguments": ""}},
-                        )
-                        if tc.get("id"):
-                            entry["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            entry["function"]["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            entry["function"]["arguments"] += fn["arguments"]
-                    continue
+                    delta_tool_calls = delta.get("tool_calls")
+                    if delta_tool_calls:
+                        mode = "tool_calls"
+                        for tc in delta_tool_calls:
+                            idx = tc.get("index", 0)
+                            entry = tool_calls.setdefault(
+                                idx,
+                                {"index": idx, "id": None, "type": "function",
+                                 "function": {"name": "", "arguments": ""}},
+                            )
+                            if tc.get("id"):
+                                entry["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                entry["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                entry["function"]["arguments"] += fn["arguments"]
+                        continue
 
-                delta_content = delta.get("content")
-                if delta_content:
-                    if mode is None:
-                        mode = "content"
-                    content += delta_content
-                    # buffered, not yielded here — see below
+                    delta_content = delta.get("content")
+                    if delta_content:
+                        if mode is None:
+                            mode = "content"
+                        content += delta_content
+                        # buffered, not yielded here — see below
+            except LlamaServerError as e:
+                print(f"[AGENT] {e}")
+                yield ("delta", f"⚠️ {e}")
+                yield ("done", {"role": "assistant", "content": str(e)})
+                return
 
             if mode == "tool_calls" and tool_calls:
                 calls = [tool_calls[i] for i in sorted(tool_calls)]
