@@ -699,7 +699,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_list_events",
-            "description": "List events on the user's iCloud calendar in a date range. Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately.",
+            "description": "List events on the user's iCloud calendar in a date range. Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately. IMPORTANT: for any relative date ('today', 'this week', etc.), call get_current_time first and compute real dates from it - never guess today's date or year.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -715,7 +715,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_search_events",
-            "description": "Search the user's iCloud calendar by keyword across event titles, locations, and descriptions. Use this to find a specific event (e.g. before editing or deleting it) rather than guessing its UID. Read-only, executes immediately.",
+            "description": "Search the user's iCloud calendar by keyword across event titles, locations, and descriptions. Use this to find a specific event (e.g. before editing or deleting it) rather than guessing its UID. Read-only, executes immediately. IMPORTANT: for a relative date range, call get_current_time first - never guess today's date or year.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -732,7 +732,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_create_event",
-            "description": "Propose creating a new iCloud calendar event. This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending.",
+            "description": "Propose creating a new iCloud calendar event. This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending. IMPORTANT: for a relative date/time ('tomorrow', 'next Friday', etc.), call get_current_time first and compute the real date - never guess today's date or year.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1320,6 +1320,16 @@ async def chat_completions(request: Request):
             "if it's ambiguous; ask the user to confirm instead. "
             "Use calendar_list_events or calendar_search_events freely to read the "
             "user's iCloud calendar - these are read-only and need no confirmation. "
+            "CRITICAL: before calling calendar_list_events or calendar_search_events "
+            "with any relative date phrase ('this week', 'today', 'tomorrow', 'next "
+            "month', etc.), you MUST call get_current_time first if you haven't "
+            "already this conversation, then compute the actual start/end dates from "
+            "that real result. NEVER guess or assume today's date or year from "
+            "memory for a calendar call - a wrong year will silently return the "
+            "wrong (usually empty) results instead of erroring, so this mistake is "
+            "easy to make and easy to miss. If you don't need a specific range, you "
+            "may also omit start/end entirely and let the tool default to today "
+            "onward. "
             "calendar_create_event, calendar_edit_event, and calendar_delete_event "
             "NEVER change the real calendar by themselves - they only stage a "
             "proposed change and return a description of it. After calling one, tell "
