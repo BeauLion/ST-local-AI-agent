@@ -107,6 +107,10 @@ DOCUMENT_SIMILARITY_THRESHOLD = 0.3
 WRITE_FILE_ALLOWED_EXTENSIONS = (".txt", ".md")
 WRITE_FILE_MAX_CHARS = 20_000
 
+# delete_file tool - slightly broader than write_file's extensions, since
+# agent_files can also contain RAG-uploaded PDFs the user may want removed.
+DELETE_FILE_ALLOWED_EXTENSIONS = (".txt", ".md", ".pdf")
+
 
 # ─────────────────────────────────────────────────────────────
 # Project manager (project_manager.py) — formerly the SillyTavern

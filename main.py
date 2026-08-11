@@ -34,6 +34,7 @@ import project_manager
 from project_manager import ProjectManagerError
 from config import (
     CORS_ALLOWED_ORIGINS,
+    DELETE_FILE_ALLOWED_EXTENSIONS,
     DOCKER_CPU_COUNT,
     DOCKER_IMAGE,
     DOCKER_MEM_LIMIT,
@@ -53,6 +54,20 @@ class LlamaServerError(Exception):
     """Raised when llama-server can't be reached, or drops the connection
     mid-response. Caught in agent_loop and turned into a friendly message
     instead of an unhandled 500."""
+
+
+# Prefixes used across the tool functions above to signal failure. Not
+# fully consistent historically (most use "Error:", but web_search uses
+# "Search failed:" and get_weather uses "Weather lookup failed:") - this
+# widens detection to catch all of them rather than fixing every tool
+# function's wording, which would be a larger, riskier change.
+_FAILURE_PREFIXES = ("Error:", "Error running", "Error evaluating", "Error reading", "Error writing",
+                     "Exit code", "Search failed:", "Weather lookup failed:")
+
+
+def _tool_call_failed(result) -> bool:
+    text = str(result)
+    return any(text.startswith(p) for p in _FAILURE_PREFIXES)
 
 
 # Lets the SillyTavern extension's browser-side fetch() calls (a different
@@ -293,6 +308,67 @@ def write_file(args: dict) -> str:
     except Exception as e:
         return f"Error writing file: {e}"
 
+
+def edit_file(args: dict) -> str:
+    filename = args.get("filename", "")
+    old_text = args.get("old_text", "")
+    new_text = args.get("new_text", "")
+
+    if not filename:
+        return "Error: no filename provided."
+    if not old_text:
+        return "Error: no old_text provided to find."
+
+    target = (SAFE_FILES_DIR / filename).resolve()
+    if SAFE_FILES_DIR not in target.parents and target != SAFE_FILES_DIR:
+        return "Error: access denied outside the allowed folder."
+    if not target.is_file():
+        return f"Error: '{filename}' not found."
+    if target.suffix.lower() not in WRITE_FILE_ALLOWED_EXTENSIONS:
+        return "Error: edit_file only supports .txt or .md files."
+
+    try:
+        current = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    count = current.count(old_text)
+    if count == 0:
+        return f"Error: old_text not found in '{filename}'. Nothing was changed."
+    if count > 1:
+        return (f"Error: old_text appears {count} times in '{filename}' - it must be "
+                f"unique. Include more surrounding context and try again.")
+
+    updated = current.replace(old_text, new_text, 1)
+    if len(updated) > WRITE_FILE_MAX_CHARS:
+        return f"Error: resulting file would be too long ({len(updated)} chars, max {WRITE_FILE_MAX_CHARS})."
+
+    try:
+        target.write_text(updated, encoding="utf-8")
+        return f"Edited '{filename}': replaced 1 occurrence."
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+
+def delete_file(args: dict) -> str:
+    filename = args.get("filename", "")
+    if not filename:
+        return "Error: no filename provided."
+
+    target = (SAFE_FILES_DIR / filename).resolve()
+    if SAFE_FILES_DIR not in target.parents and target != SAFE_FILES_DIR:
+        return "Error: access denied outside the allowed folder."
+    if not target.is_file():
+        return f"Error: '{filename}' not found."
+    if target.suffix.lower() not in DELETE_FILE_ALLOWED_EXTENSIONS:
+        return f"Error: delete_file only supports {', '.join(DELETE_FILE_ALLOWED_EXTENSIONS)} files."
+
+    try:
+        target.unlink()
+        return f"Deleted '{filename}'."
+    except Exception as e:
+        return f"Error deleting file: {e}"
+
 # ---------------------------------------------------------------------------
 # Project manager tools (formerly the SillyTavern extension's client-side
 # tools - see project_manager.py for the actual data model/logic). Each
@@ -513,6 +589,36 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "edit_file",
+            "description": "Make a targeted edit to an existing .txt or .md file by replacing one exact, unique piece of text with new text. Use this instead of write_file when only part of a file needs to change.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Name of the existing file to edit."},
+                    "old_text": {"type": "string", "description": "The exact existing text to find and replace. Must be unique within the file - include surrounding context if needed."},
+                    "new_text": {"type": "string", "description": "The text to replace it with."},
+                },
+                "required": ["filename", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "Permanently delete an existing file from the allowed files folder. This cannot be undone - only call this when the user clearly and explicitly asks to delete a specific named file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Name of the file to delete."}
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "project_manager_get_overview",
             "description": "Read the authoritative persistent project/task overview. Call this before proposing project or task changes whenever the relevant project or task is uncertain.",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -625,6 +731,8 @@ TOOL_FUNCTIONS = {
     "save_memory": save_memory_tool,
     "search_documents": search_documents_tool,
     "write_file": write_file,
+    "edit_file": edit_file,
+    "delete_file": delete_file,
     "project_manager_get_overview": project_manager_get_overview,
     "project_manager_create_task": project_manager_create_task,
     "project_manager_update_task_status": project_manager_update_task_status,
@@ -933,6 +1041,24 @@ async def agent_loop(upstream_body: dict):
                             "content": str(result),
                         }
                     )
+
+                    # Placement fix (handover-9): a failure-honesty clause
+                    # sitting once in the system prompt wasn't reliably
+                    # followed (handover-7). Injecting a short reminder
+                    # right next to the failed result, every time, is more
+                    # effective for a 14B model than one buried instruction.
+                    if _tool_call_failed(result):
+                        upstream_body["messages"].append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "The tool call above FAILED. Tell the user honestly that "
+                                    "it failed and why. Do not invent, guess, or substitute "
+                                    "any numbers, facts, or output in its place - not even as "
+                                    "an example or hypothetical."
+                                ),
+                            }
+                        )
                 continue  # loop again so the model can use the tool result
 
             # No tool call -> this is the final answer (already streamed above).
@@ -979,7 +1105,7 @@ async def chat_completions(request: Request):
         "content": (
             "You have tools available: get_current_time, calculate, run_python, "
             "web_search, get_weather, list_files, read_file, save_memory, write_file, "
-            "search_documents, project_manager_get_overview, project_manager_create_task, "
+            "edit_file, delete_file, search_documents, project_manager_get_overview, project_manager_create_task, "
             "project_manager_update_task_status, project_manager_update_task_notes, "
             "project_manager_set_all_tasks_status, project_manager_batch_update. "
             "You MUST call the relevant tool whenever the user "
@@ -995,6 +1121,11 @@ async def chat_completions(request: Request):
             "update a .txt or .md file - use mode 'overwrite' to replace a file's "
             "contents (or create a new one) and mode 'append' to add to the end of "
             "an existing file without erasing it. "
+            "Use edit_file for a small targeted change inside an existing file instead "
+            "of rewriting the whole thing with write_file. Only call delete_file when "
+            "the user clearly and explicitly asks to delete a specific named file - "
+            "never as a side effect of another request, and never guess the filename "
+            "if it's ambiguous; ask the user to confirm instead. "
             "Use the project_manager_* tools only when the user clearly states a "
             "concrete project/task action (create, start, block, complete, cancel, "
             "or annotate a task) - never from hypotheticals or vague wishes. Call "
@@ -1041,6 +1172,7 @@ async def chat_completions(request: Request):
     )
     if project_state_text:
         messages_to_prepend.append({"role": "system", "content": project_state_text})
+    print(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
 
     # Auto-recall: silently check if any saved memories are relevant to what
     # the user just said, and inject them - no tool call needed for this part.
