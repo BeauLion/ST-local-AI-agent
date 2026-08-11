@@ -6,3 +6,5 @@ sentence-transformers
 numpy
 docker
 pypdf
+caldav
+python-dotenv

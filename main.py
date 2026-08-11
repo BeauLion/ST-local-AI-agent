@@ -29,8 +29,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
+import calendar_manager
 import memory
 import project_manager
+from calendar_manager import CalendarError
 from project_manager import ProjectManagerError
 from config import (
     CORS_ALLOWED_ORIGINS,
@@ -370,6 +372,83 @@ def delete_file(args: dict) -> str:
         return f"Error deleting file: {e}"
 
 # ---------------------------------------------------------------------------
+# Calendar tools (calendar_manager.py) - iCloud via CalDAV. Read tools
+# execute immediately; write tools only STAGE a change and return a
+# description - only calendar_confirm_pending actually touches iCloud. See
+# calendar_manager.py's module docstring for the full safety rationale.
+# ---------------------------------------------------------------------------
+
+def _format_events(events: list) -> str:
+    lines = []
+    for e in events:
+        line = f"[{e['uid']}] {e['title']}: {e['start']}"
+        if e["end"]:
+            line += f" - {e['end']}"
+        if e["location"]:
+            line += f" @ {e['location']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def calendar_list_events(args: dict) -> str:
+    try:
+        events = calendar_manager.list_events(
+            args.get("start"), args.get("end"), args.get("calendar_name")
+        )
+    except CalendarError as e:
+        return f"Error: {e}"
+    return _format_events(events) if events else "No events found in that range."
+
+
+def calendar_search_events(args: dict) -> str:
+    try:
+        events = calendar_manager.search_events(
+            args.get("query", ""), args.get("start"), args.get("end"), args.get("calendar_name")
+        )
+    except CalendarError as e:
+        return f"Error: {e}"
+    return _format_events(events) if events else "No matching events found."
+
+
+def calendar_create_event(args: dict) -> str:
+    try:
+        return calendar_manager.stage_create_event(
+            args.get("title", ""), args.get("start", ""), args.get("end"),
+            args.get("location", ""), args.get("description", ""), args.get("calendar_name"),
+        )
+    except CalendarError as e:
+        return f"Error: {e}"
+
+
+def calendar_edit_event(args: dict) -> str:
+    try:
+        return calendar_manager.stage_edit_event(
+            args.get("event_uid", ""), args.get("title"), args.get("start"), args.get("end"),
+            args.get("location"), args.get("description"), args.get("calendar_name"),
+        )
+    except CalendarError as e:
+        return f"Error: {e}"
+
+
+def calendar_delete_event(args: dict) -> str:
+    try:
+        return calendar_manager.stage_delete_event(args.get("event_uid", ""), args.get("calendar_name"))
+    except CalendarError as e:
+        return f"Error: {e}"
+
+
+def calendar_confirm_pending(args: dict) -> str:
+    try:
+        return calendar_manager.confirm_pending()
+    except CalendarError as e:
+        return f"Error: {e}"
+
+
+def calendar_cancel_pending(args: dict) -> str:
+    return calendar_manager.cancel_pending()
+
+
+# ---------------------------------------------------------------------------
 # Project manager tools (formerly the SillyTavern extension's client-side
 # tools - see project_manager.py for the actual data model/logic). Each
 # wrapper here just translates tool args <-> project_manager calls and turns
@@ -619,6 +698,109 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "calendar_list_events",
+            "description": "List events on the user's iCloud calendar in a date range. Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now."},
+                    "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start."},
+                    "calendar_name": {"type": "string", "description": "Only needed if the user has multiple iCloud calendars and named one. Omit otherwise."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_search_events",
+            "description": "Search the user's iCloud calendar by keyword across event titles, locations, and descriptions. Use this to find a specific event (e.g. before editing or deleting it) rather than guessing its UID. Read-only, executes immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword to search for."},
+                    "start": {"type": "string", "description": "Optional start of search range, 'YYYY-MM-DD'. Defaults to 7 days ago."},
+                    "end": {"type": "string", "description": "Optional end of search range, 'YYYY-MM-DD'. Defaults to 90 days ahead."},
+                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_create_event",
+            "description": "Propose creating a new iCloud calendar event. This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Event title."},
+                    "start": {"type": "string", "description": "Start time, 'YYYY-MM-DD HH:MM'."},
+                    "end": {"type": "string", "description": "End time, same format. Defaults to 1 hour after start."},
+                    "location": {"type": "string", "description": "Optional location."},
+                    "description": {"type": "string", "description": "Optional notes/description."},
+                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                },
+                "required": ["title", "start"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_edit_event",
+            "description": "Propose editing an existing iCloud calendar event by its UID (get this from calendar_list_events or calendar_search_events first - never guess a UID). This does NOT apply the edit yet - it only stages the change and returns a description of exactly what would change. Relay that to the user and get explicit confirmation before calling calendar_confirm_pending.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_uid": {"type": "string", "description": "Exact UID of the event to edit, from a prior list/search result."},
+                    "title": {"type": "string", "description": "New title, if changing it."},
+                    "start": {"type": "string", "description": "New start time 'YYYY-MM-DD HH:MM', if changing it."},
+                    "end": {"type": "string", "description": "New end time, if changing it."},
+                    "location": {"type": "string", "description": "New location, if changing it."},
+                    "description": {"type": "string", "description": "New description/notes, if changing it."},
+                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                },
+                "required": ["event_uid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_delete_event",
+            "description": "Propose permanently deleting an existing iCloud calendar event by its UID (get this from calendar_list_events or calendar_search_events first - never guess a UID). This does NOT delete it yet - it only stages the change. Relay the description to the user and get explicit confirmation before calling calendar_confirm_pending.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_uid": {"type": "string", "description": "Exact UID of the event to delete, from a prior list/search result."},
+                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                },
+                "required": ["event_uid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_confirm_pending",
+            "description": "Apply the currently staged calendar change (from calendar_create_event, calendar_edit_event, or calendar_delete_event) to the real iCloud calendar. Only call this as your very next tool call after the user's following message clearly and explicitly confirms (e.g. 'yes', 'confirm', 'go ahead', 'do it'). Never call this speculatively, preemptively, or without an explicit confirmation message from the user in between.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_cancel_pending",
+            "description": "Discard the currently staged calendar change without applying it. Call this if the user declines, says no, or asks for something different instead of confirming.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "project_manager_get_overview",
             "description": "Read the authoritative persistent project/task overview. Call this before proposing project or task changes whenever the relevant project or task is uncertain.",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -733,6 +915,13 @@ TOOL_FUNCTIONS = {
     "write_file": write_file,
     "edit_file": edit_file,
     "delete_file": delete_file,
+    "calendar_list_events": calendar_list_events,
+    "calendar_search_events": calendar_search_events,
+    "calendar_create_event": calendar_create_event,
+    "calendar_edit_event": calendar_edit_event,
+    "calendar_delete_event": calendar_delete_event,
+    "calendar_confirm_pending": calendar_confirm_pending,
+    "calendar_cancel_pending": calendar_cancel_pending,
     "project_manager_get_overview": project_manager_get_overview,
     "project_manager_create_task": project_manager_create_task,
     "project_manager_update_task_status": project_manager_update_task_status,
@@ -1105,7 +1294,10 @@ async def chat_completions(request: Request):
         "content": (
             "You have tools available: get_current_time, calculate, run_python, "
             "web_search, get_weather, list_files, read_file, save_memory, write_file, "
-            "edit_file, delete_file, search_documents, project_manager_get_overview, project_manager_create_task, "
+            "edit_file, delete_file, search_documents, calendar_list_events, "
+            "calendar_search_events, calendar_create_event, calendar_edit_event, "
+            "calendar_delete_event, calendar_confirm_pending, calendar_cancel_pending, "
+            "project_manager_get_overview, project_manager_create_task, "
             "project_manager_update_task_status, project_manager_update_task_notes, "
             "project_manager_set_all_tasks_status, project_manager_batch_update. "
             "You MUST call the relevant tool whenever the user "
@@ -1126,6 +1318,19 @@ async def chat_completions(request: Request):
             "the user clearly and explicitly asks to delete a specific named file - "
             "never as a side effect of another request, and never guess the filename "
             "if it's ambiguous; ask the user to confirm instead. "
+            "Use calendar_list_events or calendar_search_events freely to read the "
+            "user's iCloud calendar - these are read-only and need no confirmation. "
+            "calendar_create_event, calendar_edit_event, and calendar_delete_event "
+            "NEVER change the real calendar by themselves - they only stage a "
+            "proposed change and return a description of it. After calling one, tell "
+            "the user exactly what will happen and wait for their reply. Only call "
+            "calendar_confirm_pending as your very next tool call if the user's "
+            "following message clearly and explicitly confirms (e.g. 'yes', "
+            "'confirm', 'go ahead') - never call it speculatively, preemptively, or "
+            "on the same turn as staging the change. If the user declines or wants "
+            "something different, call calendar_cancel_pending instead. Always look "
+            "up an event's UID with calendar_list_events or calendar_search_events "
+            "before editing or deleting it - never guess a UID. "
             "Use the project_manager_* tools only when the user clearly states a "
             "concrete project/task action (create, start, block, complete, cancel, "
             "or annotate a task) - never from hypotheticals or vague wishes. Call "
