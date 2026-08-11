@@ -1381,19 +1381,9 @@ async def chat_completions(request: Request):
             + (
                 f"Additional tools provided by the connected frontend are also "
                 f"available this turn: {', '.join(sorted(client_tool_names))}. Call "
-                f"them normally, following their own descriptions, when they fit "
-                f"the user's request. "
+                f"them normally, following their own descriptions, and only when they "
+                f"clearly fit the user's request. "
                 if client_tool_names else ""
-            )
-            + (
-                "IMPORTANT DISTINCTION: schedule_character_action schedules a "
-                "future in-character/roleplay action or message from the AI "
-                "persona - it has nothing to do with the user's real-world "
-                "calendar. If the user asks to schedule, create, book, or add a "
-                "real appointment, meeting, or event (e.g. 'schedule a dentist "
-                "appointment', 'add coffee with friends tomorrow at 10'), always "
-                "use calendar_create_event instead, never schedule_character_action. "
-                if "schedule_character_action" in client_tool_names else ""
             ) +
             "IMPORTANT for multi-step questions: if answering fully requires "
             "several pieces of information, call tools one at a time in sequence, "
