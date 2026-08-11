@@ -94,6 +94,15 @@ def start_agent_server() -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
+    # Windows' default console/pipe encoding for a Python process is often
+    # the legacy cp1252 codepage, which can't represent every Unicode
+    # character (e.g. certain punctuation in a real iCloud calendar name,
+    # or curly quotes/em-dashes in free text). Without this, any tool
+    # result containing such a character crashes the debug print()
+    # statements in main.py (and takes the whole request down with it) -
+    # this forces UTF-8 instead, which can represent anything.
+    env["PYTHONIOENCODING"] = "utf-8"
+
     return subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env=env,

@@ -386,8 +386,18 @@ def _format_events(events: list) -> str:
             line += f" - {e['end']}"
         if e["location"]:
             line += f" @ {e['location']}"
+        if e.get("calendar"):
+            line += f" ({e['calendar']})"
         lines.append(line)
     return "\n".join(lines)
+
+
+def calendar_list_calendars(args: dict) -> str:
+    try:
+        names = calendar_manager.list_calendar_names()
+    except CalendarError as e:
+        return f"Error: {e}"
+    return "Available iCloud calendars: " + ", ".join(names)
 
 
 def calendar_list_events(args: dict) -> str:
@@ -698,13 +708,21 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "calendar_list_calendars",
+            "description": "List the names of all iCloud calendars on the user's account. Use this if the user asks what calendars they have, or if events seem to be missing from calendar_list_events/calendar_search_events results and you want to check what calendar_name values are valid. Read-only, executes immediately.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calendar_list_events",
-            "description": "List events on the user's iCloud calendar in a date range. Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately. IMPORTANT: for any relative date ('today', 'this week', etc.), call get_current_time first and compute real dates from it - never guess today's date or year.",
+            "description": "List events across ALL of the user's iCloud calendars in a date range (or just one calendar if calendar_name is given). Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately. IMPORTANT: compute any relative date ('today', 'this week', etc.) from the [CURRENT DATE/TIME] system message already provided - never guess or use a training-data date/year.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now."},
-                    "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start."},
+                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the same date for both start and end - that returns the whole day."},
+                    "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start. Same value as start is valid and means 'just that one day'."},
                     "calendar_name": {"type": "string", "description": "Only needed if the user has multiple iCloud calendars and named one. Omit otherwise."},
                 },
                 "required": [],
@@ -715,7 +733,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_search_events",
-            "description": "Search the user's iCloud calendar by keyword across event titles, locations, and descriptions. Use this to find a specific event (e.g. before editing or deleting it) rather than guessing its UID. Read-only, executes immediately. IMPORTANT: for a relative date range, call get_current_time first - never guess today's date or year.",
+            "description": "Search across ALL of the user's iCloud calendars by keyword in event titles, locations, and descriptions (or just one calendar if calendar_name is given). Use this to find a specific event (e.g. before editing or deleting it) rather than guessing its UID. Read-only, executes immediately. IMPORTANT: compute any relative date range from the [CURRENT DATE/TIME] system message already provided - never guess or use a training-data date/year.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -732,7 +750,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_create_event",
-            "description": "Propose creating a new iCloud calendar event. This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending. IMPORTANT: for a relative date/time ('tomorrow', 'next Friday', etc.), call get_current_time first and compute the real date - never guess today's date or year.",
+            "description": "Propose creating a new REAL event on the user's iCloud calendar (an actual appointment, meeting, or plan - not an in-character/roleplay scheduled action). This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending. IMPORTANT: compute any relative date/time ('tomorrow', 'next Friday', etc.) from the [CURRENT DATE/TIME] system message already provided - never guess or use a training-data date/year.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -915,6 +933,7 @@ TOOL_FUNCTIONS = {
     "write_file": write_file,
     "edit_file": edit_file,
     "delete_file": delete_file,
+    "calendar_list_calendars": calendar_list_calendars,
     "calendar_list_events": calendar_list_events,
     "calendar_search_events": calendar_search_events,
     "calendar_create_event": calendar_create_event,
@@ -1294,7 +1313,8 @@ async def chat_completions(request: Request):
         "content": (
             "You have tools available: get_current_time, calculate, run_python, "
             "web_search, get_weather, list_files, read_file, save_memory, write_file, "
-            "edit_file, delete_file, search_documents, calendar_list_events, "
+            "edit_file, delete_file, search_documents, calendar_list_calendars, "
+            "calendar_list_events, "
             "calendar_search_events, calendar_create_event, calendar_edit_event, "
             "calendar_delete_event, calendar_confirm_pending, calendar_cancel_pending, "
             "project_manager_get_overview, project_manager_create_task, "
@@ -1319,14 +1339,19 @@ async def chat_completions(request: Request):
             "never as a side effect of another request, and never guess the filename "
             "if it's ambiguous; ask the user to confirm instead. "
             "Use calendar_list_events or calendar_search_events freely to read the "
-            "user's iCloud calendar - these are read-only and need no confirmation. "
-            "CRITICAL: before calling calendar_list_events or calendar_search_events "
-            "with any relative date phrase ('this week', 'today', 'tomorrow', 'next "
-            "month', etc.), you MUST call get_current_time first if you haven't "
-            "already this conversation, then compute the actual start/end dates from "
-            "that real result. NEVER guess or assume today's date or year from "
-            "memory for a calendar call - a wrong year will silently return the "
-            "wrong (usually empty) results instead of erroring, so this mistake is "
+            "user's iCloud calendar - these are read-only, need no confirmation, and "
+            "search across all of the user's calendars by default. If the user asks "
+            "what calendars they have, or expected events aren't showing up, call "
+            "calendar_list_calendars to see the actual calendar names. "
+            "CRITICAL: a system message near the top of this conversation, labeled "
+            "[CURRENT DATE/TIME], gives you today's real date and time on every "
+            "single request - use it to compute any relative date phrase ('this "
+            "week', 'today', 'tomorrow', 'next month', etc.) for calendar_list_events, "
+            "calendar_search_events, calendar_create_event, and calendar_edit_event. "
+            "You do NOT need to call get_current_time for this - the date is already "
+            "provided fresh every turn. NEVER guess or assume a date/year from memory "
+            "or training data for a calendar call - a wrong year will silently return "
+            "the wrong (usually empty) results instead of erroring, so this mistake is "
             "easy to make and easy to miss. If you don't need a specific range, you "
             "may also omit start/end entirely and let the tool default to today "
             "onward. "
@@ -1359,6 +1384,16 @@ async def chat_completions(request: Request):
                 f"them normally, following their own descriptions, when they fit "
                 f"the user's request. "
                 if client_tool_names else ""
+            )
+            + (
+                "IMPORTANT DISTINCTION: schedule_character_action schedules a "
+                "future in-character/roleplay action or message from the AI "
+                "persona - it has nothing to do with the user's real-world "
+                "calendar. If the user asks to schedule, create, book, or add a "
+                "real appointment, meeting, or event (e.g. 'schedule a dentist "
+                "appointment', 'add coffee with friends tomorrow at 10'), always "
+                "use calendar_create_event instead, never schedule_character_action. "
+                if "schedule_character_action" in client_tool_names else ""
             ) +
             "IMPORTANT for multi-step questions: if answering fully requires "
             "several pieces of information, call tools one at a time in sequence, "
@@ -1379,6 +1414,26 @@ async def chat_completions(request: Request):
         ),
     }
     messages_to_prepend = [tool_instruction]
+
+    # Inject the real current date/time on EVERY request, the same pattern
+    # used for project state and memory recall below. Previously the model
+    # was only told to call get_current_time when reasoning about relative
+    # dates ("tomorrow", "this week") - that worked right after the call,
+    # but in a longer conversation that tool result can scroll out of the
+    # 8192-token context window, and the model reverts to guessing (usually
+    # a training-data-plausible year like 2023). Injecting it fresh every
+    # turn removes the dependency on the model remembering to check, or on
+    # that earlier result still being in context - this matters most for
+    # the calendar tools, where a wrong year silently returns the wrong
+    # (often empty) results instead of erroring.
+    current_datetime_text = (
+        f"[CURRENT DATE/TIME] {datetime.now().strftime('%A, %Y-%m-%d %H:%M:%S')}. "
+        f"This is the real, authoritative current date and time. Use it for any "
+        f"relative date/time calculation (today, tomorrow, this week, next Friday, "
+        f"etc.) - especially for the calendar tools. Never guess or assume a "
+        f"different date or year from memory or training data."
+    )
+    messages_to_prepend.append({"role": "system", "content": current_datetime_text})
 
     # Server-side equivalent of the old extension's setExtensionPrompt():
     # inject the focused project's state directly, no tool call needed.

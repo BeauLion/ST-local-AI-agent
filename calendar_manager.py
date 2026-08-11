@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import caldav
+import icalendar
 from dotenv import load_dotenv
 
 from config import (
@@ -165,24 +166,43 @@ def _parse_datetime(value: str) -> datetime:
     raise CalendarError(f"Could not parse date/time '{value}'. Use 'YYYY-MM-DD HH:MM'.")
 
 
-def _vevent_field(vevent, name: str, default: str = ""):
-    return str(getattr(vevent, name).value) if hasattr(vevent, name) else default
+def _ical_field(component, name: str, default: str = ""):
+    """Read a field off an icalendar Event component. Date/time fields come
+    back as vDDDTypes with a .dt attribute; plain text fields are returned
+    directly by .get(). Both are coerced to plain strings for the model."""
+    value = component.get(name)
+    if value is None:
+        return default
+    if hasattr(value, "dt"):
+        return str(value.dt)
+    return str(value)
 
 
-def _event_to_dict(event) -> dict:
+def _event_to_dict(event, calendar_label: str = "") -> dict:
     try:
-        vevent = event.vobject_instance.vevent
+        component = event.icalendar_component
     except Exception as e:
         raise CalendarError(f"Could not read an event's data: {e}")
+    if component is None:
+        raise CalendarError("Could not read an event's data: empty calendar object.")
 
     return {
-        "uid": _vevent_field(vevent, "uid"),
-        "title": _vevent_field(vevent, "summary", "(no title)"),
-        "start": _vevent_field(vevent, "dtstart"),
-        "end": _vevent_field(vevent, "dtend"),
-        "location": _vevent_field(vevent, "location"),
-        "description": _vevent_field(vevent, "description"),
+        "uid": _ical_field(component, "uid"),
+        "title": _ical_field(component, "summary", "(no title)"),
+        "start": _ical_field(component, "dtstart"),
+        "end": _ical_field(component, "dtend"),
+        "location": _ical_field(component, "location"),
+        "description": _ical_field(component, "description"),
+        "calendar": calendar_label,
     }
+
+
+def list_calendar_names() -> list[str]:
+    """Every calendar name on the account - lets the user/model see what's
+    available, e.g. to troubleshoot events not showing up or to target a
+    specific calendar by name in the write tools."""
+    calendars = _get_calendars()
+    return [c.name or "(unnamed)" for c in calendars]
 
 
 # ---------------------------------------------------------------------------
@@ -190,18 +210,33 @@ def _event_to_dict(event) -> dict:
 # ---------------------------------------------------------------------------
 
 def list_events(start: str = None, end: str = None, calendar_name: str = None) -> list[dict]:
-    cal = _resolve_calendar(calendar_name)
+    # Default to searching EVERY calendar on the account - a named
+    # calendar_name narrows to just one. Without this, events silently
+    # wouldn't show up if they live on any calendar other than whichever
+    # one iCloud happens to return first.
+    calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
+
     start_dt = _parse_datetime(start) if start else datetime.now()
-    end_dt = _parse_datetime(end) if end else start_dt + timedelta(days=CALENDAR_DEFAULT_LOOKAHEAD_DAYS)
-    if end_dt <= start_dt:
-        raise CalendarError("End must be after start.")
+    if end:
+        end_dt = _parse_datetime(end)
+        if end_dt <= start_dt:
+            # A single day is naturally expressed as the same date for both
+            # start and end (e.g. "tomorrow" -> start='2026-08-12',
+            # end='2026-08-12'). Treat that as "the whole day" rather than
+            # rejecting it as a zero-length range.
+            end_dt = start_dt + timedelta(days=1)
+    else:
+        end_dt = start_dt + timedelta(days=CALENDAR_DEFAULT_LOOKAHEAD_DAYS)
 
-    try:
-        events = cal.date_search(start_dt, end_dt)
-    except Exception as e:
-        raise CalendarError(f"Could not fetch events: {e}")
+    results = []
+    for cal in calendars:
+        label = cal.name or "(unnamed)"
+        try:
+            events = cal.date_search(start_dt, end_dt)
+        except Exception as e:
+            raise CalendarError(f"Could not fetch events from '{label}': {e}")
+        results.extend(_event_to_dict(e, label) for e in events)
 
-    results = [_event_to_dict(e) for e in events]
     results.sort(key=lambda e: e["start"])
     return results
 
@@ -209,22 +244,25 @@ def list_events(start: str = None, end: str = None, calendar_name: str = None) -
 def search_events(query: str, start: str = None, end: str = None, calendar_name: str = None) -> list[dict]:
     if not query or not query.strip():
         raise CalendarError("A search query is required.")
-    cal = _resolve_calendar(calendar_name)
+
+    calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
+
     start_dt = _parse_datetime(start) if start else datetime.now() - timedelta(days=CALENDAR_SEARCH_LOOKBACK_DAYS)
     end_dt = _parse_datetime(end) if end else datetime.now() + timedelta(days=CALENDAR_SEARCH_LOOKAHEAD_DAYS)
 
-    try:
-        events = cal.date_search(start_dt, end_dt)
-    except Exception as e:
-        raise CalendarError(f"Could not search events: {e}")
-
     key = query.strip().lower()
     matches = []
-    for event in events:
-        d = _event_to_dict(event)
-        haystack = f"{d['title']} {d['description']} {d['location']}".lower()
-        if key in haystack:
-            matches.append(d)
+    for cal in calendars:
+        label = cal.name or "(unnamed)"
+        try:
+            events = cal.date_search(start_dt, end_dt)
+        except Exception as e:
+            raise CalendarError(f"Could not search '{label}': {e}")
+        for event in events:
+            d = _event_to_dict(event, label)
+            haystack = f"{d['title']} {d['description']} {d['location']}".lower()
+            if key in haystack:
+                matches.append(d)
     matches.sort(key=lambda e: e["start"])
     return matches
 
@@ -274,7 +312,7 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
 
     def apply_fn() -> str:
         try:
-            cal.save_event(
+            cal.add_event(
                 dtstart=start_dt, dtend=end_dt, summary=title,
                 location=location or None, description=description or None,
             )
@@ -284,7 +322,8 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
 
     desc = (f"CREATE '{title}' on {start_dt.strftime('%a %Y-%m-%d')} "
             f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
-            + (f" at {location}" if location else ""))
+            + (f" at {location}" if location else "")
+            + f" (in calendar '{cal.name or '(unnamed)'}')")
     return _stage(desc, apply_fn)
 
 
@@ -315,29 +354,21 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
 
     def apply_fn() -> str:
         try:
-            # caldav's documented pattern for edits: borrow the live vobject
-            # via this context manager, mutate it, then call save() once
-            # released. (Direct mutation of event.vobject_instance also
-            # works on the installed version, but this is what caldav's own
-            # docs demonstrate, so it's the safer bet across versions.)
-            with event.edit_vobject_instance() as vobj:
-                vevent = vobj.vevent
+            # caldav 2.0+ no longer bundles vobject by default - icalendar
+            # is the properly-supported dependency, so edits go through
+            # edit_icalendar_component() (caldav's own documented pattern
+            # for this) instead of the older vobject-based API.
+            with event.edit_icalendar_component() as comp:
                 if title:
-                    vevent.summary.value = title
+                    comp["SUMMARY"] = title
                 if start:
-                    vevent.dtstart.value = _parse_datetime(start)
+                    comp["DTSTART"] = icalendar.vDDDTypes(_parse_datetime(start))
                 if end:
-                    vevent.dtend.value = _parse_datetime(end)
+                    comp["DTEND"] = icalendar.vDDDTypes(_parse_datetime(end))
                 if location is not None:
-                    if hasattr(vevent, "location"):
-                        vevent.location.value = location
-                    else:
-                        vevent.add("location").value = location
+                    comp["LOCATION"] = location
                 if description is not None:
-                    if hasattr(vevent, "description"):
-                        vevent.description.value = description
-                    else:
-                        vevent.add("description").value = description
+                    comp["DESCRIPTION"] = description
             event.save()
         except Exception as e:
             raise CalendarError(f"Failed to edit event: {e}")
@@ -354,7 +385,7 @@ def stage_delete_event(event_uid: str, calendar_name: str = None) -> str:
     cal = _resolve_calendar(calendar_name)
     try:
         event = cal.event_by_uid(event_uid.strip())
-        title = _vevent_field(event.vobject_instance.vevent, "summary", event_uid)
+        title = _ical_field(event.icalendar_component, "summary", event_uid)
     except Exception as e:
         raise CalendarError(f"Event with UID '{event_uid}' not found: {e}")
 
