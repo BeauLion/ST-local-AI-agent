@@ -116,6 +116,7 @@ _RELATIVE_DATE_RE = re.compile(
     r"this (?:morning|afternoon|evening|week|weekend|month)|"
     r"next (?:week|weekend|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
     r"this (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"day after tomorrow"
     r")\b",
     re.IGNORECASE,
