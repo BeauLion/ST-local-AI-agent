@@ -106,7 +106,7 @@ _CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_edit_event", "calend
 # the paired stage call happened to fail (network timeout) first.
 _CALENDAR_APPLY_TOOLS = {"calendar_confirm_pending"}
 _BARE_CONFIRMATION_RE = re.compile(
-    r"^(yes|yeah|yep|sure|ok|okay|confirm|confirmed|go ahead|do it|correct|proceed)[.!]?$",
+    r"""^["'\s]*(yes|yeah|yep|sure|ok|okay|confirm|confirmed|go ahead|do it|correct|proceed)[.!]?["'\s]*$""",
     re.IGNORECASE,
 )
 
