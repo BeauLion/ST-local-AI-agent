@@ -41,6 +41,8 @@ from config import (
     CALENDAR_PENDING_CHANGE_TTL_MINUTES,
     CALENDAR_SEARCH_LOOKAHEAD_DAYS,
     CALENDAR_SEARCH_LOOKBACK_DAYS,
+    CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS,
+    CALENDAR_UID_LOOKUP_LOOKBACK_DAYS,
     ICLOUD_APP_PASSWORD_ENV_VAR,
     ICLOUD_CALDAV_URL,
     ICLOUD_USERNAME_ENV_VAR,
@@ -341,35 +343,61 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
     return _stage(desc, apply_fn)
 
 
-def _find_event_with_fallback(cal, event_uid: str):
-    """Look up an event by UID on `cal`. Live testing showed the model
-    sometimes fabricates a plausible-looking UUID for event_uid instead of
-    copying the real one - even when it was shown it directly a turn or two
-    earlier. In a single-user setup, a fabricated UID overwhelmingly means
-    "the one event I was just shown", not a genuine reference to something
-    else - so if the exact UID isn't found, fall back to the most recent
-    list/search result IF it contained exactly one event on this calendar.
-    Multiple recent candidates raise instead of guessing which was meant;
-    this never bypasses the separate staged-change confirmation step.
-    Returns (event, resolved_uid, was_corrected).
-    """
+def _get_event_by_uid_via_search(cal, uid: str):
+    """Find an event by UID using date_search() + in-memory filtering,
+    instead of caldav's own event_by_uid(). Live testing showed
+    event_by_uid() fails against iCloud (412 Precondition Failed) even when
+    given a genuinely correct UID - it likely guesses a resource URL
+    internally rather than truly searching. date_search() is the same
+    mechanism list_events/search_events already use successfully, so
+    resolving by UID reuses it too. Returns the event, or None if no event
+    with that UID was found in the scanned window."""
+    start_dt = datetime.now() - timedelta(days=CALENDAR_UID_LOOKUP_LOOKBACK_DAYS)
+    end_dt = datetime.now() + timedelta(days=CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS)
     try:
-        return cal.event_by_uid(event_uid), event_uid, False
-    except Exception as first_error:
-        with _last_results_lock:
-            candidates = list(_last_results)
-        pool = [c for c in candidates if c.get("calendar") == (cal.name or "(unnamed)")] or candidates
-        if len(pool) == 1:
-            corrected_uid = pool[0]["uid"]
-            try:
-                return cal.event_by_uid(corrected_uid), corrected_uid, True
-            except Exception:
-                pass
-        raise CalendarError(
-            f"Event with UID '{event_uid}' not found: {first_error}. Call "
-            f"calendar_list_events or calendar_search_events again to get the "
-            f"exact uid, then retry using that exact value."
-        )
+        events = cal.date_search(start_dt, end_dt)
+    except Exception as e:
+        raise CalendarError(f"Could not search '{cal.name or '(unnamed)'}' for the event: {e}")
+    for event in events:
+        try:
+            component = event.icalendar_component
+        except Exception:
+            continue
+        if component is not None and str(component.get("uid", "")) == uid:
+            return event
+    return None
+
+
+def _find_event_with_fallback(cal, event_uid: str):
+    """Resolve an event by UID on `cal`, via _get_event_by_uid_via_search.
+    Live testing also showed the model sometimes fabricates a
+    plausible-looking UUID instead of copying the real one it was just
+    shown. In this single-user setup a fabricated/unmatched UID
+    overwhelmingly means "the one event I was just shown" - so if the exact
+    UID isn't found, fall back to the most recent list/search result IF it
+    named exactly one event on this calendar. Multiple recent candidates
+    raise instead of guessing which was meant; this never bypasses the
+    separate staged-change confirmation step. Returns (event, resolved_uid,
+    was_corrected)."""
+    event = _get_event_by_uid_via_search(cal, event_uid)
+    if event is not None:
+        return event, event_uid, False
+
+    with _last_results_lock:
+        candidates = list(_last_results)
+    pool = [c for c in candidates if c.get("calendar") == (cal.name or "(unnamed)")] or candidates
+    if len(pool) == 1:
+        corrected_uid = pool[0]["uid"]
+        corrected_event = _get_event_by_uid_via_search(cal, corrected_uid)
+        if corrected_event is not None:
+            return corrected_event, corrected_uid, corrected_uid != event_uid
+
+    raise CalendarError(
+        f"Could not find an event with uid '{event_uid}' in the last "
+        f"{CALENDAR_UID_LOOKUP_LOOKBACK_DAYS}-{CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS} day "
+        f"window. Call calendar_list_events or calendar_search_events again "
+        f"to get the exact uid, then retry using that exact value."
+    )
 
 
 def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: str = None,
@@ -444,6 +472,17 @@ def stage_delete_event(event_uid: str, calendar_name: str = None) -> str:
     if corrected:
         desc += " (auto-matched to the event just shown in your last search/list result)"
     return _stage(desc, apply_fn)
+
+
+def has_pending_change() -> bool:
+    """Whether a staged (unconfirmed, unexpired) calendar change currently
+    exists. Used by main.py to detect when the model re-stages a change
+    instead of calling calendar_confirm_pending after the user has already
+    confirmed - see the matching guard in agent_loop, added after live
+    testing showed the model looping: re-staging the identical change on
+    every 'confirm' instead of ever actually applying it."""
+    with _pending_lock:
+        return _peek_pending() is not None
 
 
 def confirm_pending() -> str:

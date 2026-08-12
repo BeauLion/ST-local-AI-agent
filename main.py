@@ -15,6 +15,7 @@ Run with:
 
 import asyncio
 import json
+import re
 import tempfile
 import time
 import uuid
@@ -84,6 +85,30 @@ def _tool_call_failed(result) -> bool:
 # either has executed.
 _CALENDAR_READ_TOOLS = {"calendar_list_events", "calendar_search_events"}
 _CALENDAR_UID_WRITE_TOOLS = {"calendar_edit_event", "calendar_delete_event"}
+
+# Live testing also showed a second failure mode: after staging a change,
+# the model sometimes responds to the user's plain "confirm" by calling the
+# STAGE tool again (e.g. calendar_edit_event a second time) instead of
+# calendar_confirm_pending - silently re-staging the identical change
+# forever instead of ever actually applying it. Detected here in code
+# rather than relying on the prompt instruction alone, which live testing
+# showed isn't reliably followed. Only matches short, bare confirmations
+# (e.g. "yes", "confirm") - a longer message is treated as a new request,
+# not blocked, in case the user is actually asking to change something.
+_CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_edit_event", "calendar_delete_event"}
+
+# A stage tool and calendar_confirm_pending in the SAME response batch is
+# unsafe even though this server executes calls sequentially within a
+# batch (so confirm_pending would see the fresh stage): the user never
+# actually saw the staged description before it got applied, which
+# defeats the whole point of the two-step confirm safety model. Live
+# testing showed this happen for real - only harmless that time because
+# the paired stage call happened to fail (network timeout) first.
+_CALENDAR_APPLY_TOOLS = {"calendar_confirm_pending"}
+_BARE_CONFIRMATION_RE = re.compile(
+    r"^(yes|yeah|yep|sure|ok|okay|confirm|confirmed|go ahead|do it|correct|proceed)[.!]?$",
+    re.IGNORECASE,
+)
 
 
 # Lets the SillyTavern extension's browser-side fetch() calls (a different
@@ -1250,6 +1275,15 @@ async def agent_loop(upstream_body: dict):
                     else set()
                 )
 
+                pending_calendar_change = calendar_manager.has_pending_change()
+                last_user_text = next(
+                    (m.get("content") for m in reversed(upstream_body["messages"]) if m.get("role") == "user"),
+                    "",
+                )
+                looks_like_bare_confirmation = bool(
+                    _BARE_CONFIRMATION_RE.match(str(last_user_text or "").strip())
+                )
+
                 for call in calls:
                     name = call["function"]["name"]
                     try:
@@ -1269,6 +1303,32 @@ async def agent_loop(upstream_body: dict):
                             f"guessed. Wait for the search/list result, THEN call {name} "
                             f"again as a separate follow-up using the exact uid field from "
                             f"that result. Do not guess or invent a UID."
+                        )
+                    elif name in _CALENDAR_APPLY_TOOLS and (names_in_batch & _CALENDAR_STAGE_TOOLS):
+                        # confirm_pending requested in the same response as
+                        # a stage call - block it so the user always sees
+                        # the real staged description first, in its own
+                        # turn, before anything can be applied.
+                        result = (
+                            "Error: calendar_confirm_pending was NOT called. It was requested "
+                            "in the same response as a calendar create/edit/delete call, before "
+                            "the user could see and confirm the actual staged description. Stop "
+                            "here: relay the staged change's description to the user and wait "
+                            "for their explicit confirmation in a SEPARATE following message "
+                            "before calling calendar_confirm_pending."
+                        )
+                    elif name in _CALENDAR_STAGE_TOOLS and pending_calendar_change and looks_like_bare_confirmation:
+                        # A change is already staged, and the user's last
+                        # message reads as a plain confirmation of it, not a
+                        # new/different request - re-staging now would just
+                        # loop forever without ever applying anything.
+                        result = (
+                            f"Error: {name} was NOT called. A calendar change is already "
+                            f"staged, and the user's last message ('{str(last_user_text).strip()}') "
+                            f"looks like a confirmation of it, not a new or different request. "
+                            f"Call calendar_confirm_pending now instead to actually apply the "
+                            f"staged change. If the user meant something different, call "
+                            f"calendar_cancel_pending first, then propose the new change."
                         )
                     else:
                         # Run in a thread so a slow web search doesn't freeze the server.

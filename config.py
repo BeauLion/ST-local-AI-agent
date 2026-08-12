@@ -168,6 +168,15 @@ CALENDAR_SEARCH_LOOKAHEAD_DAYS = 90
 # conversation can't accidentally apply an old, stale proposed change.
 CALENDAR_PENDING_CHANGE_TTL_MINUTES = 10
 
+# How wide a date_search() window to scan when resolving an event by UID
+# for edit/delete (calendar_manager._get_event_by_uid_via_search). caldav's
+# own event_by_uid() proved unreliable against iCloud even with a genuinely
+# correct UID (likely guesses a resource URL internally rather than really
+# searching) - date_search()+filter is the same mechanism list/search
+# already use successfully, so it's used here too instead.
+CALENDAR_UID_LOOKUP_LOOKBACK_DAYS = 365
+CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS = 365
+
 
 # ─────────────────────────────────────────────────────────────
 # run_python tool (Docker sandbox)
