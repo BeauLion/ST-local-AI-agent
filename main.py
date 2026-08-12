@@ -110,6 +110,32 @@ _BARE_CONFIRMATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RELATIVE_DATE_RE = re.compile(
+    r"\b("
+    r"today|tonight|tomorrow|yesterday|"
+    r"this (?:morning|afternoon|evening|week|weekend|month)|"
+    r"next (?:week|weekend|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"this (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"day after tomorrow"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _calendar_read_tool_seen(messages: list) -> bool:
+    """True if a calendar_list_events/calendar_search_events call appears
+    anywhere earlier in this conversation - used to establish that the
+    current exchange is actually calendar-related before the stale-answer
+    guard below fires, so it doesn't trigger on an unrelated message that
+    happens to contain the word "today"."""
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if tc.get("function", {}).get("name") in _CALENDAR_READ_TOOLS:
+                return True
+    return False
+
 
 # Lets the SillyTavern extension's browser-side fetch() calls (a different
 # origin/port than this server) reach the /projects endpoints below.
@@ -1404,6 +1430,34 @@ async def agent_loop(upstream_body: dict):
                 })
                 continue
 
+            stale_calendar_answer = (
+                not unresolved_confirmation
+                and bool(_RELATIVE_DATE_RE.search(str(last_user_text_for_check or "")))
+                and _calendar_read_tool_seen(upstream_body["messages"])
+            )
+            if stale_calendar_answer:
+                print("[AGENT] Model answered a date-specific calendar question without "
+                      "calling a calendar tool this turn - discarding that answer and "
+                      "forcing a fresh, explicitly-scoped call instead of trusting an "
+                      "earlier result still in context.")
+                upstream_body["messages"].append({"role": "assistant", "content": content or None})
+                upstream_body["messages"].append({
+                    "role": "system",
+                    "content": (
+                        "STOP: you answered without calling calendar_list_events or "
+                        "calendar_search_events this turn, but the user's message named a "
+                        "specific day or relative date. Do not answer from an earlier "
+                        "calendar result already in this conversation, even if it looks "
+                        "like it covers the right day - you have gotten this wrong before "
+                        "(repeating a previous day's answer instead of the day actually "
+                        "asked about). Call calendar_list_events or calendar_search_events "
+                        "again now, with start and end set explicitly to the exact "
+                        "date/range just asked about (computed from the [CURRENT "
+                        "DATE/TIME] system message), then answer from that fresh result."
+                    ),
+                })
+                continue
+
             print("[AGENT] Model answered directly, without calling any tool.")
             if content:
                 yield ("delta", content)
@@ -1486,9 +1540,20 @@ async def chat_completions(request: Request):
             "provided fresh every turn. NEVER guess or assume a date/year from memory "
             "or training data for a calendar call - a wrong year will silently return "
             "the wrong (usually empty) results instead of erroring, so this mistake is "
-            "easy to make and easy to miss. If you don't need a specific range, you "
-            "may also omit start/end entirely and let the tool default to today "
-            "onward. "
+            "easy to make and easy to miss. If the user names a specific day or range "
+            "('today', 'tomorrow', 'this week', a weekday, a date), ALWAYS pass start "
+            "and end computed for exactly that day/range - do not omit them, since the "
+            "tool's default window spans multiple days and mixes other days' events "
+            "into the same result. Only omit start/end for a genuinely open-ended "
+            "request with no date reference at all (e.g. 'what's coming up'). "
+            "CRITICAL: every new calendar question - including a short follow-up like "
+            "'and today?' - needs its OWN fresh calendar_list_events or "
+            "calendar_search_events call scoped to exactly what's being asked, even if "
+            "you already fetched calendar data earlier in this same conversation. Never "
+            "answer a calendar question by eye from an earlier tool result instead of "
+            "calling the tool again - you have been unreliable at correctly telling "
+            "apart which entries in an earlier multi-day result belong to the day now "
+            "being asked about. "
             "calendar_create_event, calendar_edit_event, and calendar_delete_event "
             "NEVER change the real calendar by themselves - they only stage a "
             "proposed change and return a description of it. After calling one, tell "
