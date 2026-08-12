@@ -343,54 +343,83 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
     return _stage(desc, apply_fn)
 
 
-def _get_event_by_uid_via_search(cal, uid: str):
-    """Find an event by UID using date_search() + in-memory filtering,
-    instead of caldav's own event_by_uid(). Live testing showed
-    event_by_uid() fails against iCloud (412 Precondition Failed) even when
-    given a genuinely correct UID - it likely guesses a resource URL
-    internally rather than truly searching. date_search() is the same
-    mechanism list_events/search_events already use successfully, so
-    resolving by UID reuses it too. Returns the event, or None if no event
-    with that UID was found in the scanned window."""
+def _search_calendars_for_uid(calendars, uid: str):
+    """Scan a list of caldav Calendar objects for an event with the given
+    UID, using date_search() + in-memory filtering (see
+    _get_event_by_uid_via_search's docstring for why event_by_uid() isn't
+    used). Returns (event, calendar) or (None, None)."""
     start_dt = datetime.now() - timedelta(days=CALENDAR_UID_LOOKUP_LOOKBACK_DAYS)
     end_dt = datetime.now() + timedelta(days=CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS)
-    try:
-        events = cal.date_search(start_dt, end_dt)
-    except Exception as e:
-        raise CalendarError(f"Could not search '{cal.name or '(unnamed)'}' for the event: {e}")
-    for event in events:
+    for cal in calendars:
         try:
-            component = event.icalendar_component
-        except Exception:
-            continue
-        if component is not None and str(component.get("uid", "")) == uid:
-            return event
-    return None
+            events = cal.date_search(start_dt, end_dt)
+        except Exception as e:
+            raise CalendarError(f"Could not search '{cal.name or '(unnamed)'}' for the event: {e}")
+        for event in events:
+            try:
+                component = event.icalendar_component
+            except Exception:
+                continue
+            if component is not None and str(component.get("uid", "")) == uid:
+                return event, cal
+    return None, None
 
 
-def _find_event_with_fallback(cal, event_uid: str):
-    """Resolve an event by UID on `cal`, via _get_event_by_uid_via_search.
-    Live testing also showed the model sometimes fabricates a
-    plausible-looking UUID instead of copying the real one it was just
-    shown. In this single-user setup a fabricated/unmatched UID
-    overwhelmingly means "the one event I was just shown" - so if the exact
-    UID isn't found, fall back to the most recent list/search result IF it
-    named exactly one event on this calendar. Multiple recent candidates
-    raise instead of guessing which was meant; this never bypasses the
-    separate staged-change confirmation step. Returns (event, resolved_uid,
-    was_corrected)."""
-    event = _get_event_by_uid_via_search(cal, event_uid)
+def _get_event_by_uid_via_search(calendar_name: str, uid: str):
+    """Find an event by UID. If calendar_name is given, only that calendar
+    is scanned; otherwise EVERY calendar on the account is scanned - this
+    matters because list_events/search_events default to searching every
+    calendar too, so an event found by search (with no calendar_name) can
+    live on ANY of the user's calendars, not necessarily whichever one
+    _resolve_calendar(None) would guess as "the default" (iCloud's first
+    returned calendar). Scanning only the guessed default calendar was a
+    real bug: a UID genuinely found seconds earlier by search_events could
+    still fail to resolve here purely because it lives on a different
+    calendar than the default. Returns (event, calendar) or (None, None)."""
+    calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
+    return _search_calendars_for_uid(calendars, uid)
+
+
+def _find_event_with_fallback(calendar_name: str, event_uid: str):
+    """Resolve an event by UID, scanning all calendars unless calendar_name
+    narrows it. Falls back to the sole most-recent list/search result if
+    either the UID wasn't found OR calendar_name itself doesn't match any
+    real calendar - the model has been observed fabricating BOTH a
+    plausible-looking UID and a plausible-looking calendar name on the same
+    call, not just the UID. A bad calendar_name must not hard-fail before
+    this fallback gets a chance to run. Returns (event, calendar,
+    resolved_uid, was_corrected)."""
+    try:
+        event, cal = _get_event_by_uid_via_search(calendar_name, event_uid)
+    except CalendarError:
+        # calendar_name didn't resolve to a real calendar - don't give up,
+        # fall through to the last-result rescue below just like an
+        # unresolved UID would.
+        event, cal = None, None
+
     if event is not None:
-        return event, event_uid, False
+        return event, cal, event_uid, False
 
     with _last_results_lock:
         candidates = list(_last_results)
-    pool = [c for c in candidates if c.get("calendar") == (cal.name or "(unnamed)")] or candidates
+
+    if calendar_name:
+        try:
+            target_cal = _resolve_calendar(calendar_name)
+            pool = [c for c in candidates if c.get("calendar") == (target_cal.name or "(unnamed)")]
+        except CalendarError:
+            # calendar_name was fabricated too - don't filter by it, just
+            # use whatever was in the last search/list result as-is.
+            pool = candidates
+    else:
+        pool = candidates
+
     if len(pool) == 1:
         corrected_uid = pool[0]["uid"]
-        corrected_event = _get_event_by_uid_via_search(cal, corrected_uid)
+        corrected_cal_name = pool[0].get("calendar")
+        corrected_event, corrected_cal = _get_event_by_uid_via_search(corrected_cal_name, corrected_uid)
         if corrected_event is not None:
-            return corrected_event, corrected_uid, corrected_uid != event_uid
+            return corrected_event, corrected_cal, corrected_uid, corrected_uid != event_uid
 
     raise CalendarError(
         f"Could not find an event with uid '{event_uid}' in the last "
@@ -405,8 +434,7 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
     if not event_uid or not event_uid.strip():
         raise CalendarError("event_uid is required - use calendar_list_events or "
                              "calendar_search_events to find it first. Never guess a UID.")
-    cal = _resolve_calendar(calendar_name)
-    event, event_uid, corrected = _find_event_with_fallback(cal, event_uid.strip())
+    event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, event_uid.strip())
 
     changes = []
     if title:
@@ -454,8 +482,7 @@ def stage_delete_event(event_uid: str, calendar_name: str = None) -> str:
     if not event_uid or not event_uid.strip():
         raise CalendarError("event_uid is required - use calendar_list_events or "
                              "calendar_search_events to find it first. Never guess a UID.")
-    cal = _resolve_calendar(calendar_name)
-    event, event_uid, corrected = _find_event_with_fallback(cal, event_uid.strip())
+    event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, event_uid.strip())
     try:
         title = _ical_field(event.icalendar_component, "summary", event_uid)
     except Exception as e:

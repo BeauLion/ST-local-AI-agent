@@ -106,7 +106,7 @@ _CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_edit_event", "calend
 # the paired stage call happened to fail (network timeout) first.
 _CALENDAR_APPLY_TOOLS = {"calendar_confirm_pending"}
 _BARE_CONFIRMATION_RE = re.compile(
-    r"^(yes|yeah|yep|sure|ok|okay|confirm|confirmed|go ahead|do it|correct|proceed)[.!]?$",
+    r"""^["'\s]*(yes|yeah|yep|sure|ok|okay|confirm|confirmed|go ahead|do it|correct|proceed)[.!]?["'\s]*$""",
     re.IGNORECASE,
 )
 
@@ -1364,7 +1364,46 @@ async def agent_loop(upstream_body: dict):
                         )
                 continue  # loop again so the model can use the tool result
 
-            # No tool call -> this is the final answer (already streamed above).
+            # No tool call -> normally the final answer. But if the user's
+            # last message read as a bare confirmation AND a calendar
+            # change is still staged, the model must not be allowed to
+            # tell the user it succeeded without ever having called
+            # calendar_confirm_pending. Live testing showed exactly this:
+            # the model was correctly blocked from re-staging (see the
+            # guard above), then simply wrote a false "successfully
+            # deleted" answer here instead of calling
+            # calendar_confirm_pending as the blocked-call error told it
+            # to. Content is fully buffered above (never streamed early),
+            # so it's safe to discard this answer and force another
+            # iteration instead of returning it.
+            last_user_text_for_check = next(
+                (m.get("content") for m in reversed(upstream_body["messages"]) if m.get("role") == "user"),
+                "",
+            )
+            unresolved_confirmation = (
+                calendar_manager.has_pending_change()
+                and bool(_BARE_CONFIRMATION_RE.match(str(last_user_text_for_check or "").strip()))
+            )
+            if unresolved_confirmation:
+                print("[AGENT] Model claimed a calendar change is resolved but never called "
+                      "confirm/cancel - forcing it to actually do so instead of returning "
+                      "the false answer.")
+                upstream_body["messages"].append({"role": "assistant", "content": content or None})
+                upstream_body["messages"].append({
+                    "role": "system",
+                    "content": (
+                        "STOP: nothing has actually been applied to the calendar yet - a "
+                        "change is still staged and waiting. Your previous message must NOT "
+                        "have told the user it was done, because it wasn't - that was "
+                        "incorrect and the user did not see it. Call calendar_confirm_pending "
+                        "now to actually apply the staged change (the user's last message "
+                        "confirmed it), or calendar_cancel_pending if that's not correct. Do "
+                        "not write another direct answer claiming success without calling one "
+                        "of these tools first."
+                    ),
+                })
+                continue
+
             print("[AGENT] Model answered directly, without calling any tool.")
             if content:
                 yield ("delta", content)
