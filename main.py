@@ -1395,6 +1395,21 @@ async def agent_loop(upstream_body: dict):
                             f"staged change. If the user meant something different, call "
                             f"calendar_cancel_pending first, then propose the new change."
                         )
+                    elif (
+                        name == "calendar_search_events"
+                        and str(args.get("query", "")).strip().lower()
+                        and str(args.get("query", "")).strip().lower() == str(args.get("calendar_name", "")).strip().lower()
+                    ):
+                        result = (
+                            f"Error: calendar_search_events was NOT called. Its query "
+                            f"('{args.get('query')}') is identical to calendar_name - that means "
+                            f"you're using the calendar's own name as a search keyword, which "
+                            f"will not match real events and returns a false 'no events found'. "
+                            f"For a plain listing request ('what's on my calendar {args.get('calendar_name')}'), "
+                            f"call calendar_list_events with calendar_name='{args.get('calendar_name')}' "
+                            f"instead - no query needed. Only use calendar_search_events when "
+                            f"searching for a specific event by its title/location/description text."
+                        )
                     else:
                         # Run in a thread so a slow web search doesn't freeze the server.
                         result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
