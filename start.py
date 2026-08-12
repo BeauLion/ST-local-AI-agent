@@ -42,6 +42,13 @@ def start_llama_server() -> subprocess.Popen:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            # Without this, Windows decodes the pipe using the legacy
+            # cp1252 codepage regardless of what encoding llama-server
+            # actually writes in, and any non-cp1252 byte sequence crashes
+            # start.py entirely (see the matching fix in start_agent_server
+            # below - both ends of a pipe need to agree on UTF-8).
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError:
         print(f"[start.py] ERROR: could not find llama-server.exe at:")
@@ -94,9 +101,23 @@ def start_agent_server() -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
+    # Windows' default console/pipe encoding for a Python process is often
+    # the legacy cp1252 codepage, which can't represent every Unicode
+    # character (e.g. certain punctuation in a real iCloud calendar name,
+    # or curly quotes/em-dashes in free text). Without this, any tool
+    # result containing such a character crashes the debug print()
+    # statements in main.py (and takes the whole request down with it) -
+    # this forces UTF-8 instead, which can represent anything.
+    env["PYTHONIOENCODING"] = "utf-8"
+
     return subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env=env,
+        # PYTHONIOENCODING above makes main.py WRITE utf-8; this makes
+        # start.py correctly READ it back on this end of the same pipe.
+        # Both sides need to agree, or Windows falls back to decoding with
+        # cp1252 here regardless of what was actually written.
+        encoding="utf-8", errors="replace",
     )
 
 

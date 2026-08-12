@@ -142,6 +142,43 @@ CORS_ALLOWED_ORIGINS = ["*"]
 
 
 # ─────────────────────────────────────────────────────────────
+# Calendar (calendar_manager.py) — iCloud via CalDAV
+# ─────────────────────────────────────────────────────────────
+
+# iCloud's CalDAV entry point. Same URL regardless of which calendar(s)
+# your account has - principal discovery happens from here.
+ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
+
+# Names of the environment variables calendar_manager.py reads credentials
+# from (via a .env file in PROJECT_ROOT - see .env.example). Secrets never
+# go in this file.
+ICLOUD_USERNAME_ENV_VAR = "ICLOUD_USERNAME"
+ICLOUD_APP_PASSWORD_ENV_VAR = "ICLOUD_APP_PASSWORD"
+
+# How many days ahead calendar_list_events looks by default when the model
+# doesn't specify an end date.
+CALENDAR_DEFAULT_LOOKAHEAD_DAYS = 14
+
+# How many days back/forward calendar_search_events looks by default.
+CALENDAR_SEARCH_LOOKBACK_DAYS = 7
+CALENDAR_SEARCH_LOOKAHEAD_DAYS = 90
+
+# Staged (unconfirmed) create/edit/delete changes expire after this many
+# minutes, so a "confirm" typed much later in an unrelated part of the
+# conversation can't accidentally apply an old, stale proposed change.
+CALENDAR_PENDING_CHANGE_TTL_MINUTES = 10
+
+# How wide a date_search() window to scan when resolving an event by UID
+# for edit/delete (calendar_manager._get_event_by_uid_via_search). caldav's
+# own event_by_uid() proved unreliable against iCloud even with a genuinely
+# correct UID (likely guesses a resource URL internally rather than really
+# searching) - date_search()+filter is the same mechanism list/search
+# already use successfully, so it's used here too instead.
+CALENDAR_UID_LOOKUP_LOOKBACK_DAYS = 365
+CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS = 365
+
+
+# ─────────────────────────────────────────────────────────────
 # run_python tool (Docker sandbox)
 # ─────────────────────────────────────────────────────────────
 
