@@ -209,6 +209,14 @@ def list_calendar_names() -> list[str]:
 # Read operations - execute immediately, no staging needed
 # ---------------------------------------------------------------------------
 
+# Cache of the most recent list/search results (single slot, like
+# _pending_change) - lets stage_edit_event/stage_delete_event recover when
+# the model fabricates a UID instead of copying the real one it was just
+# shown. See _find_event_with_fallback below.
+_last_results_lock = threading.Lock()
+_last_results: list[dict] = []
+
+
 def list_events(start: str = None, end: str = None, calendar_name: str = None) -> list[dict]:
     # Default to searching EVERY calendar on the account - a named
     # calendar_name narrows to just one. Without this, events silently
@@ -238,6 +246,9 @@ def list_events(start: str = None, end: str = None, calendar_name: str = None) -
         results.extend(_event_to_dict(e, label) for e in events)
 
     results.sort(key=lambda e: e["start"])
+    with _last_results_lock:
+        _last_results.clear()
+        _last_results.extend(results)
     return results
 
 
@@ -264,6 +275,9 @@ def search_events(query: str, start: str = None, end: str = None, calendar_name:
             if key in haystack:
                 matches.append(d)
     matches.sort(key=lambda e: e["start"])
+    with _last_results_lock:
+        _last_results.clear()
+        _last_results.extend(matches)
     return matches
 
 
@@ -327,16 +341,44 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
     return _stage(desc, apply_fn)
 
 
+def _find_event_with_fallback(cal, event_uid: str):
+    """Look up an event by UID on `cal`. Live testing showed the model
+    sometimes fabricates a plausible-looking UUID for event_uid instead of
+    copying the real one - even when it was shown it directly a turn or two
+    earlier. In a single-user setup, a fabricated UID overwhelmingly means
+    "the one event I was just shown", not a genuine reference to something
+    else - so if the exact UID isn't found, fall back to the most recent
+    list/search result IF it contained exactly one event on this calendar.
+    Multiple recent candidates raise instead of guessing which was meant;
+    this never bypasses the separate staged-change confirmation step.
+    Returns (event, resolved_uid, was_corrected).
+    """
+    try:
+        return cal.event_by_uid(event_uid), event_uid, False
+    except Exception as first_error:
+        with _last_results_lock:
+            candidates = list(_last_results)
+        pool = [c for c in candidates if c.get("calendar") == (cal.name or "(unnamed)")] or candidates
+        if len(pool) == 1:
+            corrected_uid = pool[0]["uid"]
+            try:
+                return cal.event_by_uid(corrected_uid), corrected_uid, True
+            except Exception:
+                pass
+        raise CalendarError(
+            f"Event with UID '{event_uid}' not found: {first_error}. Call "
+            f"calendar_list_events or calendar_search_events again to get the "
+            f"exact uid, then retry using that exact value."
+        )
+
+
 def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: str = None,
                       location: str = None, description: str = None, calendar_name: str = None) -> str:
     if not event_uid or not event_uid.strip():
         raise CalendarError("event_uid is required - use calendar_list_events or "
                              "calendar_search_events to find it first. Never guess a UID.")
     cal = _resolve_calendar(calendar_name)
-    try:
-        event = cal.event_by_uid(event_uid.strip())
-    except Exception as e:
-        raise CalendarError(f"Event with UID '{event_uid}' not found: {e}")
+    event, event_uid, corrected = _find_event_with_fallback(cal, event_uid.strip())
 
     changes = []
     if title:
@@ -375,6 +417,8 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
         return f"Edited event {event_uid}: {', '.join(changes)}."
 
     desc = f"EDIT event {event_uid}: {', '.join(changes)}"
+    if corrected:
+        desc += " (auto-matched to the event just shown in your last search/list result)"
     return _stage(desc, apply_fn)
 
 
@@ -383,11 +427,11 @@ def stage_delete_event(event_uid: str, calendar_name: str = None) -> str:
         raise CalendarError("event_uid is required - use calendar_list_events or "
                              "calendar_search_events to find it first. Never guess a UID.")
     cal = _resolve_calendar(calendar_name)
+    event, event_uid, corrected = _find_event_with_fallback(cal, event_uid.strip())
     try:
-        event = cal.event_by_uid(event_uid.strip())
         title = _ical_field(event.icalendar_component, "summary", event_uid)
     except Exception as e:
-        raise CalendarError(f"Event with UID '{event_uid}' not found: {e}")
+        raise CalendarError(f"Could not read event {event_uid}: {e}")
 
     def apply_fn() -> str:
         try:
@@ -397,6 +441,8 @@ def stage_delete_event(event_uid: str, calendar_name: str = None) -> str:
         return f"Deleted '{title}'."
 
     desc = f"DELETE event '{title}' (uid {event_uid})"
+    if corrected:
+        desc += " (auto-matched to the event just shown in your last search/list result)"
     return _stage(desc, apply_fn)
 
 

@@ -72,6 +72,20 @@ def _tool_call_failed(result) -> bool:
     return any(text.startswith(p) for p in _FAILURE_PREFIXES)
 
 
+# Calendar UID-dependent write tools (edit/delete) require a UID that can
+# only be known once a search/list call's result has actually been seen.
+# If the model requests one of these in the SAME response as a read call
+# (parallel tool calls - this model does this sometimes), it has no real
+# UID yet and will fabricate a plausible-looking one; iCloud rejects it
+# with an opaque 412 and no clear explanation why. Caught here in code
+# rather than relying on the "never guess a UID" prompt instruction alone -
+# verified live this session that instruction does not reliably prevent it,
+# because the model isn't disobeying, it's generating both calls before
+# either has executed.
+_CALENDAR_READ_TOOLS = {"calendar_list_events", "calendar_search_events"}
+_CALENDAR_UID_WRITE_TOOLS = {"calendar_edit_event", "calendar_delete_event"}
+
+
 # Lets the SillyTavern extension's browser-side fetch() calls (a different
 # origin/port than this server) reach the /projects endpoints below.
 app.add_middleware(
@@ -717,7 +731,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_list_events",
-            "description": "List events across ALL of the user's iCloud calendars in a date range (or just one calendar if calendar_name is given). Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately. IMPORTANT: compute any relative date ('today', 'this week', etc.) from the [CURRENT DATE/TIME] system message already provided - never guess or use a training-data date/year.",
+            "description": "List events across ALL of the user's iCloud calendars in a date range (or just one calendar if calendar_name is given). Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -733,7 +747,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_search_events",
-            "description": "Search across ALL of the user's iCloud calendars by keyword in event titles, locations, and descriptions (or just one calendar if calendar_name is given). Use this to find a specific event (e.g. before editing or deleting it) rather than guessing its UID. Read-only, executes immediately. IMPORTANT: compute any relative date range from the [CURRENT DATE/TIME] system message already provided - never guess or use a training-data date/year.",
+            "description": "Search across ALL of the user's iCloud calendars by keyword in event titles, locations, and descriptions (or just one calendar if calendar_name is given). Use this to find a specific event (e.g. before editing or deleting it) rather than guessing its UID. Read-only, executes immediately.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -750,7 +764,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_create_event",
-            "description": "Propose creating a new REAL event on the user's iCloud calendar (an actual appointment, meeting, or plan - not an in-character/roleplay scheduled action). This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending. IMPORTANT: compute any relative date/time ('tomorrow', 'next Friday', etc.) from the [CURRENT DATE/TIME] system message already provided - never guess or use a training-data date/year.",
+            "description": "Propose creating a new REAL event on the user's iCloud calendar (an actual appointment, meeting, or plan - not an in-character/roleplay scheduled action). This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1229,6 +1243,13 @@ async def agent_loop(upstream_body: dict):
                 print(f"[AGENT] Model requested {len(calls)} tool call(s)")
                 upstream_body["messages"].append(message)
 
+                names_in_batch = {c["function"]["name"] for c in calls}
+                blocked_uid_writes = (
+                    names_in_batch & _CALENDAR_UID_WRITE_TOOLS
+                    if names_in_batch & _CALENDAR_READ_TOOLS
+                    else set()
+                )
+
                 for call in calls:
                     name = call["function"]["name"]
                     try:
@@ -1236,8 +1257,22 @@ async def agent_loop(upstream_body: dict):
                     except json.JSONDecodeError:
                         args = {}
 
-                    # Run in a thread so a slow web search doesn't freeze the server.
-                    result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
+                    if name in blocked_uid_writes:
+                        # Blocked before ever reaching calendar_manager - the
+                        # UID in `args` was necessarily fabricated, since the
+                        # search/list call in this same batch hadn't run yet
+                        # when this call was generated.
+                        result = (
+                            f"Error: {name} was called in the same response as a calendar "
+                            f"search/list call, before that result could be seen - so the "
+                            f"event_uid you used cannot be correct, it must have been "
+                            f"guessed. Wait for the search/list result, THEN call {name} "
+                            f"again as a separate follow-up using the exact uid field from "
+                            f"that result. Do not guess or invent a UID."
+                        )
+                    else:
+                        # Run in a thread so a slow web search doesn't freeze the server.
+                        result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
 
                     print(f"[AGENT] {name}({args}) ->")
                     print(f"[AGENT]   {str(result)[:400]}")

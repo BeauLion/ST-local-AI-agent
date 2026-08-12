@@ -42,6 +42,13 @@ def start_llama_server() -> subprocess.Popen:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            # Without this, Windows decodes the pipe using the legacy
+            # cp1252 codepage regardless of what encoding llama-server
+            # actually writes in, and any non-cp1252 byte sequence crashes
+            # start.py entirely (see the matching fix in start_agent_server
+            # below - both ends of a pipe need to agree on UTF-8).
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError:
         print(f"[start.py] ERROR: could not find llama-server.exe at:")
@@ -106,6 +113,11 @@ def start_agent_server() -> subprocess.Popen:
     return subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env=env,
+        # PYTHONIOENCODING above makes main.py WRITE utf-8; this makes
+        # start.py correctly READ it back on this end of the same pipe.
+        # Both sides need to agree, or Windows falls back to decoding with
+        # cp1252 here regardless of what was actually written.
+        encoding="utf-8", errors="replace",
     )
 
 
