@@ -138,6 +138,44 @@ def _calendar_read_tool_seen_before_last_user_msg(messages: list) -> bool:
     return False
 
 
+_CALENDAR_KEYWORD_RE = re.compile(r"\bcalendar\b", re.IGNORECASE)
+
+
+def _looks_like_calendar_question(text) -> bool:
+    text = text or ""
+    if not isinstance(text, str):
+        return False
+    return bool(_CALENDAR_KEYWORD_RE.search(text) or _RELATIVE_DATE_RE.search(text))
+
+
+def _redact_stale_calendar_answers(messages: list) -> list:
+    last_user_idx = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            last_user_idx = i
+    if last_user_idx is None:
+        return messages
+
+    redacted = []
+    for i, m in enumerate(messages):
+        if (
+            i < last_user_idx
+            and m.get("role") == "assistant"
+            and i > 0
+            and messages[i - 1].get("role") == "user"
+            and _looks_like_calendar_question(messages[i - 1].get("content"))
+        ):
+            m = dict(m)
+            m["content"] = (
+                "[An earlier calendar answer was here - hidden because it may be "
+                "about a different day than what's being asked now. If this "
+                "question needs calendar data, call calendar_list_events or "
+                "calendar_search_events again rather than reusing it.]"
+            )
+        redacted.append(m)
+    return redacted
+
+
 # Lets the SillyTavern extension's browser-side fetch() calls (a different
 # origin/port than this server) reach the /projects endpoints below.
 app.add_middleware(
@@ -1474,6 +1512,7 @@ async def agent_loop(upstream_body: dict):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
+    body["messages"] = _redact_stale_calendar_answers(body.get("messages") or [])
     client_wants_stream = body.get("stream", False)
 
     # SillyTavern extensions can register their own tools (e.g. the
