@@ -122,13 +122,14 @@ _RELATIVE_DATE_RE = re.compile(
 )
 
 
-def _calendar_read_tool_seen(messages: list) -> bool:
-    """True if a calendar_list_events/calendar_search_events call appears
-    anywhere earlier in this conversation - used to establish that the
-    current exchange is actually calendar-related before the stale-answer
-    guard below fires, so it doesn't trigger on an unrelated message that
-    happens to contain the word "today"."""
-    for m in messages:
+def _calendar_read_tool_seen_before_last_user_msg(messages: list) -> bool:
+    last_user_idx = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            last_user_idx = i
+    if last_user_idx is None:
+        return False
+    for m in messages[:last_user_idx]:
         if m.get("role") != "assistant":
             continue
         for tc in (m.get("tool_calls") or []):
@@ -1433,7 +1434,7 @@ async def agent_loop(upstream_body: dict):
             stale_calendar_answer = (
                 not unresolved_confirmation
                 and bool(_RELATIVE_DATE_RE.search(str(last_user_text_for_check or "")))
-                and _calendar_read_tool_seen(upstream_body["messages"])
+                and _calendar_read_tool_seen_before_last_user_msg(upstream_body["messages"])
             )
             if stale_calendar_answer:
                 print("[AGENT] Model answered a date-specific calendar question without "
