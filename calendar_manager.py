@@ -382,12 +382,21 @@ def _get_event_by_uid_via_search(calendar_name: str, uid: str):
 
 def _find_event_with_fallback(calendar_name: str, event_uid: str):
     """Resolve an event by UID, scanning all calendars unless calendar_name
-    narrows it (see _get_event_by_uid_via_search). Falls back to the sole
-    most-recent list/search result if the UID wasn't found - same
-    auto-correct-a-fabricated-UID reasoning as before, but now scoped
-    correctly across calendars instead of just one. Returns (event,
-    calendar, resolved_uid, was_corrected)."""
-    event, cal = _get_event_by_uid_via_search(calendar_name, event_uid)
+    narrows it. Falls back to the sole most-recent list/search result if
+    either the UID wasn't found OR calendar_name itself doesn't match any
+    real calendar - the model has been observed fabricating BOTH a
+    plausible-looking UID and a plausible-looking calendar name on the same
+    call, not just the UID. A bad calendar_name must not hard-fail before
+    this fallback gets a chance to run. Returns (event, calendar,
+    resolved_uid, was_corrected)."""
+    try:
+        event, cal = _get_event_by_uid_via_search(calendar_name, event_uid)
+    except CalendarError:
+        # calendar_name didn't resolve to a real calendar - don't give up,
+        # fall through to the last-result rescue below just like an
+        # unresolved UID would.
+        event, cal = None, None
+
     if event is not None:
         return event, cal, event_uid, False
 
@@ -395,8 +404,13 @@ def _find_event_with_fallback(calendar_name: str, event_uid: str):
         candidates = list(_last_results)
 
     if calendar_name:
-        target_cal = _resolve_calendar(calendar_name)
-        pool = [c for c in candidates if c.get("calendar") == (target_cal.name or "(unnamed)")]
+        try:
+            target_cal = _resolve_calendar(calendar_name)
+            pool = [c for c in candidates if c.get("calendar") == (target_cal.name or "(unnamed)")]
+        except CalendarError:
+            # calendar_name was fabricated too - don't filter by it, just
+            # use whatever was in the last search/list result as-is.
+            pool = candidates
     else:
         pool = candidates
 
