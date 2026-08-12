@@ -221,6 +221,64 @@ def list_calendar_names() -> list[str]:
     return [c.name or "(unnamed)" for c in calendars]
 
 
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def _day_bounds(d) -> tuple:
+    start = datetime.combine(d, datetime.min.time())
+    return start, start + timedelta(days=1)
+
+
+def resolve_when(when: str) -> tuple:
+    if not when or not when.strip():
+        raise CalendarError("No date phrase given to resolve.")
+    text = when.strip().lower()
+    now = datetime.now()
+    today = now.date()
+
+    if text in ("today", "tonight"):
+        return _day_bounds(today)
+    if text == "tomorrow":
+        return _day_bounds(today + timedelta(days=1))
+    if text == "yesterday":
+        return _day_bounds(today - timedelta(days=1))
+    if text == "day after tomorrow":
+        return _day_bounds(today + timedelta(days=2))
+
+    if text == "this week":
+        start = today - timedelta(days=today.weekday())
+        return datetime.combine(start, datetime.min.time()), datetime.combine(start + timedelta(days=7), datetime.min.time())
+    if text == "next week":
+        start = today - timedelta(days=today.weekday()) + timedelta(days=7)
+        return datetime.combine(start, datetime.min.time()), datetime.combine(start + timedelta(days=7), datetime.min.time())
+    if text in ("this weekend", "the weekend"):
+        saturday = today + timedelta(days=(5 - today.weekday()) % 7)
+        return datetime.combine(saturday, datetime.min.time()), datetime.combine(saturday + timedelta(days=2), datetime.min.time())
+    if text == "this month":
+        start = today.replace(day=1)
+        end = start.replace(year=start.year + 1, month=1) if start.month == 12 else start.replace(month=start.month + 1)
+        return datetime.combine(start, datetime.min.time()), datetime.combine(end, datetime.min.time())
+
+    for name, idx in _WEEKDAYS.items():
+        if text in (name, f"this {name}", f"next {name}"):
+            delta = (idx - today.weekday()) % 7
+            if delta == 0 and text == f"next {name}":
+                delta = 7
+            return _day_bounds(today + timedelta(days=delta))
+
+    import dateparser
+    parsed = dateparser.parse(when, settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": now})
+    if parsed is None:
+        raise CalendarError(
+            f"Could not understand the date phrase '{when}'. Try a specific "
+            f"date like 'YYYY-MM-DD' instead."
+        )
+    return _day_bounds(parsed.date())
+
+
 # ---------------------------------------------------------------------------
 # Read operations - execute immediately, no staging needed
 # ---------------------------------------------------------------------------
@@ -233,23 +291,29 @@ _last_results_lock = threading.Lock()
 _last_results: list[dict] = []
 
 
-def list_events(start: str = None, end: str = None, calendar_name: str = None) -> list[dict]:
+def list_events(start: str = None, end: str = None, calendar_name: str = None, when: str = None) -> list[dict]:
     # Default to searching EVERY calendar on the account - a named
     # calendar_name narrows to just one. Without this, events silently
     # wouldn't show up if they live on any calendar other than whichever
     # one iCloud happens to return first.
     calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
 
-    start_dt = _parse_datetime(start) if start else datetime.now()
-    if end:
-        end_dt = _parse_datetime(end)
-        if end_dt <= start_dt:
-            # A single day is naturally expressed as the same date for both
-            # start and end (e.g. "tomorrow" -> start='2026-08-12',
-            # end='2026-08-12'). Treat that as "the whole day" rather than
-            # rejecting it as a zero-length range.
-            end_dt = start_dt + timedelta(days=1)
+    if when and not (start or end):
+        start_dt, end_dt = resolve_when(when)
+    elif start:
+        start_dt = _parse_datetime(start)
+        if end:
+            end_dt = _parse_datetime(end)
+            if end_dt <= start_dt:
+                # A single day is naturally expressed as the same date for both
+                # start and end (e.g. "tomorrow" -> start='2026-08-12',
+                # end='2026-08-12'). Treat that as "the whole day" rather than
+                # rejecting it as a zero-length range.
+                end_dt = start_dt + timedelta(days=1)
+        else:
+            end_dt = start_dt + timedelta(days=CALENDAR_DEFAULT_LOOKAHEAD_DAYS)
     else:
+        start_dt = datetime.now()
         end_dt = start_dt + timedelta(days=CALENDAR_DEFAULT_LOOKAHEAD_DAYS)
 
     results = []
@@ -265,14 +329,17 @@ def list_events(start: str = None, end: str = None, calendar_name: str = None) -
     return results
 
 
-def search_events(query: str, start: str = None, end: str = None, calendar_name: str = None) -> list[dict]:
+def search_events(query: str, start: str = None, end: str = None, calendar_name: str = None, when: str = None) -> list[dict]:
     if not query or not query.strip():
         raise CalendarError("A search query is required.")
 
     calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
 
-    start_dt = _parse_datetime(start) if start else datetime.now() - timedelta(days=CALENDAR_SEARCH_LOOKBACK_DAYS)
-    end_dt = _parse_datetime(end) if end else datetime.now() + timedelta(days=CALENDAR_SEARCH_LOOKAHEAD_DAYS)
+    if when and not (start or end):
+        start_dt, end_dt = resolve_when(when)
+    else:
+        start_dt = _parse_datetime(start) if start else datetime.now() - timedelta(days=CALENDAR_SEARCH_LOOKBACK_DAYS)
+        end_dt = _parse_datetime(end) if end else datetime.now() + timedelta(days=CALENDAR_SEARCH_LOOKAHEAD_DAYS)
 
     key = query.strip().lower()
     matches = []

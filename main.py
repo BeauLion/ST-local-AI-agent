@@ -508,7 +508,7 @@ def calendar_list_calendars(args: dict) -> str:
 def calendar_list_events(args: dict) -> str:
     try:
         events = calendar_manager.list_events(
-            args.get("start"), args.get("end"), args.get("calendar_name")
+            args.get("start"), args.get("end"), args.get("calendar_name"), args.get("when")
         )
     except CalendarError as e:
         return f"Error: {e}"
@@ -518,7 +518,8 @@ def calendar_list_events(args: dict) -> str:
 def calendar_search_events(args: dict) -> str:
     try:
         events = calendar_manager.search_events(
-            args.get("query", ""), args.get("start"), args.get("end"), args.get("calendar_name")
+            args.get("query", ""), args.get("start"), args.get("end"),
+            args.get("calendar_name"), args.get("when")
         )
     except CalendarError as e:
         return f"Error: {e}"
@@ -826,7 +827,8 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the same date for both start and end - that returns the whole day."},
+                    "when": {"type": "string", "description": "PREFERRED for any relative/named date or range - pass the phrase close to how the user said it, e.g. 'today', 'tomorrow', 'this weekend', 'next friday', 'in 3 days', 'the 20th'. The backend resolves this precisely, so you don't need to compute a date yourself. Omit if start/end are given instead."},
+                    "start": {"type": "string", "description": "Only use this instead of 'when' if you have an exact date already, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the same date for both start and end - that returns the whole day."},
                     "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start. Same value as start is valid and means 'just that one day'."},
                     "calendar_name": {"type": "string", "description": "Only needed if the user has multiple iCloud calendars and named one. Omit otherwise."},
                 },
@@ -843,7 +845,8 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Keyword to search for."},
-                    "start": {"type": "string", "description": "Optional start of search range, 'YYYY-MM-DD'. Defaults to 7 days ago."},
+                    "when": {"type": "string", "description": "PREFERRED for any relative/named date or range - pass the phrase close to how the user said it, e.g. 'today', 'this weekend', 'next friday', 'in 3 days'. The backend resolves this precisely. Omit if start/end are given instead."},
+                    "start": {"type": "string", "description": "Only use this instead of 'when' if you have an exact date already, 'YYYY-MM-DD'. Defaults to 7 days ago."},
                     "end": {"type": "string", "description": "Optional end of search range, 'YYYY-MM-DD'. Defaults to 90 days ahead."},
                     "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
                 },
@@ -1587,21 +1590,25 @@ async def chat_completions(request: Request):
             "search across all of the user's calendars by default. If the user asks "
             "what calendars they have, or expected events aren't showing up, call "
             "calendar_list_calendars to see the actual calendar names. "
-            "CRITICAL: a system message near the top of this conversation, labeled "
-            "[CURRENT DATE/TIME], gives you today's real date and time on every "
-            "single request - use it to compute any relative date phrase ('this "
-            "week', 'today', 'tomorrow', 'next month', etc.) for calendar_list_events, "
-            "calendar_search_events, calendar_create_event, and calendar_edit_event. "
-            "You do NOT need to call get_current_time for this - the date is already "
-            "provided fresh every turn. NEVER guess or assume a date/year from memory "
-            "or training data for a calendar call - a wrong year will silently return "
-            "the wrong (usually empty) results instead of erroring, so this mistake is "
-            "easy to make and easy to miss. If the user names a specific day or range "
-            "('today', 'tomorrow', 'this week', a weekday, a date), ALWAYS pass start "
-            "and end computed for exactly that day/range - do not omit them, since the "
-            "tool's default window spans multiple days and mixes other days' events "
-            "into the same result. Only omit start/end for a genuinely open-ended "
-            "request with no date reference at all (e.g. 'what's coming up'). "
+            "CRITICAL: for calendar_list_events and calendar_search_events, if the "
+            "user names any relative or named date or range ('today', 'tomorrow', "
+            "'this weekend', 'next friday', 'in 3 days', 'the 20th', etc.), use the "
+            "'when' parameter and pass the phrase close to how the user said it - "
+            "the backend resolves it precisely, so you do NOT need to compute the "
+            "date yourself for these two tools. Only use start/end on these two "
+            "tools if you already have an exact date. Only omit both 'when' and "
+            "start/end for a genuinely open-ended request with no date reference at "
+            "all (e.g. 'what's coming up'). "
+            "calendar_create_event and calendar_edit_event do NOT have a 'when' "
+            "parameter and still need an exact start (and optionally end) time - a "
+            "system message near the top of this conversation, labeled [CURRENT "
+            "DATE/TIME], gives you today's real date and time on every request; use "
+            "it to compute the exact date/time these two tools need. You do NOT "
+            "need to call get_current_time for this - the date is already provided "
+            "fresh every turn. NEVER guess or assume a date/year from memory or "
+            "training data - a wrong year will silently create/edit against the "
+            "wrong date instead of erroring, so this mistake is easy to make and "
+            "easy to miss. "
             "CRITICAL: every new calendar question - including a short follow-up like "
             "'and today?' - needs its OWN fresh calendar_list_events or "
             "calendar_search_events call scoped to exactly what's being asked, even if "
