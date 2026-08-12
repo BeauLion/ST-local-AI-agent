@@ -120,6 +120,20 @@ def _get_calendars(refresh: bool = False):
     return calendars
 
 
+_CALENDAR_RETRY_DELAY_SECONDS = 2
+
+
+def _date_search_with_retry(cal, start_dt, end_dt, error_prefix: str):
+    try:
+        return cal.date_search(start_dt, end_dt)
+    except Exception as first_error:
+        time.sleep(_CALENDAR_RETRY_DELAY_SECONDS)
+        try:
+            return cal.date_search(start_dt, end_dt)
+        except Exception as second_error:
+            raise CalendarError(f"{error_prefix}: {second_error}")
+
+
 def _reset_client():
     global _cached_client, _cached_calendars
     _cached_client = None
@@ -241,10 +255,7 @@ def list_events(start: str = None, end: str = None, calendar_name: str = None) -
     results = []
     for cal in calendars:
         label = cal.name or "(unnamed)"
-        try:
-            events = cal.date_search(start_dt, end_dt)
-        except Exception as e:
-            raise CalendarError(f"Could not fetch events from '{label}': {e}")
+        events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not fetch events from '{label}'")
         results.extend(_event_to_dict(e, label) for e in events)
 
     results.sort(key=lambda e: e["start"])
@@ -267,10 +278,7 @@ def search_events(query: str, start: str = None, end: str = None, calendar_name:
     matches = []
     for cal in calendars:
         label = cal.name or "(unnamed)"
-        try:
-            events = cal.date_search(start_dt, end_dt)
-        except Exception as e:
-            raise CalendarError(f"Could not search '{label}': {e}")
+        events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not search '{label}'")
         for event in events:
             d = _event_to_dict(event, label)
             haystack = f"{d['title']} {d['description']} {d['location']}".lower()
@@ -351,10 +359,7 @@ def _search_calendars_for_uid(calendars, uid: str):
     start_dt = datetime.now() - timedelta(days=CALENDAR_UID_LOOKUP_LOOKBACK_DAYS)
     end_dt = datetime.now() + timedelta(days=CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS)
     for cal in calendars:
-        try:
-            events = cal.date_search(start_dt, end_dt)
-        except Exception as e:
-            raise CalendarError(f"Could not search '{cal.name or '(unnamed)'}' for the event: {e}")
+        events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not search '{cal.name or '(unnamed)'}' for the event")
         for event in events:
             try:
                 component = event.icalendar_component
