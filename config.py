@@ -45,12 +45,12 @@ LLAMA_SERVER_URL = f"http://localhost:{LLAMA_SERVER_PORT}"
 LLAMA_MODEL_REPO = "Qwen/Qwen3-14B-GGUF:Q4_K_M"
 
 LLAMA_NGL = 99          # -ngl: layers offloaded to GPU (99 = full offload)
-LLAMA_CONTEXT = 21576    # -c: context window size
+LLAMA_CONTEXT = 32768    # -c: context window size
 LLAMA_TEMP = 0.6        # 
 LLAMA_FLASH_ATTENTION = 'on'   # -fa: flash attention, speed optimization [on|off|auto]
 LLAMA_USE_JINJA = True         # --jinja: required for structured tool-call output
 LLAMA_TOP_P = 0.95
-LLAMA_TOP_K = 0
+LLAMA_TOP_K = 20
 LLAMA_MIN_P = 0.0   # new constant - see command builder change below
 
 
