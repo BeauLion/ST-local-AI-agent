@@ -31,6 +31,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import caldav
 import icalendar
@@ -38,9 +39,11 @@ from dotenv import load_dotenv
 
 from config import (
     CALENDAR_DEFAULT_LOOKAHEAD_DAYS,
+    CALENDAR_DEFAULT_NAME,
     CALENDAR_PENDING_CHANGE_TTL_MINUTES,
     CALENDAR_SEARCH_LOOKAHEAD_DAYS,
     CALENDAR_SEARCH_LOOKBACK_DAYS,
+    CALENDAR_TIMEZONE,
     CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS,
     CALENDAR_UID_LOOKUP_LOOKBACK_DAYS,
     ICLOUD_APP_PASSWORD_ENV_VAR,
@@ -48,6 +51,22 @@ from config import (
     ICLOUD_USERNAME_ENV_VAR,
     PROJECT_ROOT,
 )
+
+# Cached once - ZoneInfo() does a filesystem/tzdata lookup internally, no
+# need to repeat it on every event write.
+_LOCAL_TZ = ZoneInfo(CALENDAR_TIMEZONE)
+
+
+def _localize(dt: datetime) -> datetime:
+    """Attach CALENDAR_TIMEZONE to a naive datetime before it's written to
+    iCloud. Only used at the point events are actually created/edited -
+    NOT applied to read-path datetimes (list/search/date_search), which
+    were already working correctly and use naive datetimes consistently
+    with each other. Mixing that up would risk breaking working reads to
+    fix a writes-only bug."""
+    if dt.tzinfo is not None:
+        return dt
+    return dt.replace(tzinfo=_LOCAL_TZ)
 
 # Loads ICLOUD_USERNAME / ICLOUD_APP_PASSWORD from a .env file sitting next
 # to config.py. If the file doesn't exist yet, this is a harmless no-op -
@@ -141,28 +160,45 @@ def _reset_client():
 
 
 def _resolve_calendar(name: str = None):
-    """Match by exact name, then unique partial name. Defaults to the
-    first calendar iCloud returns (usually the account's primary one) when
-    no name is given - fine for most single-calendar setups, but the model
-    can pass calendar_name to target a specific one."""
+    """Match by exact name, then unique partial name. When no name is
+    given, falls back to CALENDAR_DEFAULT_NAME (config.py) if it matches a
+    real calendar; if that's unset or doesn't match anything on the
+    account, falls back to whichever calendar iCloud happens to return
+    first."""
     calendars = _get_calendars()
-    if not name or not name.strip():
-        return calendars[0]
 
-    key = name.strip().lower()
-    for cal in calendars:
-        if (cal.name or "").strip().lower() == key:
-            return cal
+    def _match(key: str):
+        for cal in calendars:
+            if (cal.name or "").strip().lower() == key:
+                return cal
+        partial = [c for c in calendars if key in (c.name or "").strip().lower()]
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            names = ", ".join(c.name or "(unnamed)" for c in partial)
+            raise CalendarError(f"Multiple calendars match '{key}': {names}. Be more specific.")
+        return None
 
-    partial = [c for c in calendars if key in (c.name or "").strip().lower()]
-    if len(partial) == 1:
-        return partial[0]
-    if len(partial) > 1:
-        names = ", ".join(c.name or "(unnamed)" for c in partial)
-        raise CalendarError(f"Multiple calendars match '{name}': {names}. Be more specific.")
+    if name and name.strip():
+        matched = _match(name.strip().lower())
+        if matched is not None:
+            return matched
+        available = ", ".join(c.name or "(unnamed)" for c in calendars)
+        raise CalendarError(f"No calendar named '{name}' found. Available calendars: {available}")
 
-    available = ", ".join(c.name or "(unnamed)" for c in calendars)
-    raise CalendarError(f"No calendar named '{name}' found. Available calendars: {available}")
+    if CALENDAR_DEFAULT_NAME and CALENDAR_DEFAULT_NAME.strip():
+        try:
+            matched = _match(CALENDAR_DEFAULT_NAME.strip().lower())
+        except CalendarError:
+            matched = None  # CALENDAR_DEFAULT_NAME ambiguously partial-matched - no name
+                             # was explicitly requested here, so fall through instead
+                             # of hard-failing every calendar_name-less call.
+        if matched is not None:
+            return matched
+        # Configured default doesn't exist on this account - fall through
+        # silently rather than hard-failing every calendar_name-less call.
+
+    return calendars[0]
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +436,10 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
     end_dt = _parse_datetime(end) if end else start_dt + timedelta(hours=1)
     if end_dt <= start_dt:
         raise CalendarError("Event end time must be after the start time.")
+    # Attach the configured local timezone now - iCloud otherwise has no
+    # timezone info to go on and events land shifted (usually to UTC).
+    start_dt = _localize(start_dt)
+    end_dt = _localize(end_dt)
 
     def apply_fn() -> str:
         try:
@@ -532,9 +572,9 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
                 if title:
                     comp["SUMMARY"] = title
                 if start:
-                    comp["DTSTART"] = icalendar.vDDDTypes(_parse_datetime(start))
+                    comp["DTSTART"] = icalendar.vDDDTypes(_localize(_parse_datetime(start)))
                 if end:
-                    comp["DTEND"] = icalendar.vDDDTypes(_parse_datetime(end))
+                    comp["DTEND"] = icalendar.vDDDTypes(_localize(_parse_datetime(end)))
                 if location is not None:
                     comp["LOCATION"] = location
                 if description is not None:
