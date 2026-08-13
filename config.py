@@ -40,16 +40,18 @@ LLAMA_SERVER_PORT = 8080
 LLAMA_SERVER_URL = f"http://localhost:{LLAMA_SERVER_PORT}"
 
 # The exact model to pull/run via llama.cpp's -hf shorthand.
-LLAMA_MODEL_REPO = "Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
+#LLAMA_MODEL_REPO = "Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
+LLAMA_MODEL_REPO = "Qwen/Qwen3-14B-GGUF:Q4_K_M"
 
 LLAMA_NGL = 99          # -ngl: layers offloaded to GPU (99 = full offload)
-LLAMA_CONTEXT = 8192    # -c: context window size
-LLAMA_TEMP = 0.5        # --temp: lowered from default: fixed the malformed
-                        #   tool-call bug (handover item 15). Raise this
-                        #   again only if you're prepared to re-test that
-                        #   fix, or re-add the salvage function.
+LLAMA_CONTEXT = 32768    # -c: context window size
+LLAMA_TEMP = 0.6
+LLAMA_TOP_P = 0.95
+LLAMA_TOP_K = 20
+LLAMA_MIN_P = 0.0   # new constant - see command builder change below
 LLAMA_FLASH_ATTENTION = 'on'   # -fa: flash attention, speed optimization [on|off|auto]
 LLAMA_USE_JINJA = True         # --jinja: required for structured tool-call output
+LLAMA_REASONING_FORMAT = "deepseek"
 
 
 def build_llama_server_command() -> list[str]:
@@ -67,6 +69,10 @@ def build_llama_server_command() -> list[str]:
         "--host", LLAMA_SERVER_HOST,
         "--port", str(LLAMA_SERVER_PORT),
         "-fa", str(LLAMA_FLASH_ATTENTION),
+        "--top-p", str(LLAMA_TOP_P),
+        "--top-k", str(LLAMA_TOP_K),
+        "--min-p", str(LLAMA_MIN_P),
+        "--reasoning-format", LLAMA_REASONING_FORMAT,
     ]
     if LLAMA_USE_JINJA:
         cmd.append("--jinja")
