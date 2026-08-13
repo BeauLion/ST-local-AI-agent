@@ -38,6 +38,7 @@ import icalendar
 from dotenv import load_dotenv
 
 from config import (
+    CALDAV_TIMEOUT_SECONDS,
     CALENDAR_DEFAULT_LOOKAHEAD_DAYS,
     CALENDAR_DEFAULT_NAME,
     CALENDAR_PENDING_CHANGE_TTL_MINUTES,
@@ -46,6 +47,7 @@ from config import (
     CALENDAR_TIMEZONE,
     CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS,
     CALENDAR_UID_LOOKUP_LOOKBACK_DAYS,
+    CALENDAR_WRITE_RETRIES,
     ICLOUD_APP_PASSWORD_ENV_VAR,
     ICLOUD_CALDAV_URL,
     ICLOUD_USERNAME_ENV_VAR,
@@ -109,7 +111,10 @@ def _get_client() -> caldav.DAVClient:
         if _cached_client is None:
             username, password = _get_credentials()
             try:
-                client = caldav.DAVClient(url=ICLOUD_CALDAV_URL, username=username, password=password)
+                client = caldav.DAVClient(
+                    url=ICLOUD_CALDAV_URL, username=username, password=password,
+                    timeout=CALDAV_TIMEOUT_SECONDS,
+                )
                 client.principal()  # forces a round-trip now, not on first real use
             except Exception as e:
                 raise CalendarError(
@@ -151,6 +156,34 @@ def _date_search_with_retry(cal, start_dt, end_dt, error_prefix: str):
             return cal.date_search(start_dt, end_dt)
         except Exception as second_error:
             raise CalendarError(f"{error_prefix}: {second_error}")
+
+
+def _find_matching_event(cal, title: str, start_dt: datetime):
+    """Look for an event with a matching title at the same start time in
+    `cal`, in a narrow window around start_dt. Used as a duplicate guard
+    before creating an event: a previous create attempt may have
+    succeeded on iCloud's side even though the client never saw the
+    response (e.g. after a read timeout), and cal.add_event() always
+    mints a new UID - so blindly retrying a create can silently
+    double-book. Returns the matching event, or None."""
+    window_start = start_dt - timedelta(minutes=1)
+    window_end = start_dt + timedelta(minutes=1)
+    try:
+        events = cal.date_search(window_start, window_end)
+    except Exception:
+        # Don't let a failed duplicate-check block the real create
+        # attempt - fall through and let that attempt's own error
+        # handling decide the outcome.
+        return None
+    target = title.strip().lower()
+    for event in events:
+        try:
+            summary = _ical_field(event.icalendar_component, "summary", "")
+        except Exception:
+            continue
+        if summary.strip().lower() == target:
+            return event
+    return None
 
 
 def _reset_client():
@@ -442,6 +475,13 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
     end_dt = _localize(end_dt)
 
     def apply_fn() -> str:
+        # Duplicate guard: a previous attempt may have succeeded on
+        # iCloud's side even though the client never saw the response
+        # (e.g. a timeout) - check before minting a new event.
+        if _find_matching_event(cal, title, start_dt) is not None:
+            return (f"'{title}' on {start_dt.strftime('%A %Y-%m-%d')} "
+                     f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')} already exists - "
+                     f"not creating a duplicate.")
         try:
             cal.add_event(
                 dtstart=start_dt, dtend=end_dt, summary=title,
@@ -630,11 +670,25 @@ def confirm_pending() -> str:
         pending = _peek_pending()
         if pending is None:
             return "Nothing is staged to confirm. It may have expired - propose the change again."
-        try:
-            result = pending["apply"]()
-        finally:
+        last_error = None
+        for attempt in range(CALENDAR_WRITE_RETRIES + 1):
+            try:
+                result = pending["apply"]()
+            except CalendarError as e:
+                last_error = e
+                if attempt < CALENDAR_WRITE_RETRIES:
+                    time.sleep(_CALENDAR_RETRY_DELAY_SECONDS)
+                continue
             _pending_change = None
-        return result
+            return result
+        # All attempts failed - deliberately do NOT clear _pending_change
+        # here (unlike before). That lets the user just say "confirm"
+        # again later instead of the model re-describing/re-staging it
+        # from scratch, and apply_fn's own duplicate guard (for creates)
+        # makes that safe even if an earlier attempt actually succeeded
+        # on iCloud's side despite the client-side error. The existing
+        # TTL in _peek_pending() still expires it eventually.
+        raise last_error
 
 
 def cancel_pending() -> str:
