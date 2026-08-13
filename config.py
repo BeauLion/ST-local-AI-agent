@@ -149,6 +149,19 @@ CORS_ALLOWED_ORIGINS = ["*"]
 # your account has - principal discovery happens from here.
 ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 
+# IANA timezone name used to localize any naive date/time the model writes
+# to the calendar (create/edit). A named zone (not a fixed UTC offset) is
+# required so CEST/CET DST transitions are handled automatically. Needs
+# the `tzdata` package on Windows (stdlib zoneinfo has no built-in tz
+# database there) - see requirements.txt.
+CALENDAR_TIMEZONE = "Europe/Amsterdam"
+
+# Calendar to default to when no calendar_name is given. Must exactly
+# match (or uniquely partially match) one of your real iCloud calendar
+# names - check with calendar_list_calendars if unsure. Falls back to
+# iCloud's first-returned calendar if this name doesn't match anything.
+CALENDAR_DEFAULT_NAME = "Home"
+
 # Names of the environment variables calendar_manager.py reads credentials
 # from (via a .env file in PROJECT_ROOT - see .env.example). Secrets never
 # go in this file.
