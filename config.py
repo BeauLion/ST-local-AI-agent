@@ -156,6 +156,15 @@ ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 # database there) - see requirements.txt.
 CALENDAR_TIMEZONE = "Europe/Amsterdam"
 
+# Per-request timeout (seconds) for all CalDAV calls to iCloud. Previously
+# unset, which let a single stalled request hang on whatever the caldav
+# library's internal default is (~120s) with no way to recover from it.
+CALDAV_TIMEOUT_SECONDS = 30
+
+# Extra attempts (beyond the first) confirm_pending() makes if writing a
+# staged change to iCloud fails, with a short delay between attempts.
+CALENDAR_WRITE_RETRIES = 2
+
 # Calendar to default to when no calendar_name is given. Must exactly
 # match (or uniquely partially match) one of your real iCloud calendar
 # names - check with calendar_list_calendars if unsure. Falls back to
