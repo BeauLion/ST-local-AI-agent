@@ -43,6 +43,7 @@ from config import (
     DOCKER_MEM_LIMIT,
     DOCKER_NETWORK_DISABLED,
     DOCKER_TIMEOUT_SECONDS,
+    LLAMA_CONTEXT,
     LLAMA_SERVER_URL,
     MAX_TOOL_ITERATIONS,
     SAFE_FILES_DIR,
@@ -1251,10 +1252,28 @@ async def _stream_chat(client: httpx.AsyncClient, body: dict):
         ) from e
 
 
-async def agent_loop(upstream_body: dict):
+async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
+    """Ask llama-server for the exact token count of a piece of text via
+    its /tokenize endpoint. Returns None (never raises) on any failure -
+    this is a diagnostic-only feature and should never block a real chat
+    turn if llama-server is briefly unreachable for it."""
+    if not text:
+        return 0
+    try:
+        resp = await client.post(f"{LLAMA_SERVER_URL}/tokenize", json={"content": text})
+        resp.raise_for_status()
+        return len(resp.json().get("tokens", []))
+    except Exception as e:
+        print(f"[AGENT] Token count lookup failed: {e}")
+        return None
+
+
+async def agent_loop(upstream_body: dict, usage_totals: dict):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
-    way. Yields:
+    way. usage_totals is mutated in place with cumulative token counts
+    across every llama-server round-trip in this turn - the caller reads
+    it once the generator finishes. Yields:
       ("delta", text)    - a piece of the FINAL answer, forwarded the
                             moment it's clear this iteration isn't a tool
                             call.
@@ -1283,14 +1302,26 @@ async def agent_loop(upstream_body: dict):
     the client resolves its half and sends the follow-up request.
     """
     async with httpx.AsyncClient(timeout=None) as client:
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for iteration in range(MAX_TOOL_ITERATIONS):
             content = ""
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
+            iteration_usage = None
 
             try:
                 async for chunk in _stream_chat(client, upstream_body):
-                    delta = chunk["choices"][0].get("delta", {})
+                    chunk_usage = chunk.get("usage")
+                    if chunk_usage:
+                        iteration_usage = chunk_usage
+
+                    choices = chunk.get("choices")
+                    if not choices:
+                        # The final chunk when stream_options.include_usage is set
+                        # carries usage with an empty choices list, per the OpenAI
+                        # spec llama-server mirrors here - nothing else to do with it.
+                        continue
+
+                    delta = choices[0].get("delta", {})
 
                     delta_tool_calls = delta.get("tool_calls")
                     if delta_tool_calls:
@@ -1322,6 +1353,17 @@ async def agent_loop(upstream_body: dict):
                 yield ("delta", f"⚠️ {e}")
                 yield ("done", {"role": "assistant", "content": str(e)})
                 return
+
+            if iteration_usage:
+                usage_totals["prompt_tokens"] += iteration_usage.get("prompt_tokens", 0)
+                usage_totals["completion_tokens"] += iteration_usage.get("completion_tokens", 0)
+                usage_totals["total_tokens"] += iteration_usage.get("total_tokens", 0)
+                print(
+                    f"[AGENT] iteration {iteration + 1} tokens - "
+                    f"prompt: {iteration_usage.get('prompt_tokens', 0)}, "
+                    f"completion: {iteration_usage.get('completion_tokens', 0)}, "
+                    f"running total: {usage_totals['total_tokens']}"
+                )
 
             if mode == "tool_calls" and tool_calls:
                 calls = [tool_calls[i] for i in sorted(tool_calls)]
@@ -1554,6 +1596,8 @@ async def chat_completions(request: Request):
     upstream_body["stream"] = True
     upstream_body["tools"] = TOOLS + client_tools
     upstream_body["tool_choice"] = "auto"
+    upstream_body["stream_options"] = {"include_usage": True}
+    usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     tool_instruction = {
         "role": "system",
@@ -1666,6 +1710,7 @@ async def chat_completions(request: Request):
         ),
     }
     messages_to_prepend = [tool_instruction]
+    prepend_sections = [("tool_instruction", tool_instruction["content"])]
 
     # Inject the real current date/time on EVERY request, the same pattern
     # used for project state and memory recall below. Previously the model
@@ -1686,6 +1731,7 @@ async def chat_completions(request: Request):
         f"different date or year from memory or training data."
     )
     messages_to_prepend.append({"role": "system", "content": current_datetime_text})
+    prepend_sections.append(("current_datetime", current_datetime_text))
 
     # Server-side equivalent of the old extension's setExtensionPrompt():
     # inject the focused project's state directly, no tool call needed.
@@ -1694,6 +1740,7 @@ async def chat_completions(request: Request):
     )
     if project_state_text:
         messages_to_prepend.append({"role": "system", "content": project_state_text})
+        prepend_sections.append(("project_state", project_state_text))
     print(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
 
     # Auto-recall: silently check if any saved memories are relevant to what
@@ -1706,11 +1753,48 @@ async def chat_completions(request: Request):
         relevant = await asyncio.to_thread(memory.search_memories, last_user_msg)
         if relevant:
             print(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
-            messages_to_prepend.append({
-                "role": "system",
-                "content": "Relevant things you remember about this user from past "
-                            "conversations:\n" + "\n".join(f"- {m}" for m in relevant),
-            })
+            memory_recall_text = (
+                "Relevant things you remember about this user from past "
+                "conversations:\n" + "\n".join(f"- {m}" for m in relevant)
+            )
+            messages_to_prepend.append({"role": "system", "content": memory_recall_text})
+            prepend_sections.append(("memory_recall", memory_recall_text))
+
+    # Best-effort exact per-section token counts via llama-server's
+    # /tokenize endpoint - purely diagnostic, printed to console to help
+    # spot which system-prompt section is worth trimming. "character_card"
+    # is SillyTavern's own leading system message, if any - inspected here
+    # for visibility only, never modified. A tokenize failure just skips
+    # this log line; it never blocks the actual turn.
+    character_card_text = None
+    if upstream_body["messages"] and upstream_body["messages"][0].get("role") == "system":
+        character_card_text = upstream_body["messages"][0].get("content") or ""
+
+    # The tools schema (this server's own TOOLS plus any client-registered
+    # ones) is sent as JSON on every single request and rendered into the
+    # prompt by the chat template - easy to overlook since it isn't a
+    # system message like the others, but it's often the single largest
+    # fixed cost in the whole prompt.
+    tools_schema_text = json.dumps(upstream_body["tools"])
+
+    sections = [
+        ("character_card", character_card_text),
+        ("tools_schema", tools_schema_text),
+    ] + prepend_sections
+
+    async with httpx.AsyncClient(timeout=10.0) as tokenize_client:
+        counts = await asyncio.gather(
+            *(_count_tokens(tokenize_client, text) for _, text in sections)
+        )
+    breakdown = ", ".join(
+        f"{name}={count if count is not None else '?'}"
+        for (name, _), count in zip(sections, counts)
+    )
+    known_total = sum(c for c in counts if c is not None)
+    print(
+        f"[AGENT] System prompt section sizes (tokens): {breakdown} "
+        f"| known total: {known_total} / {LLAMA_CONTEXT} context"
+    )
 
     upstream_body["messages"] = messages_to_prepend + upstream_body["messages"]
     # Full OpenAI chat-completion responses carry an id/object/created/model
@@ -1729,17 +1813,19 @@ async def chat_completions(request: Request):
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
         finish_reason = "stop"
-        async for kind, payload in agent_loop(upstream_body):
+        async for kind, payload in agent_loop(upstream_body, usage_totals):
             if kind in ("done", "handoff"):
                 final_message = payload
                 finish_reason = "tool_calls" if kind == "handoff" else "stop"
+        print(f"[AGENT] Turn total tokens - prompt: {usage_totals['prompt_tokens']}, "
+              f"completion: {usage_totals['completion_tokens']}, total: {usage_totals['total_tokens']}")
         final_data = {
             "id": completion_id,
             "object": "chat.completion",
             "created": created_ts,
             "model": model_name,
             "choices": [{"index": 0, "message": final_message, "finish_reason": finish_reason}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": usage_totals,
         }
         return JSONResponse(content=final_data)
 
@@ -1756,7 +1842,7 @@ async def chat_completions(request: Request):
         return f"data: {json.dumps(payload)}\n\n".encode()
 
     async def event_stream():
-        async for kind, payload in agent_loop(upstream_body):
+        async for kind, payload in agent_loop(upstream_body, usage_totals):
             if kind == "delta":
                 yield sse({"index": 0, "delta": {"content": payload}, "finish_reason": None})
                 continue
@@ -1771,12 +1857,16 @@ async def chat_completions(request: Request):
                     delta["content"] = payload["content"]
                 yield sse({"index": 0, "delta": delta, "finish_reason": None})
                 yield sse({"index": 0, "delta": {}, "finish_reason": "tool_calls"})
+                print(f"[AGENT] Turn total tokens - prompt: {usage_totals['prompt_tokens']}, "
+                      f"completion: {usage_totals['completion_tokens']}, total: {usage_totals['total_tokens']}")
                 yield b"data: [DONE]\n\n"
                 return
             # "done" carries the full message for the non-streaming path only;
             # its content has already been sent as deltas above.
 
         yield sse({"index": 0, "delta": {}, "finish_reason": "stop"})
+        print(f"[AGENT] Turn total tokens - prompt: {usage_totals['prompt_tokens']}, "
+              f"completion: {usage_totals['completion_tokens']}, total: {usage_totals['total_tokens']}")
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
