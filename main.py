@@ -43,6 +43,7 @@ from config import (
     DOCKER_MEM_LIMIT,
     DOCKER_NETWORK_DISABLED,
     DOCKER_TIMEOUT_SECONDS,
+    LLAMA_CONTEXT,
     LLAMA_SERVER_URL,
     MAX_TOOL_ITERATIONS,
     SAFE_FILES_DIR,
@@ -109,6 +110,72 @@ _BARE_CONFIRMATION_RE = re.compile(
     r"""^["'\s]*(yes|yeah|yep|sure|ok|okay|confirm|confirmed|go ahead|do it|correct|proceed)[.!]?["'\s]*$""",
     re.IGNORECASE,
 )
+
+_RELATIVE_DATE_RE = re.compile(
+    r"\b("
+    r"today|tonight|tomorrow|yesterday|"
+    r"this (?:morning|afternoon|evening|week|weekend|month)|"
+    r"next (?:week|weekend|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"this (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"day after tomorrow"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _calendar_read_tool_seen_before_last_user_msg(messages: list) -> bool:
+    last_user_idx = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            last_user_idx = i
+    if last_user_idx is None:
+        return False
+    for m in messages[:last_user_idx]:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if tc.get("function", {}).get("name") in _CALENDAR_READ_TOOLS:
+                return True
+    return False
+
+
+_CALENDAR_KEYWORD_RE = re.compile(r"\bcalendar\b", re.IGNORECASE)
+
+
+def _looks_like_calendar_question(text) -> bool:
+    text = text or ""
+    if not isinstance(text, str):
+        return False
+    return bool(_CALENDAR_KEYWORD_RE.search(text) or _RELATIVE_DATE_RE.search(text))
+
+
+def _redact_stale_calendar_answers(messages: list) -> list:
+    last_user_idx = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            last_user_idx = i
+    if last_user_idx is None:
+        return messages
+
+    redacted = []
+    for i, m in enumerate(messages):
+        if (
+            i < last_user_idx
+            and m.get("role") == "assistant"
+            and i > 0
+            and messages[i - 1].get("role") == "user"
+            and _looks_like_calendar_question(messages[i - 1].get("content"))
+        ):
+            m = dict(m)
+            m["content"] = (
+                "[An earlier calendar answer was here - hidden because it may be "
+                "about a different day than what's being asked now. If this "
+                "question needs calendar data, call calendar_list_events or "
+                "calendar_search_events again rather than reusing it.]"
+            )
+        redacted.append(m)
+    return redacted
 
 
 # Lets the SillyTavern extension's browser-side fetch() calls (a different
@@ -442,7 +509,7 @@ def calendar_list_calendars(args: dict) -> str:
 def calendar_list_events(args: dict) -> str:
     try:
         events = calendar_manager.list_events(
-            args.get("start"), args.get("end"), args.get("calendar_name")
+            args.get("start"), args.get("end"), args.get("calendar_name"), args.get("when")
         )
     except CalendarError as e:
         return f"Error: {e}"
@@ -452,7 +519,8 @@ def calendar_list_events(args: dict) -> str:
 def calendar_search_events(args: dict) -> str:
     try:
         events = calendar_manager.search_events(
-            args.get("query", ""), args.get("start"), args.get("end"), args.get("calendar_name")
+            args.get("query", ""), args.get("start"), args.get("end"),
+            args.get("calendar_name"), args.get("when")
         )
     except CalendarError as e:
         return f"Error: {e}"
@@ -760,7 +828,8 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the same date for both start and end - that returns the whole day."},
+                    "when": {"type": "string", "description": "PREFERRED for any relative/named date or range - pass the phrase close to how the user said it, e.g. 'today', 'tomorrow', 'this weekend', 'next friday', 'in 3 days', 'the 20th'. The backend resolves this precisely, so you don't need to compute a date yourself. Omit if start/end are given instead."},
+                    "start": {"type": "string", "description": "Only use this instead of 'when' if you have an exact date already, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the same date for both start and end - that returns the whole day."},
                     "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start. Same value as start is valid and means 'just that one day'."},
                     "calendar_name": {"type": "string", "description": "Only needed if the user has multiple iCloud calendars and named one. Omit otherwise."},
                 },
@@ -777,7 +846,8 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Keyword to search for."},
-                    "start": {"type": "string", "description": "Optional start of search range, 'YYYY-MM-DD'. Defaults to 7 days ago."},
+                    "when": {"type": "string", "description": "PREFERRED for any relative/named date or range - pass the phrase close to how the user said it, e.g. 'today', 'this weekend', 'next friday', 'in 3 days'. The backend resolves this precisely. Omit if start/end are given instead."},
+                    "start": {"type": "string", "description": "Only use this instead of 'when' if you have an exact date already, 'YYYY-MM-DD'. Defaults to 7 days ago."},
                     "end": {"type": "string", "description": "Optional end of search range, 'YYYY-MM-DD'. Defaults to 90 days ahead."},
                     "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
                 },
@@ -1182,10 +1252,28 @@ async def _stream_chat(client: httpx.AsyncClient, body: dict):
         ) from e
 
 
-async def agent_loop(upstream_body: dict):
+async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
+    """Ask llama-server for the exact token count of a piece of text via
+    its /tokenize endpoint. Returns None (never raises) on any failure -
+    this is a diagnostic-only feature and should never block a real chat
+    turn if llama-server is briefly unreachable for it."""
+    if not text:
+        return 0
+    try:
+        resp = await client.post(f"{LLAMA_SERVER_URL}/tokenize", json={"content": text})
+        resp.raise_for_status()
+        return len(resp.json().get("tokens", []))
+    except Exception as e:
+        print(f"[AGENT] Token count lookup failed: {e}")
+        return None
+
+
+async def agent_loop(upstream_body: dict, usage_totals: dict):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
-    way. Yields:
+    way. usage_totals is mutated in place with cumulative token counts
+    across every llama-server round-trip in this turn - the caller reads
+    it once the generator finishes. Yields:
       ("delta", text)    - a piece of the FINAL answer, forwarded the
                             moment it's clear this iteration isn't a tool
                             call.
@@ -1214,14 +1302,26 @@ async def agent_loop(upstream_body: dict):
     the client resolves its half and sends the follow-up request.
     """
     async with httpx.AsyncClient(timeout=None) as client:
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for iteration in range(MAX_TOOL_ITERATIONS):
             content = ""
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
+            iteration_usage = None
 
             try:
                 async for chunk in _stream_chat(client, upstream_body):
-                    delta = chunk["choices"][0].get("delta", {})
+                    chunk_usage = chunk.get("usage")
+                    if chunk_usage:
+                        iteration_usage = chunk_usage
+
+                    choices = chunk.get("choices")
+                    if not choices:
+                        # The final chunk when stream_options.include_usage is set
+                        # carries usage with an empty choices list, per the OpenAI
+                        # spec llama-server mirrors here - nothing else to do with it.
+                        continue
+
+                    delta = choices[0].get("delta", {})
 
                     delta_tool_calls = delta.get("tool_calls")
                     if delta_tool_calls:
@@ -1253,6 +1353,17 @@ async def agent_loop(upstream_body: dict):
                 yield ("delta", f"⚠️ {e}")
                 yield ("done", {"role": "assistant", "content": str(e)})
                 return
+
+            if iteration_usage:
+                usage_totals["prompt_tokens"] += iteration_usage.get("prompt_tokens", 0)
+                usage_totals["completion_tokens"] += iteration_usage.get("completion_tokens", 0)
+                usage_totals["total_tokens"] += iteration_usage.get("total_tokens", 0)
+                print(
+                    f"[AGENT] iteration {iteration + 1} tokens - "
+                    f"prompt: {iteration_usage.get('prompt_tokens', 0)}, "
+                    f"completion: {iteration_usage.get('completion_tokens', 0)}, "
+                    f"running total: {usage_totals['total_tokens']}"
+                )
 
             if mode == "tool_calls" and tool_calls:
                 calls = [tool_calls[i] for i in sorted(tool_calls)]
@@ -1330,6 +1441,21 @@ async def agent_loop(upstream_body: dict):
                             f"staged change. If the user meant something different, call "
                             f"calendar_cancel_pending first, then propose the new change."
                         )
+                    elif (
+                        name == "calendar_search_events"
+                        and str(args.get("query", "")).strip().lower()
+                        and str(args.get("query", "")).strip().lower() == str(args.get("calendar_name", "")).strip().lower()
+                    ):
+                        result = (
+                            f"Error: calendar_search_events was NOT called. Its query "
+                            f"('{args.get('query')}') is identical to calendar_name - that means "
+                            f"you're using the calendar's own name as a search keyword, which "
+                            f"will not match real events and returns a false 'no events found'. "
+                            f"For a plain listing request ('what's on my calendar {args.get('calendar_name')}'), "
+                            f"call calendar_list_events with calendar_name='{args.get('calendar_name')}' "
+                            f"instead - no query needed. Only use calendar_search_events when "
+                            f"searching for a specific event by its title/location/description text."
+                        )
                     else:
                         # Run in a thread so a slow web search doesn't freeze the server.
                         result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
@@ -1404,6 +1530,34 @@ async def agent_loop(upstream_body: dict):
                 })
                 continue
 
+            stale_calendar_answer = (
+                not unresolved_confirmation
+                and bool(_RELATIVE_DATE_RE.search(str(last_user_text_for_check or "")))
+                and _calendar_read_tool_seen_before_last_user_msg(upstream_body["messages"])
+            )
+            if stale_calendar_answer:
+                print("[AGENT] Model answered a date-specific calendar question without "
+                      "calling a calendar tool this turn - discarding that answer and "
+                      "forcing a fresh, explicitly-scoped call instead of trusting an "
+                      "earlier result still in context.")
+                upstream_body["messages"].append({"role": "assistant", "content": content or None})
+                upstream_body["messages"].append({
+                    "role": "system",
+                    "content": (
+                        "STOP: you answered without calling calendar_list_events or "
+                        "calendar_search_events this turn, but the user's message named a "
+                        "specific day or relative date. Do not answer from an earlier "
+                        "calendar result already in this conversation, even if it looks "
+                        "like it covers the right day - you have gotten this wrong before "
+                        "(repeating a previous day's answer instead of the day actually "
+                        "asked about). Call calendar_list_events or calendar_search_events "
+                        "again now, with start and end set explicitly to the exact "
+                        "date/range just asked about (computed from the [CURRENT "
+                        "DATE/TIME] system message), then answer from that fresh result."
+                    ),
+                })
+                continue
+
             print("[AGENT] Model answered directly, without calling any tool.")
             if content:
                 yield ("delta", content)
@@ -1419,6 +1573,7 @@ async def agent_loop(upstream_body: dict):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
+    body["messages"] = _redact_stale_calendar_answers(body.get("messages") or [])
     client_wants_stream = body.get("stream", False)
 
     # SillyTavern extensions can register their own tools (e.g. the
@@ -1441,6 +1596,8 @@ async def chat_completions(request: Request):
     upstream_body["stream"] = True
     upstream_body["tools"] = TOOLS + client_tools
     upstream_body["tool_choice"] = "auto"
+    upstream_body["stream_options"] = {"include_usage": True}
+    usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     tool_instruction = {
         "role": "system",
@@ -1477,18 +1634,33 @@ async def chat_completions(request: Request):
             "search across all of the user's calendars by default. If the user asks "
             "what calendars they have, or expected events aren't showing up, call "
             "calendar_list_calendars to see the actual calendar names. "
-            "CRITICAL: a system message near the top of this conversation, labeled "
-            "[CURRENT DATE/TIME], gives you today's real date and time on every "
-            "single request - use it to compute any relative date phrase ('this "
-            "week', 'today', 'tomorrow', 'next month', etc.) for calendar_list_events, "
-            "calendar_search_events, calendar_create_event, and calendar_edit_event. "
-            "You do NOT need to call get_current_time for this - the date is already "
-            "provided fresh every turn. NEVER guess or assume a date/year from memory "
-            "or training data for a calendar call - a wrong year will silently return "
-            "the wrong (usually empty) results instead of erroring, so this mistake is "
-            "easy to make and easy to miss. If you don't need a specific range, you "
-            "may also omit start/end entirely and let the tool default to today "
-            "onward. "
+            "CRITICAL: for calendar_list_events and calendar_search_events, if the "
+            "user names any relative or named date or range ('today', 'tomorrow', "
+            "'this weekend', 'next friday', 'in 3 days', 'the 20th', etc.), use the "
+            "'when' parameter and pass the phrase close to how the user said it - "
+            "the backend resolves it precisely, so you do NOT need to compute the "
+            "date yourself for these two tools. Only use start/end on these two "
+            "tools if you already have an exact date. Only omit both 'when' and "
+            "start/end for a genuinely open-ended request with no date reference at "
+            "all (e.g. 'what's coming up'). "
+            "calendar_create_event and calendar_edit_event do NOT have a 'when' "
+            "parameter and still need an exact start (and optionally end) time - a "
+            "system message near the top of this conversation, labeled [CURRENT "
+            "DATE/TIME], gives you today's real date and time on every request; use "
+            "it to compute the exact date/time these two tools need. You do NOT "
+            "need to call get_current_time for this - the date is already provided "
+            "fresh every turn. NEVER guess or assume a date/year from memory or "
+            "training data - a wrong year will silently create/edit against the "
+            "wrong date instead of erroring, so this mistake is easy to make and "
+            "easy to miss. "
+            "CRITICAL: every new calendar question - including a short follow-up like "
+            "'and today?' - needs its OWN fresh calendar_list_events or "
+            "calendar_search_events call scoped to exactly what's being asked, even if "
+            "you already fetched calendar data earlier in this same conversation. Never "
+            "answer a calendar question by eye from an earlier tool result instead of "
+            "calling the tool again - you have been unreliable at correctly telling "
+            "apart which entries in an earlier multi-day result belong to the day now "
+            "being asked about. "
             "calendar_create_event, calendar_edit_event, and calendar_delete_event "
             "NEVER change the real calendar by themselves - they only stage a "
             "proposed change and return a description of it. After calling one, tell "
@@ -1538,6 +1710,7 @@ async def chat_completions(request: Request):
         ),
     }
     messages_to_prepend = [tool_instruction]
+    prepend_sections = [("tool_instruction", tool_instruction["content"])]
 
     # Inject the real current date/time on EVERY request, the same pattern
     # used for project state and memory recall below. Previously the model
@@ -1558,6 +1731,7 @@ async def chat_completions(request: Request):
         f"different date or year from memory or training data."
     )
     messages_to_prepend.append({"role": "system", "content": current_datetime_text})
+    prepend_sections.append(("current_datetime", current_datetime_text))
 
     # Server-side equivalent of the old extension's setExtensionPrompt():
     # inject the focused project's state directly, no tool call needed.
@@ -1566,6 +1740,7 @@ async def chat_completions(request: Request):
     )
     if project_state_text:
         messages_to_prepend.append({"role": "system", "content": project_state_text})
+        prepend_sections.append(("project_state", project_state_text))
     print(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
 
     # Auto-recall: silently check if any saved memories are relevant to what
@@ -1578,11 +1753,48 @@ async def chat_completions(request: Request):
         relevant = await asyncio.to_thread(memory.search_memories, last_user_msg)
         if relevant:
             print(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
-            messages_to_prepend.append({
-                "role": "system",
-                "content": "Relevant things you remember about this user from past "
-                            "conversations:\n" + "\n".join(f"- {m}" for m in relevant),
-            })
+            memory_recall_text = (
+                "Relevant things you remember about this user from past "
+                "conversations:\n" + "\n".join(f"- {m}" for m in relevant)
+            )
+            messages_to_prepend.append({"role": "system", "content": memory_recall_text})
+            prepend_sections.append(("memory_recall", memory_recall_text))
+
+    # Best-effort exact per-section token counts via llama-server's
+    # /tokenize endpoint - purely diagnostic, printed to console to help
+    # spot which system-prompt section is worth trimming. "character_card"
+    # is SillyTavern's own leading system message, if any - inspected here
+    # for visibility only, never modified. A tokenize failure just skips
+    # this log line; it never blocks the actual turn.
+    character_card_text = None
+    if upstream_body["messages"] and upstream_body["messages"][0].get("role") == "system":
+        character_card_text = upstream_body["messages"][0].get("content") or ""
+
+    # The tools schema (this server's own TOOLS plus any client-registered
+    # ones) is sent as JSON on every single request and rendered into the
+    # prompt by the chat template - easy to overlook since it isn't a
+    # system message like the others, but it's often the single largest
+    # fixed cost in the whole prompt.
+    tools_schema_text = json.dumps(upstream_body["tools"])
+
+    sections = [
+        ("character_card", character_card_text),
+        ("tools_schema", tools_schema_text),
+    ] + prepend_sections
+
+    async with httpx.AsyncClient(timeout=10.0) as tokenize_client:
+        counts = await asyncio.gather(
+            *(_count_tokens(tokenize_client, text) for _, text in sections)
+        )
+    breakdown = ", ".join(
+        f"{name}={count if count is not None else '?'}"
+        for (name, _), count in zip(sections, counts)
+    )
+    known_total = sum(c for c in counts if c is not None)
+    print(
+        f"[AGENT] System prompt section sizes (tokens): {breakdown} "
+        f"| known total: {known_total} / {LLAMA_CONTEXT} context"
+    )
 
     upstream_body["messages"] = messages_to_prepend + upstream_body["messages"]
     # Full OpenAI chat-completion responses carry an id/object/created/model
@@ -1601,17 +1813,19 @@ async def chat_completions(request: Request):
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
         finish_reason = "stop"
-        async for kind, payload in agent_loop(upstream_body):
+        async for kind, payload in agent_loop(upstream_body, usage_totals):
             if kind in ("done", "handoff"):
                 final_message = payload
                 finish_reason = "tool_calls" if kind == "handoff" else "stop"
+        print(f"[AGENT] Turn total tokens - prompt: {usage_totals['prompt_tokens']}, "
+              f"completion: {usage_totals['completion_tokens']}, total: {usage_totals['total_tokens']}")
         final_data = {
             "id": completion_id,
             "object": "chat.completion",
             "created": created_ts,
             "model": model_name,
             "choices": [{"index": 0, "message": final_message, "finish_reason": finish_reason}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": usage_totals,
         }
         return JSONResponse(content=final_data)
 
@@ -1628,7 +1842,7 @@ async def chat_completions(request: Request):
         return f"data: {json.dumps(payload)}\n\n".encode()
 
     async def event_stream():
-        async for kind, payload in agent_loop(upstream_body):
+        async for kind, payload in agent_loop(upstream_body, usage_totals):
             if kind == "delta":
                 yield sse({"index": 0, "delta": {"content": payload}, "finish_reason": None})
                 continue
@@ -1643,12 +1857,16 @@ async def chat_completions(request: Request):
                     delta["content"] = payload["content"]
                 yield sse({"index": 0, "delta": delta, "finish_reason": None})
                 yield sse({"index": 0, "delta": {}, "finish_reason": "tool_calls"})
+                print(f"[AGENT] Turn total tokens - prompt: {usage_totals['prompt_tokens']}, "
+                      f"completion: {usage_totals['completion_tokens']}, total: {usage_totals['total_tokens']}")
                 yield b"data: [DONE]\n\n"
                 return
             # "done" carries the full message for the non-streaming path only;
             # its content has already been sent as deltas above.
 
         yield sse({"index": 0, "delta": {}, "finish_reason": "stop"})
+        print(f"[AGENT] Turn total tokens - prompt: {usage_totals['prompt_tokens']}, "
+              f"completion: {usage_totals['completion_tokens']}, total: {usage_totals['total_tokens']}")
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
