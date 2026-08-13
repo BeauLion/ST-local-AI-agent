@@ -31,25 +31,46 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import caldav
 import icalendar
 from dotenv import load_dotenv
 
 from config import (
+    CALDAV_TIMEOUT_SECONDS,
     CALENDAR_BATCH_DEFAULT_DURATION_MINUTES,
     CALENDAR_BATCH_MAX_EVENTS,
     CALENDAR_DEFAULT_LOOKAHEAD_DAYS,
+    CALENDAR_DEFAULT_NAME,
     CALENDAR_PENDING_CHANGE_TTL_MINUTES,
     CALENDAR_SEARCH_LOOKAHEAD_DAYS,
     CALENDAR_SEARCH_LOOKBACK_DAYS,
+    CALENDAR_TIMEZONE,
     CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS,
     CALENDAR_UID_LOOKUP_LOOKBACK_DAYS,
+    CALENDAR_WRITE_RETRIES,
     ICLOUD_APP_PASSWORD_ENV_VAR,
     ICLOUD_CALDAV_URL,
     ICLOUD_USERNAME_ENV_VAR,
     PROJECT_ROOT,
 )
+
+# Cached once - ZoneInfo() does a filesystem/tzdata lookup internally, no
+# need to repeat it on every event write.
+_LOCAL_TZ = ZoneInfo(CALENDAR_TIMEZONE)
+
+
+def _localize(dt: datetime) -> datetime:
+    """Attach CALENDAR_TIMEZONE to a naive datetime before it's written to
+    iCloud. Only used at the point events are actually created/edited -
+    NOT applied to read-path datetimes (list/search/date_search), which
+    were already working correctly and use naive datetimes consistently
+    with each other. Mixing that up would risk breaking working reads to
+    fix a writes-only bug."""
+    if dt.tzinfo is not None:
+        return dt
+    return dt.replace(tzinfo=_LOCAL_TZ)
 
 # Loads ICLOUD_USERNAME / ICLOUD_APP_PASSWORD from a .env file sitting next
 # to config.py. If the file doesn't exist yet, this is a harmless no-op -
@@ -92,7 +113,10 @@ def _get_client() -> caldav.DAVClient:
         if _cached_client is None:
             username, password = _get_credentials()
             try:
-                client = caldav.DAVClient(url=ICLOUD_CALDAV_URL, username=username, password=password)
+                client = caldav.DAVClient(
+                    url=ICLOUD_CALDAV_URL, username=username, password=password,
+                    timeout=CALDAV_TIMEOUT_SECONDS,
+                )
                 client.principal()  # forces a round-trip now, not on first real use
             except Exception as e:
                 raise CalendarError(
@@ -122,6 +146,48 @@ def _get_calendars(refresh: bool = False):
     return calendars
 
 
+_CALENDAR_RETRY_DELAY_SECONDS = 2
+
+
+def _date_search_with_retry(cal, start_dt, end_dt, error_prefix: str):
+    try:
+        return cal.date_search(start_dt, end_dt)
+    except Exception as first_error:
+        time.sleep(_CALENDAR_RETRY_DELAY_SECONDS)
+        try:
+            return cal.date_search(start_dt, end_dt)
+        except Exception as second_error:
+            raise CalendarError(f"{error_prefix}: {second_error}")
+
+
+def _find_matching_event(cal, title: str, start_dt: datetime):
+    """Look for an event with a matching title at the same start time in
+    `cal`, in a narrow window around start_dt. Used as a duplicate guard
+    before creating an event: a previous create attempt may have
+    succeeded on iCloud's side even though the client never saw the
+    response (e.g. after a read timeout), and cal.add_event() always
+    mints a new UID - so blindly retrying a create can silently
+    double-book. Returns the matching event, or None."""
+    window_start = start_dt - timedelta(minutes=1)
+    window_end = start_dt + timedelta(minutes=1)
+    try:
+        events = cal.date_search(window_start, window_end)
+    except Exception:
+        # Don't let a failed duplicate-check block the real create
+        # attempt - fall through and let that attempt's own error
+        # handling decide the outcome.
+        return None
+    target = title.strip().lower()
+    for event in events:
+        try:
+            summary = _ical_field(event.icalendar_component, "summary", "")
+        except Exception:
+            continue
+        if summary.strip().lower() == target:
+            return event
+    return None
+
+
 def _reset_client():
     global _cached_client, _cached_calendars
     _cached_client = None
@@ -129,28 +195,45 @@ def _reset_client():
 
 
 def _resolve_calendar(name: str = None):
-    """Match by exact name, then unique partial name. Defaults to the
-    first calendar iCloud returns (usually the account's primary one) when
-    no name is given - fine for most single-calendar setups, but the model
-    can pass calendar_name to target a specific one."""
+    """Match by exact name, then unique partial name. When no name is
+    given, falls back to CALENDAR_DEFAULT_NAME (config.py) if it matches a
+    real calendar; if that's unset or doesn't match anything on the
+    account, falls back to whichever calendar iCloud happens to return
+    first."""
     calendars = _get_calendars()
-    if not name or not name.strip():
-        return calendars[0]
 
-    key = name.strip().lower()
-    for cal in calendars:
-        if (cal.name or "").strip().lower() == key:
-            return cal
+    def _match(key: str):
+        for cal in calendars:
+            if (cal.name or "").strip().lower() == key:
+                return cal
+        partial = [c for c in calendars if key in (c.name or "").strip().lower()]
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            names = ", ".join(c.name or "(unnamed)" for c in partial)
+            raise CalendarError(f"Multiple calendars match '{key}': {names}. Be more specific.")
+        return None
 
-    partial = [c for c in calendars if key in (c.name or "").strip().lower()]
-    if len(partial) == 1:
-        return partial[0]
-    if len(partial) > 1:
-        names = ", ".join(c.name or "(unnamed)" for c in partial)
-        raise CalendarError(f"Multiple calendars match '{name}': {names}. Be more specific.")
+    if name and name.strip():
+        matched = _match(name.strip().lower())
+        if matched is not None:
+            return matched
+        available = ", ".join(c.name or "(unnamed)" for c in calendars)
+        raise CalendarError(f"No calendar named '{name}' found. Available calendars: {available}")
 
-    available = ", ".join(c.name or "(unnamed)" for c in calendars)
-    raise CalendarError(f"No calendar named '{name}' found. Available calendars: {available}")
+    if CALENDAR_DEFAULT_NAME and CALENDAR_DEFAULT_NAME.strip():
+        try:
+            matched = _match(CALENDAR_DEFAULT_NAME.strip().lower())
+        except CalendarError:
+            matched = None  # CALENDAR_DEFAULT_NAME ambiguously partial-matched - no name
+                             # was explicitly requested here, so fall through instead
+                             # of hard-failing every calendar_name-less call.
+        if matched is not None:
+            return matched
+        # Configured default doesn't exist on this account - fall through
+        # silently rather than hard-failing every calendar_name-less call.
+
+    return calendars[0]
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +292,64 @@ def list_calendar_names() -> list[str]:
     return [c.name or "(unnamed)" for c in calendars]
 
 
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def _day_bounds(d) -> tuple:
+    start = datetime.combine(d, datetime.min.time())
+    return start, start + timedelta(days=1)
+
+
+def resolve_when(when: str) -> tuple:
+    if not when or not when.strip():
+        raise CalendarError("No date phrase given to resolve.")
+    text = when.strip().lower()
+    now = datetime.now()
+    today = now.date()
+
+    if text in ("today", "tonight"):
+        return _day_bounds(today)
+    if text == "tomorrow":
+        return _day_bounds(today + timedelta(days=1))
+    if text == "yesterday":
+        return _day_bounds(today - timedelta(days=1))
+    if text == "day after tomorrow":
+        return _day_bounds(today + timedelta(days=2))
+
+    if text == "this week":
+        start = today - timedelta(days=today.weekday())
+        return datetime.combine(start, datetime.min.time()), datetime.combine(start + timedelta(days=7), datetime.min.time())
+    if text == "next week":
+        start = today - timedelta(days=today.weekday()) + timedelta(days=7)
+        return datetime.combine(start, datetime.min.time()), datetime.combine(start + timedelta(days=7), datetime.min.time())
+    if text in ("this weekend", "the weekend"):
+        saturday = today + timedelta(days=(5 - today.weekday()) % 7)
+        return datetime.combine(saturday, datetime.min.time()), datetime.combine(saturday + timedelta(days=2), datetime.min.time())
+    if text == "this month":
+        start = today.replace(day=1)
+        end = start.replace(year=start.year + 1, month=1) if start.month == 12 else start.replace(month=start.month + 1)
+        return datetime.combine(start, datetime.min.time()), datetime.combine(end, datetime.min.time())
+
+    for name, idx in _WEEKDAYS.items():
+        if text in (name, f"this {name}", f"next {name}"):
+            delta = (idx - today.weekday()) % 7
+            if delta == 0 and text == f"next {name}":
+                delta = 7
+            return _day_bounds(today + timedelta(days=delta))
+
+    import dateparser
+    parsed = dateparser.parse(when, settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": now})
+    if parsed is None:
+        raise CalendarError(
+            f"Could not understand the date phrase '{when}'. Try a specific "
+            f"date like 'YYYY-MM-DD' instead."
+        )
+    return _day_bounds(parsed.date())
+
+
 # ---------------------------------------------------------------------------
 # Read operations - execute immediately, no staging needed
 # ---------------------------------------------------------------------------
@@ -221,32 +362,35 @@ _last_results_lock = threading.Lock()
 _last_results: list[dict] = []
 
 
-def list_events(start: str = None, end: str = None, calendar_name: str = None) -> list[dict]:
+def list_events(start: str = None, end: str = None, calendar_name: str = None, when: str = None) -> list[dict]:
     # Default to searching EVERY calendar on the account - a named
     # calendar_name narrows to just one. Without this, events silently
     # wouldn't show up if they live on any calendar other than whichever
     # one iCloud happens to return first.
     calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
 
-    start_dt = _parse_datetime(start) if start else datetime.now()
-    if end:
-        end_dt = _parse_datetime(end)
-        if end_dt <= start_dt:
-            # A single day is naturally expressed as the same date for both
-            # start and end (e.g. "tomorrow" -> start='2026-08-12',
-            # end='2026-08-12'). Treat that as "the whole day" rather than
-            # rejecting it as a zero-length range.
-            end_dt = start_dt + timedelta(days=1)
+    if when and not (start or end):
+        start_dt, end_dt = resolve_when(when)
+    elif start:
+        start_dt = _parse_datetime(start)
+        if end:
+            end_dt = _parse_datetime(end)
+            if end_dt <= start_dt:
+                # A single day is naturally expressed as the same date for both
+                # start and end (e.g. "tomorrow" -> start='2026-08-12',
+                # end='2026-08-12'). Treat that as "the whole day" rather than
+                # rejecting it as a zero-length range.
+                end_dt = start_dt + timedelta(days=1)
+        else:
+            end_dt = start_dt + timedelta(days=CALENDAR_DEFAULT_LOOKAHEAD_DAYS)
     else:
+        start_dt = datetime.now()
         end_dt = start_dt + timedelta(days=CALENDAR_DEFAULT_LOOKAHEAD_DAYS)
 
     results = []
     for cal in calendars:
         label = cal.name or "(unnamed)"
-        try:
-            events = cal.date_search(start_dt, end_dt)
-        except Exception as e:
-            raise CalendarError(f"Could not fetch events from '{label}': {e}")
+        events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not fetch events from '{label}'")
         results.extend(_event_to_dict(e, label) for e in events)
 
     results.sort(key=lambda e: e["start"])
@@ -256,23 +400,23 @@ def list_events(start: str = None, end: str = None, calendar_name: str = None) -
     return results
 
 
-def search_events(query: str, start: str = None, end: str = None, calendar_name: str = None) -> list[dict]:
+def search_events(query: str, start: str = None, end: str = None, calendar_name: str = None, when: str = None) -> list[dict]:
     if not query or not query.strip():
         raise CalendarError("A search query is required.")
 
     calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
 
-    start_dt = _parse_datetime(start) if start else datetime.now() - timedelta(days=CALENDAR_SEARCH_LOOKBACK_DAYS)
-    end_dt = _parse_datetime(end) if end else datetime.now() + timedelta(days=CALENDAR_SEARCH_LOOKAHEAD_DAYS)
+    if when and not (start or end):
+        start_dt, end_dt = resolve_when(when)
+    else:
+        start_dt = _parse_datetime(start) if start else datetime.now() - timedelta(days=CALENDAR_SEARCH_LOOKBACK_DAYS)
+        end_dt = _parse_datetime(end) if end else datetime.now() + timedelta(days=CALENDAR_SEARCH_LOOKAHEAD_DAYS)
 
     key = query.strip().lower()
     matches = []
     for cal in calendars:
         label = cal.name or "(unnamed)"
-        try:
-            events = cal.date_search(start_dt, end_dt)
-        except Exception as e:
-            raise CalendarError(f"Could not search '{label}': {e}")
+        events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not search '{label}'")
         for event in events:
             d = _event_to_dict(event, label)
             haystack = f"{d['title']} {d['description']} {d['location']}".lower()
@@ -327,8 +471,19 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
     end_dt = _parse_datetime(end) if end else start_dt + timedelta(hours=1)
     if end_dt <= start_dt:
         raise CalendarError("Event end time must be after the start time.")
+    # Attach the configured local timezone now - iCloud otherwise has no
+    # timezone info to go on and events land shifted (usually to UTC).
+    start_dt = _localize(start_dt)
+    end_dt = _localize(end_dt)
 
     def apply_fn() -> str:
+        # Duplicate guard: a previous attempt may have succeeded on
+        # iCloud's side even though the client never saw the response
+        # (e.g. a timeout) - check before minting a new event.
+        if _find_matching_event(cal, title, start_dt) is not None:
+            return (f"'{title}' on {start_dt.strftime('%A %Y-%m-%d')} "
+                     f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')} already exists - "
+                     f"not creating a duplicate.")
         try:
             cal.add_event(
                 dtstart=start_dt, dtend=end_dt, summary=title,
@@ -346,20 +501,19 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
 
 
 def _get_busy_intervals(start_dt: datetime, end_dt: datetime) -> list:
-    """Return (busy_start, busy_end, title) tuples, naive local time
-    (consistent with _parse_datetime elsewhere in this module), for every
+    """Return (busy_start, busy_end, title) tuples, tz-aware, for every
     event across EVERY calendar on the account that overlaps
-    [start_dt, end_dt). Used by stage_create_events_batch to check a
-    proposed schedule against what's already on the calendar, on ANY
-    calendar - a conflicting event elsewhere should still block
-    scheduling here."""
+    [start_dt, end_dt). start_dt/end_dt are naive here, consistent with
+    the other read paths in this module (list_events/search_events) -
+    iCloud's date_search accepts naive datetimes fine, same as those.
+    Used by stage_create_events_batch to check a proposed schedule
+    against what's already on the calendar, on ANY calendar - a
+    conflicting event elsewhere should still block scheduling here."""
     busy = []
     for cal in _get_calendars():
-        label = cal.name or "(unnamed)"
-        try:
-            events = cal.date_search(start_dt, end_dt)
-        except Exception as e:
-            raise CalendarError(f"Could not check '{label}' for conflicts: {e}")
+        events = _date_search_with_retry(
+            cal, start_dt, end_dt, f"Could not check '{cal.name or '(unnamed)'}' for conflicts"
+        )
         for event in events:
             try:
                 component = event.icalendar_component
@@ -374,40 +528,22 @@ def _get_busy_intervals(start_dt: datetime, end_dt: datetime) -> list:
             s = dtstart.dt
             e = dtend.dt if dtend is not None else s
             # Normalize all-day (date-only) events to a full-day interval
-            # so they still block a proposed slot inside that day.
+            # in the configured local timezone so they still block a
+            # proposed slot inside that day.
             if not isinstance(s, datetime):
-                s = datetime.combine(s, datetime.min.time())
+                s = datetime.combine(s, datetime.min.time(), tzinfo=_LOCAL_TZ)
+            elif s.tzinfo is None:
+                s = s.replace(tzinfo=_LOCAL_TZ)
             if not isinstance(e, datetime):
-                e = datetime.combine(e, datetime.min.time())
-            # Drop any tzinfo iCloud returned so this stays comparable
-            # with the naive local times _parse_datetime produces.
-            busy.append((s.replace(tzinfo=None), e.replace(tzinfo=None),
-                         _ical_field(component, "summary", "(no title)")))
+                e = datetime.combine(e, datetime.min.time(), tzinfo=_LOCAL_TZ)
+            elif e.tzinfo is None:
+                e = e.replace(tzinfo=_LOCAL_TZ)
+            busy.append((s, e, _ical_field(component, "summary", "(no title)")))
     return busy
 
 
 def _overlaps(a_start, a_end, b_start, b_end) -> bool:
     return a_start < b_end and b_start < a_end
-
-
-def _find_matching_event(cal, title: str, start_dt: datetime):
-    """Look for an event with this exact title starting at this exact
-    time on cal, in a narrow window around start_dt. Used by
-    stage_create_events_batch's apply step so re-confirming after a
-    partial failure doesn't double-book events that already succeeded in
-    an earlier attempt."""
-    try:
-        events = cal.date_search(start_dt - timedelta(minutes=1), start_dt + timedelta(minutes=1))
-    except Exception:
-        return None
-    for event in events:
-        try:
-            component = event.icalendar_component
-        except Exception:
-            continue
-        if component is not None and str(component.get("summary", "")) == title:
-            return event
-    return None
 
 
 def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
@@ -441,8 +577,8 @@ def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
             raise CalendarError(f"Event {i + 1} ('{title}'): end time must be after the start time.")
         prepared.append({
             "title": title,
-            "start_dt": start_dt,
-            "end_dt": end_dt,
+            "start_dt": _localize(start_dt),
+            "end_dt": _localize(end_dt),
             "location": str(ev.get("location") or ""),
             "description": str(ev.get("description") or ""),
         })
@@ -461,11 +597,15 @@ def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
     # None of the proposed events may collide with what's already on the
     # calendar - checked across every calendar on the account, not just
     # the target one for this batch.
-    window_start = min(p["start_dt"] for p in prepared)
-    window_end = max(p["end_dt"] for p in prepared)
-    busy_intervals = _get_busy_intervals(window_start, window_end)
+    window_start = min(p["start_dt"] for p in prepared).replace(tzinfo=None)
+    window_end = max(p["end_dt"] for p in prepared).replace(tzinfo=None)
+    busy = _get_busy_intervals(window_start, window_end)  # fetched ONCE for the whole
+                                                            # batch, not once per event -
+                                                            # the earlier per-event fetch
+                                                            # multiplied CalDAV round-trips
+                                                            # (and timeout risk) by batch size
     for p in prepared:
-        for busy_start, busy_end, busy_title in busy_intervals:
+        for busy_start, busy_end, busy_title in busy:
             if _overlaps(p["start_dt"], p["end_dt"], busy_start, busy_end):
                 raise CalendarError(
                     f"'{p['title']}' ({p['start_dt'].strftime('%a %H:%M')}-{p['end_dt'].strftime('%H:%M')}) "
@@ -476,10 +616,9 @@ def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
     def apply_fn() -> str:
         results = []
         for p in prepared:
-            # Duplicate guard, same idea as the retry-safety note on
-            # stage_create_event - protects a retry-after-failure from
-            # double-booking events that actually succeeded on iCloud's
-            # side in an earlier attempt.
+            # Duplicate guard, same as stage_create_event - protects a
+            # retry-after-failure from double-booking events that
+            # actually succeeded on iCloud's side in an earlier attempt.
             if _find_matching_event(cal, p["title"], p["start_dt"]) is not None:
                 results.append(f"'{p['title']}' already exists - skipped (not duplicated).")
                 continue
@@ -514,10 +653,7 @@ def _search_calendars_for_uid(calendars, uid: str):
     start_dt = datetime.now() - timedelta(days=CALENDAR_UID_LOOKUP_LOOKBACK_DAYS)
     end_dt = datetime.now() + timedelta(days=CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS)
     for cal in calendars:
-        try:
-            events = cal.date_search(start_dt, end_dt)
-        except Exception as e:
-            raise CalendarError(f"Could not search '{cal.name or '(unnamed)'}' for the event: {e}")
+        events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not search '{cal.name or '(unnamed)'}' for the event")
         for event in events:
             try:
                 component = event.icalendar_component
@@ -623,9 +759,9 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
                 if title:
                     comp["SUMMARY"] = title
                 if start:
-                    comp["DTSTART"] = icalendar.vDDDTypes(_parse_datetime(start))
+                    comp["DTSTART"] = icalendar.vDDDTypes(_localize(_parse_datetime(start)))
                 if end:
-                    comp["DTEND"] = icalendar.vDDDTypes(_parse_datetime(end))
+                    comp["DTEND"] = icalendar.vDDDTypes(_localize(_parse_datetime(end)))
                 if location is not None:
                     comp["LOCATION"] = location
                 if description is not None:
@@ -681,11 +817,25 @@ def confirm_pending() -> str:
         pending = _peek_pending()
         if pending is None:
             return "Nothing is staged to confirm. It may have expired - propose the change again."
-        try:
-            result = pending["apply"]()
-        finally:
+        last_error = None
+        for attempt in range(CALENDAR_WRITE_RETRIES + 1):
+            try:
+                result = pending["apply"]()
+            except CalendarError as e:
+                last_error = e
+                if attempt < CALENDAR_WRITE_RETRIES:
+                    time.sleep(_CALENDAR_RETRY_DELAY_SECONDS)
+                continue
             _pending_change = None
-        return result
+            return result
+        # All attempts failed - deliberately do NOT clear _pending_change
+        # here (unlike before). That lets the user just say "confirm"
+        # again later instead of the model re-describing/re-staging it
+        # from scratch, and apply_fn's own duplicate guard (for creates)
+        # makes that safe even if an earlier attempt actually succeeded
+        # on iCloud's side despite the client-side error. The existing
+        # TTL in _peek_pending() still expires it eventually.
+        raise last_error
 
 
 def cancel_pending() -> str:
