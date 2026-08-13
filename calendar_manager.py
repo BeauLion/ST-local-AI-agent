@@ -37,6 +37,8 @@ import icalendar
 from dotenv import load_dotenv
 
 from config import (
+    CALENDAR_BATCH_DEFAULT_DURATION_MINUTES,
+    CALENDAR_BATCH_MAX_EVENTS,
     CALENDAR_DEFAULT_LOOKAHEAD_DAYS,
     CALENDAR_PENDING_CHANGE_TTL_MINUTES,
     CALENDAR_SEARCH_LOOKAHEAD_DAYS,
@@ -340,6 +342,167 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
             f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
             + (f" at {location}" if location else "")
             + f" (in calendar '{cal.name or '(unnamed)'}')")
+    return _stage(desc, apply_fn)
+
+
+def _get_busy_intervals(start_dt: datetime, end_dt: datetime) -> list:
+    """Return (busy_start, busy_end, title) tuples, naive local time
+    (consistent with _parse_datetime elsewhere in this module), for every
+    event across EVERY calendar on the account that overlaps
+    [start_dt, end_dt). Used by stage_create_events_batch to check a
+    proposed schedule against what's already on the calendar, on ANY
+    calendar - a conflicting event elsewhere should still block
+    scheduling here."""
+    busy = []
+    for cal in _get_calendars():
+        label = cal.name or "(unnamed)"
+        try:
+            events = cal.date_search(start_dt, end_dt)
+        except Exception as e:
+            raise CalendarError(f"Could not check '{label}' for conflicts: {e}")
+        for event in events:
+            try:
+                component = event.icalendar_component
+            except Exception:
+                continue
+            if component is None:
+                continue
+            dtstart = component.get("dtstart")
+            if dtstart is None:
+                continue
+            dtend = component.get("dtend")
+            s = dtstart.dt
+            e = dtend.dt if dtend is not None else s
+            # Normalize all-day (date-only) events to a full-day interval
+            # so they still block a proposed slot inside that day.
+            if not isinstance(s, datetime):
+                s = datetime.combine(s, datetime.min.time())
+            if not isinstance(e, datetime):
+                e = datetime.combine(e, datetime.min.time())
+            # Drop any tzinfo iCloud returned so this stays comparable
+            # with the naive local times _parse_datetime produces.
+            busy.append((s.replace(tzinfo=None), e.replace(tzinfo=None),
+                         _ical_field(component, "summary", "(no title)")))
+    return busy
+
+
+def _overlaps(a_start, a_end, b_start, b_end) -> bool:
+    return a_start < b_end and b_start < a_end
+
+
+def _find_matching_event(cal, title: str, start_dt: datetime):
+    """Look for an event with this exact title starting at this exact
+    time on cal, in a narrow window around start_dt. Used by
+    stage_create_events_batch's apply step so re-confirming after a
+    partial failure doesn't double-book events that already succeeded in
+    an earlier attempt."""
+    try:
+        events = cal.date_search(start_dt - timedelta(minutes=1), start_dt + timedelta(minutes=1))
+    except Exception:
+        return None
+    for event in events:
+        try:
+            component = event.icalendar_component
+        except Exception:
+            continue
+        if component is not None and str(component.get("summary", "")) == title:
+            return event
+    return None
+
+
+def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
+    """Like stage_create_event, but for MULTIPLE events staged as one
+    pending change - e.g. a proposed morning schedule. Validates that no
+    two proposed events overlap each other, and that none of them
+    overlap anything already on the calendar, before staging anything.
+    A single calendar_confirm_pending call then creates all of them."""
+    if not isinstance(events, list) or len(events) < 1:
+        raise CalendarError("At least one event is required.")
+    if len(events) > CALENDAR_BATCH_MAX_EVENTS:
+        raise CalendarError(f"A batch may contain at most {CALENDAR_BATCH_MAX_EVENTS} events.")
+
+    cal = _resolve_calendar(calendar_name)  # validated up front, same as stage_create_event
+
+    prepared = []
+    for i, ev in enumerate(events):
+        title = str(ev.get("title") or "").strip()
+        if not title:
+            raise CalendarError(f"Event {i + 1}: a title is required.")
+        start_raw = ev.get("start")
+        if not start_raw:
+            raise CalendarError(f"Event {i + 1} ('{title}'): a start time is required.")
+        start_dt = _parse_datetime(start_raw)
+        end_raw = ev.get("end")
+        end_dt = (
+            _parse_datetime(end_raw) if end_raw
+            else start_dt + timedelta(minutes=CALENDAR_BATCH_DEFAULT_DURATION_MINUTES)
+        )
+        if end_dt <= start_dt:
+            raise CalendarError(f"Event {i + 1} ('{title}'): end time must be after the start time.")
+        prepared.append({
+            "title": title,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "location": str(ev.get("location") or ""),
+            "description": str(ev.get("description") or ""),
+        })
+
+    # No two proposed events may overlap each other.
+    ordered = sorted(prepared, key=lambda p: p["start_dt"])
+    for a, b in zip(ordered, ordered[1:]):
+        if a["end_dt"] > b["start_dt"]:
+            raise CalendarError(
+                f"Proposed events overlap: '{a['title']}' ({a['start_dt'].strftime('%H:%M')}-"
+                f"{a['end_dt'].strftime('%H:%M')}) and '{b['title']}' "
+                f"({b['start_dt'].strftime('%H:%M')}-{b['end_dt'].strftime('%H:%M')}). "
+                f"Adjust the times so no two proposed events overlap, then retry."
+            )
+
+    # None of the proposed events may collide with what's already on the
+    # calendar - checked across every calendar on the account, not just
+    # the target one for this batch.
+    window_start = min(p["start_dt"] for p in prepared)
+    window_end = max(p["end_dt"] for p in prepared)
+    busy_intervals = _get_busy_intervals(window_start, window_end)
+    for p in prepared:
+        for busy_start, busy_end, busy_title in busy_intervals:
+            if _overlaps(p["start_dt"], p["end_dt"], busy_start, busy_end):
+                raise CalendarError(
+                    f"'{p['title']}' ({p['start_dt'].strftime('%a %H:%M')}-{p['end_dt'].strftime('%H:%M')}) "
+                    f"conflicts with an existing event '{busy_title}' ({busy_start.strftime('%H:%M')}-"
+                    f"{busy_end.strftime('%H:%M')}). Adjust the proposed schedule around it, then retry."
+                )
+
+    def apply_fn() -> str:
+        results = []
+        for p in prepared:
+            # Duplicate guard, same idea as the retry-safety note on
+            # stage_create_event - protects a retry-after-failure from
+            # double-booking events that actually succeeded on iCloud's
+            # side in an earlier attempt.
+            if _find_matching_event(cal, p["title"], p["start_dt"]) is not None:
+                results.append(f"'{p['title']}' already exists - skipped (not duplicated).")
+                continue
+            try:
+                cal.add_event(
+                    dtstart=p["start_dt"], dtend=p["end_dt"], summary=p["title"],
+                    location=p["location"] or None, description=p["description"] or None,
+                )
+            except Exception as e:
+                raise CalendarError(
+                    f"Failed to create '{p['title']}': {e}. {len(results)} of {len(prepared)} "
+                    f"event(s) in this batch were created before this failure - confirming "
+                    f"again will safely skip those and only create the rest."
+                )
+            results.append(f"Created '{p['title']}' {p['start_dt'].strftime('%H:%M')}-{p['end_dt'].strftime('%H:%M')}.")
+        return "\n".join(results)
+
+    lines = [
+        f"- {p['title']}: {p['start_dt'].strftime('%a %Y-%m-%d %H:%M')}-{p['end_dt'].strftime('%H:%M')}"
+        + (f" at {p['location']}" if p["location"] else "")
+        for p in ordered
+    ]
+    desc = f"CREATE {len(prepared)} events in calendar '{cal.name or '(unnamed)'}':\n" + "\n".join(lines)
     return _stage(desc, apply_fn)
 
 

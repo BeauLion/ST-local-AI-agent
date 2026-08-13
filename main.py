@@ -95,7 +95,7 @@ _CALENDAR_UID_WRITE_TOOLS = {"calendar_edit_event", "calendar_delete_event"}
 # showed isn't reliably followed. Only matches short, bare confirmations
 # (e.g. "yes", "confirm") - a longer message is treated as a new request,
 # not blocked, in case the user is actually asking to change something.
-_CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_edit_event", "calendar_delete_event"}
+_CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_create_events_batch", "calendar_edit_event", "calendar_delete_event"}
 
 # A stage tool and calendar_confirm_pending in the SAME response batch is
 # unsafe even though this server executes calls sequentially within a
@@ -469,6 +469,15 @@ def calendar_create_event(args: dict) -> str:
         return f"Error: {e}"
 
 
+def calendar_create_events_batch(args: dict) -> str:
+    try:
+        return calendar_manager.stage_create_events_batch(
+            args.get("events", []), args.get("calendar_name")
+        )
+    except CalendarError as e:
+        return f"Error: {e}"
+
+
 def calendar_edit_event(args: dict) -> str:
     try:
         return calendar_manager.stage_edit_event(
@@ -807,6 +816,46 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "calendar_create_events_batch",
+            "description": (
+                "Stage MULTIPLE new calendar events at once as a SINGLE pending change - e.g. "
+                "a proposed schedule of task blocks for the morning. Use this instead of calling "
+                "calendar_create_event repeatedly whenever proposing more than one event together; "
+                "calendar_confirm_pending then creates all of them in one go. Before calling this, "
+                "check what's already on the calendar for the relevant time range "
+                "(calendar_list_events) so the times you propose don't conflict - this tool "
+                "validates that anyway and rejects the whole batch with a clear reason if any "
+                "proposed event overlaps another proposed event or an existing calendar event, so "
+                "you can adjust and retry. After staging, tell the user the full proposed schedule "
+                "and wait for their explicit confirmation in a separate message before calling "
+                "calendar_confirm_pending - never call it in the same response as this tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "events": {
+                        "type": "array", "minItems": 1, "maxItems": 12,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "start": {"type": "string", "description": "'YYYY-MM-DD HH:MM'."},
+                                "end": {"type": "string", "description": "'YYYY-MM-DD HH:MM'. Optional - defaults to a 30-minute block."},
+                                "location": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["title", "start"],
+                        },
+                    },
+                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit to use the default calendar."},
+                },
+                "required": ["events"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calendar_edit_event",
             "description": "Propose editing an existing iCloud calendar event by its UID (get this from calendar_list_events or calendar_search_events first - never guess a UID). This does NOT apply the edit yet - it only stages the change and returns a description of exactly what would change. Relay that to the user and get explicit confirmation before calling calendar_confirm_pending.",
             "parameters": {
@@ -976,6 +1025,7 @@ TOOL_FUNCTIONS = {
     "calendar_list_events": calendar_list_events,
     "calendar_search_events": calendar_search_events,
     "calendar_create_event": calendar_create_event,
+    "calendar_create_events_batch": calendar_create_events_batch,
     "calendar_edit_event": calendar_edit_event,
     "calendar_delete_event": calendar_delete_event,
     "calendar_confirm_pending": calendar_confirm_pending,

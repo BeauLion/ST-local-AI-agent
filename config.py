@@ -177,6 +177,14 @@ CALENDAR_PENDING_CHANGE_TTL_MINUTES = 10
 CALENDAR_UID_LOOKUP_LOOKBACK_DAYS = 365
 CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS = 365
 
+# calendar_create_events_batch: stages MULTIPLE events (e.g. a proposed
+# morning schedule from project tasks) as one pending change. Safety
+# ceiling on batch size, and the default block length used when an event
+# in the batch doesn't specify an explicit end time (shorter than the
+# single-event default of 1 hour, since this is aimed at task blocks).
+CALENDAR_BATCH_MAX_EVENTS = 12
+CALENDAR_BATCH_DEFAULT_DURATION_MINUTES = 30
+
 
 # ─────────────────────────────────────────────────────────────
 # run_python tool (Docker sandbox)
