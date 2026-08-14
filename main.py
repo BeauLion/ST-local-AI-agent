@@ -519,6 +519,28 @@ def calendar_cancel_pending(args: dict) -> str:
     return calendar_manager.cancel_pending()
 
 
+def calendar_check_availability(args: dict) -> str:
+    try:
+        result = calendar_manager.check_availability(
+            args.get("start"), args.get("end"), args.get("when")
+        )
+    except CalendarError as e:
+        return f"Error: {e}"
+
+    cache_note = (
+        " (answered from the cached calendar - may be a few minutes out "
+        "of date for very recent changes)"
+        if result["source"] == "cache" else ""
+    )
+    if result["free"]:
+        return f"Free - no conflicts found.{cache_note}"
+
+    lines = [f"NOT free - conflicts found{cache_note}:"]
+    for c in result["conflicts"]:
+        lines.append(f"- {c['title']}: {c['start']} - {c['end']}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Project manager tools (formerly the SillyTavern extension's client-side
 # tools - see project_manager.py for the actual data model/logic). Each
@@ -920,6 +942,22 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "calendar_check_availability",
+            "description": "Read-only: check whether a time range is free or conflicts with something on any of the user's calendars. Never stages or changes anything. Ranges in roughly the next two weeks typically answer from a background cache that refreshes every few minutes, so the answer may be a little stale for very recent changes; ranges further out do a live calendar lookup instead. Give either a 'when' phrase (e.g. 'tomorrow', 'next Friday') or explicit start/end - not both.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "Start of the range to check, e.g. '2026-08-20 14:00'. Omit if using 'when'."},
+                    "end": {"type": "string", "description": "End of the range to check. Omit to default to 1 hour after start."},
+                    "when": {"type": "string", "description": "Natural date phrase like 'tomorrow' or 'next Friday', checked as a full day. Mutually exclusive with start/end."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "project_manager_get_overview",
             "description": "Read the authoritative persistent project/task overview. Call this before proposing project or task changes whenever the relevant project or task is uncertain.",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -1043,6 +1081,7 @@ TOOL_FUNCTIONS = {
     "calendar_delete_event": calendar_delete_event,
     "calendar_confirm_pending": calendar_confirm_pending,
     "calendar_cancel_pending": calendar_cancel_pending,
+    "calendar_check_availability": calendar_check_availability,
     "project_manager_get_overview": project_manager_get_overview,
     "project_manager_create_task": project_manager_create_task,
     "project_manager_update_task_status": project_manager_update_task_status,

@@ -290,6 +290,35 @@ def _event_to_dict(event, calendar_label: str = "") -> dict:
     }
 
 
+def _component_start_end(component):
+    """Return a tz-aware (start, end) tuple for an icalendar component's
+    dtstart/dtend, normalizing all-day (date-only) events to a full-day
+    interval in CALENDAR_TIMEZONE (_LOCAL_TZ). Returns (None, None) if the
+    component has no dtstart.
+
+    Deliberately a standalone duplicate of the equivalent inline logic in
+    _get_busy_intervals rather than a shared refactor of it - that
+    function is on the stabilized create-batch conflict-check path and
+    isn't touched here."""
+    if component is None:
+        return None, None
+    dtstart = component.get("dtstart")
+    if dtstart is None:
+        return None, None
+    dtend = component.get("dtend")
+    s = dtstart.dt
+    e = dtend.dt if dtend is not None else s
+    if not isinstance(s, datetime):
+        s = datetime.combine(s, datetime.min.time(), tzinfo=_LOCAL_TZ)
+    elif s.tzinfo is None:
+        s = s.replace(tzinfo=_LOCAL_TZ)
+    if not isinstance(e, datetime):
+        e = datetime.combine(e, datetime.min.time(), tzinfo=_LOCAL_TZ)
+    elif e.tzinfo is None:
+        e = e.replace(tzinfo=_LOCAL_TZ)
+    return s, e
+
+
 def list_calendar_names() -> list[str]:
     """Every calendar name on the account - lets the user/model see what's
     available, e.g. to troubleshoot events not showing up or to target a
@@ -435,6 +464,78 @@ def search_events(query: str, start: str = None, end: str = None, calendar_name:
     return matches
 
 
+def check_availability(start: str = None, end: str = None, when: str = None) -> dict:
+    """Read-only: is [start, end) free across every calendar on the
+    account, or does it conflict with something? Never stages or writes
+    anything - no involvement with _pending_change/_stage() at all.
+
+    Answers from the background cache (CALENDAR_CACHE_FILE, kept fresh by
+    refresh_cache()) when the requested range falls inside the cache's own
+    lookahead window, since that's a fast local file read with no CalDAV
+    round-trip. Otherwise falls back to a live _get_busy_intervals() call -
+    the same mechanism stage_create_events_batch already uses to
+    conflict-check a proposed schedule - left untouched here."""
+    if when and not (start or end):
+        start_dt, end_dt = resolve_when(when)
+    elif start:
+        start_dt = _parse_datetime(start)
+        end_dt = _parse_datetime(end) if end else start_dt + timedelta(hours=1)
+    else:
+        raise CalendarError("Provide either a 'when' phrase or a start time to check availability for.")
+
+    if end_dt <= start_dt:
+        raise CalendarError("End time must be after the start time.")
+
+    start_dt = _localize(start_dt)
+    end_dt = _localize(end_dt)
+
+    # "Inside the cache window" = roughly now (minus a small grace period,
+    # so a range starting moments ago isn't kicked to the live path) up to
+    # how far ahead refresh_cache() actually looks.
+    now = datetime.now(_LOCAL_TZ)
+    cache_window_start = now - timedelta(minutes=CALENDAR_CACHE_REFRESH_MINUTES)
+    cache_window_end = now + timedelta(days=CALENDAR_CACHE_LOOKAHEAD_DAYS)
+    within_cache_window = start_dt >= cache_window_start and end_dt <= cache_window_end
+
+    if within_cache_window and _CACHE_FILE.exists():
+        try:
+            payload = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        if payload is not None:
+            conflicts = []
+            for ev in payload.get("events", []):
+                start_iso = ev.get("start_iso")
+                end_iso = ev.get("end_iso")
+                if not start_iso or not end_iso:
+                    continue
+                try:
+                    ev_start = datetime.fromisoformat(start_iso)
+                    ev_end = datetime.fromisoformat(end_iso)
+                except ValueError:
+                    continue
+                if _overlaps(start_dt, end_dt, ev_start, ev_end):
+                    conflicts.append({
+                        "title": ev.get("title", "(no title)"),
+                        "start": ev.get("start", ""),
+                        "end": ev.get("end", ""),
+                    })
+            return {"free": not conflicts, "source": "cache", "conflicts": conflicts}
+
+    # Live fallback - range outside the cache window, or the cache isn't
+    # ready/readable yet. Don't answer "free" from a missing/corrupt cache.
+    try:
+        busy = _get_busy_intervals(start_dt.replace(tzinfo=None), end_dt.replace(tzinfo=None))
+    except CalendarError:
+        raise
+    except Exception as e:
+        raise CalendarError(f"Could not check calendar availability: {e}")
+
+    conflicts = [{"title": title, "start": str(busy_start), "end": str(busy_end)}
+                 for busy_start, busy_end, title in busy]
+    return {"free": not conflicts, "source": "live", "conflicts": conflicts}
+
+
 # ---------------------------------------------------------------------------
 # Background cache - context injection only, never a data source for reads
 # or writes. See handover-17 for the full rationale: a caching bug here can
@@ -466,7 +567,19 @@ def refresh_cache():
         for cal in _get_calendars():
             label = cal.name or "(unnamed)"
             found = _date_search_with_retry(cal, start_dt, end_dt, f"cache refresh: '{label}'")
-            events.extend(_event_to_dict(e, label) for e in found)
+            for e in found:
+                ev = _event_to_dict(e, label)
+                # Extra machine-readable fields for check_availability's
+                # cache path, on top of the existing display fields above
+                # (which get_cached_context() formats as-is, unchanged).
+                try:
+                    comp_start, comp_end = _component_start_end(e.icalendar_component)
+                except Exception:
+                    comp_start, comp_end = None, None
+                if comp_start is not None and comp_end is not None:
+                    ev["start_iso"] = comp_start.isoformat()
+                    ev["end_iso"] = comp_end.isoformat()
+                events.append(ev)
     except CalendarError as e:
         # Leave whatever cache already exists in place - a failed refresh
         # should degrade to "slightly stale", not "no context at all".
