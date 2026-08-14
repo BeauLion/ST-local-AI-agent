@@ -51,7 +51,19 @@ from config import (
     WRITE_FILE_MAX_CHARS,
 )
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Starts the calendar cache's background refresh thread once, when the
+    # server actually comes up (not on every reload-triggered reimport -
+    # see calendar_manager.start_background_refresh()'s own guard too).
+    calendar_manager.start_background_refresh()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class LlamaServerError(Exception):
@@ -96,7 +108,7 @@ _CALENDAR_UID_WRITE_TOOLS = {"calendar_edit_event", "calendar_delete_event"}
 # showed isn't reliably followed. Only matches short, bare confirmations
 # (e.g. "yes", "confirm") - a longer message is treated as a new request,
 # not blocked, in case the user is actually asking to change something.
-_CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_edit_event", "calendar_delete_event"}
+_CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_create_events_batch", "calendar_edit_event", "calendar_delete_event"}
 
 # A stage tool and calendar_confirm_pending in the SAME response batch is
 # unsafe even though this server executes calls sequentially within a
@@ -537,6 +549,15 @@ def calendar_create_event(args: dict) -> str:
         return f"Error: {e}"
 
 
+def calendar_create_events_batch(args: dict) -> str:
+    try:
+        return calendar_manager.stage_create_events_batch(
+            args.get("events", []), args.get("calendar_name")
+        )
+    except CalendarError as e:
+        return f"Error: {e}"
+
+
 def calendar_edit_event(args: dict) -> str:
     try:
         return calendar_manager.stage_edit_event(
@@ -563,6 +584,28 @@ def calendar_confirm_pending(args: dict) -> str:
 
 def calendar_cancel_pending(args: dict) -> str:
     return calendar_manager.cancel_pending()
+
+
+def calendar_check_availability(args: dict) -> str:
+    try:
+        result = calendar_manager.check_availability(
+            args.get("start"), args.get("end"), args.get("when")
+        )
+    except CalendarError as e:
+        return f"Error: {e}"
+
+    cache_note = (
+        " (answered from the cached calendar - may be a few minutes out "
+        "of date for very recent changes)"
+        if result["source"] == "cache" else ""
+    )
+    if result["free"]:
+        return f"Free - no conflicts found.{cache_note}"
+
+    lines = [f"NOT free - conflicts found{cache_note}:"]
+    for c in result["conflicts"]:
+        lines.append(f"- {c['title']}: {c['start']} - {c['end']}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +920,46 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "calendar_create_events_batch",
+            "description": (
+                "Stage MULTIPLE new calendar events at once as a SINGLE pending change - e.g. "
+                "a proposed schedule of task blocks for the morning. Use this instead of calling "
+                "calendar_create_event repeatedly whenever proposing more than one event together; "
+                "calendar_confirm_pending then creates all of them in one go. Before calling this, "
+                "check what's already on the calendar for the relevant time range "
+                "(calendar_list_events) so the times you propose don't conflict - this tool "
+                "validates that anyway and rejects the whole batch with a clear reason if any "
+                "proposed event overlaps another proposed event or an existing calendar event, so "
+                "you can adjust and retry. After staging, tell the user the full proposed schedule "
+                "and wait for their explicit confirmation in a separate message before calling "
+                "calendar_confirm_pending - never call it in the same response as this tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "events": {
+                        "type": "array", "minItems": 1, "maxItems": 12,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "start": {"type": "string", "description": "'YYYY-MM-DD HH:MM'."},
+                                "end": {"type": "string", "description": "'YYYY-MM-DD HH:MM'. Optional - defaults to a 30-minute block."},
+                                "location": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["title", "start"],
+                        },
+                    },
+                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit to use the default calendar."},
+                },
+                "required": ["events"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calendar_edit_event",
             "description": "Propose editing an existing iCloud calendar event by its UID (get this from calendar_list_events or calendar_search_events first - never guess a UID). This does NOT apply the edit yet - it only stages the change and returns a description of exactly what would change. Relay that to the user and get explicit confirmation before calling calendar_confirm_pending.",
             "parameters": {
@@ -923,6 +1006,22 @@ TOOLS = [
             "name": "calendar_cancel_pending",
             "description": "Discard the currently staged calendar change without applying it. Call this if the user declines, says no, or asks for something different instead of confirming.",
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_check_availability",
+            "description": "Read-only: check whether a time range is free or conflicts with something on any of the user's calendars. Never stages or changes anything. Ranges in roughly the next two weeks typically answer from a background cache that refreshes every few minutes, so the answer may be a little stale for very recent changes; ranges further out do a live calendar lookup instead. Give either a 'when' phrase (e.g. 'tomorrow', 'next Friday') or explicit start/end - not both.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "Start of the range to check, e.g. '2026-08-20 14:00'. Omit if using 'when'."},
+                    "end": {"type": "string", "description": "End of the range to check. Omit to default to 1 hour after start."},
+                    "when": {"type": "string", "description": "Natural date phrase like 'tomorrow' or 'next Friday', checked as a full day. Mutually exclusive with start/end."},
+                },
+                "required": [],
+            },
         },
     },
     {
@@ -1046,10 +1145,12 @@ TOOL_FUNCTIONS = {
     "calendar_list_events": calendar_list_events,
     "calendar_search_events": calendar_search_events,
     "calendar_create_event": calendar_create_event,
+    "calendar_create_events_batch": calendar_create_events_batch,
     "calendar_edit_event": calendar_edit_event,
     "calendar_delete_event": calendar_delete_event,
     "calendar_confirm_pending": calendar_confirm_pending,
     "calendar_cancel_pending": calendar_cancel_pending,
+    "calendar_check_availability": calendar_check_availability,
     "project_manager_get_overview": project_manager_get_overview,
     "project_manager_create_task": project_manager_create_task,
     "project_manager_update_task_status": project_manager_update_task_status,
@@ -1268,7 +1369,7 @@ async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
         return None
 
 
-async def agent_loop(upstream_body: dict, usage_totals: dict):
+async def agent_loop(upstream_body: dict):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
     way. usage_totals is mutated in place with cumulative token counts
@@ -1742,6 +1843,14 @@ async def chat_completions(request: Request):
         messages_to_prepend.append({"role": "system", "content": project_state_text})
         prepend_sections.append(("project_state", project_state_text))
     print(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
+
+    # Read-only, local-file-only - see calendar_manager.get_cached_context()
+    # docstring for why this never triggers a live CalDAV call.
+    calendar_context_text = await asyncio.to_thread(calendar_manager.get_cached_context)
+    if calendar_context_text:
+        messages_to_prepend.append({"role": "system", "content": calendar_context_text})
+        prepend_sections.append(("calendar_cache", calendar_context_text))
+    print(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
 
     # Auto-recall: silently check if any saved memories are relevant to what
     # the user just said, and inject them - no tool call needed for this part.

@@ -26,7 +26,9 @@ Only one change can be staged at a time (single-user, single-session use
 case) - staging a new one silently replaces whatever was staged before.
 """
 
+import json
 import os
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -282,6 +284,35 @@ def _event_to_dict(event, calendar_label: str = "") -> dict:
     }
 
 
+def _component_start_end(component):
+    """Return a tz-aware (start, end) tuple for an icalendar component's
+    dtstart/dtend, normalizing all-day (date-only) events to a full-day
+    interval in CALENDAR_TIMEZONE (_LOCAL_TZ). Returns (None, None) if the
+    component has no dtstart.
+
+    Deliberately a standalone duplicate of the equivalent inline logic in
+    _get_busy_intervals rather than a shared refactor of it - that
+    function is on the stabilized create-batch conflict-check path and
+    isn't touched here."""
+    if component is None:
+        return None, None
+    dtstart = component.get("dtstart")
+    if dtstart is None:
+        return None, None
+    dtend = component.get("dtend")
+    s = dtstart.dt
+    e = dtend.dt if dtend is not None else s
+    if not isinstance(s, datetime):
+        s = datetime.combine(s, datetime.min.time(), tzinfo=_LOCAL_TZ)
+    elif s.tzinfo is None:
+        s = s.replace(tzinfo=_LOCAL_TZ)
+    if not isinstance(e, datetime):
+        e = datetime.combine(e, datetime.min.time(), tzinfo=_LOCAL_TZ)
+    elif e.tzinfo is None:
+        e = e.replace(tzinfo=_LOCAL_TZ)
+    return s, e
+
+
 def list_calendar_names() -> list[str]:
     """Every calendar name on the account - lets the user/model see what's
     available, e.g. to troubleshoot events not showing up or to target a
@@ -427,6 +458,201 @@ def search_events(query: str, start: str = None, end: str = None, calendar_name:
     return matches
 
 
+def check_availability(start: str = None, end: str = None, when: str = None) -> dict:
+    """Read-only: is [start, end) free across every calendar on the
+    account, or does it conflict with something? Never stages or writes
+    anything - no involvement with _pending_change/_stage() at all.
+
+    Answers from the background cache (CALENDAR_CACHE_FILE, kept fresh by
+    refresh_cache()) when the requested range falls inside the cache's own
+    lookahead window, since that's a fast local file read with no CalDAV
+    round-trip. Otherwise falls back to a live _get_busy_intervals() call -
+    the same mechanism stage_create_events_batch already uses to
+    conflict-check a proposed schedule - left untouched here."""
+    if when and not (start or end):
+        start_dt, end_dt = resolve_when(when)
+    elif start:
+        start_dt = _parse_datetime(start)
+        end_dt = _parse_datetime(end) if end else start_dt + timedelta(hours=1)
+    else:
+        raise CalendarError("Provide either a 'when' phrase or a start time to check availability for.")
+
+    if end_dt <= start_dt:
+        raise CalendarError("End time must be after the start time.")
+
+    start_dt = _localize(start_dt)
+    end_dt = _localize(end_dt)
+
+    # "Inside the cache window" = roughly now (minus a small grace period,
+    # so a range starting moments ago isn't kicked to the live path) up to
+    # how far ahead refresh_cache() actually looks.
+    now = datetime.now(_LOCAL_TZ)
+    cache_window_start = now - timedelta(minutes=CALENDAR_CACHE_REFRESH_MINUTES)
+    cache_window_end = now + timedelta(days=CALENDAR_CACHE_LOOKAHEAD_DAYS)
+    within_cache_window = start_dt >= cache_window_start and end_dt <= cache_window_end
+
+    if within_cache_window and _CACHE_FILE.exists():
+        try:
+            payload = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        if payload is not None:
+            conflicts = []
+            for ev in payload.get("events", []):
+                start_iso = ev.get("start_iso")
+                end_iso = ev.get("end_iso")
+                if not start_iso or not end_iso:
+                    continue
+                try:
+                    ev_start = datetime.fromisoformat(start_iso)
+                    ev_end = datetime.fromisoformat(end_iso)
+                except ValueError:
+                    continue
+                if _overlaps(start_dt, end_dt, ev_start, ev_end):
+                    conflicts.append({
+                        "title": ev.get("title", "(no title)"),
+                        "start": ev.get("start", ""),
+                        "end": ev.get("end", ""),
+                    })
+            return {"free": not conflicts, "source": "cache", "conflicts": conflicts}
+
+    # Live fallback - range outside the cache window, or the cache isn't
+    # ready/readable yet. Don't answer "free" from a missing/corrupt cache.
+    try:
+        busy = _get_busy_intervals(start_dt.replace(tzinfo=None), end_dt.replace(tzinfo=None))
+    except CalendarError:
+        raise
+    except Exception as e:
+        raise CalendarError(f"Could not check calendar availability: {e}")
+
+    conflicts = [{"title": title, "start": str(busy_start), "end": str(busy_end)}
+                 for busy_start, busy_end, title in busy]
+    return {"free": not conflicts, "source": "live", "conflicts": conflicts}
+
+
+# ---------------------------------------------------------------------------
+# Background cache - context injection only, never a data source for reads
+# or writes. See handover-17 for the full rationale: a caching bug here can
+# only make the ambient "here's what's coming up" text stale, never cause a
+# wrong tool result or a bad write.
+# ---------------------------------------------------------------------------
+
+_CACHE_FILE = Path(CALENDAR_CACHE_FILE)
+
+
+def refresh_cache():
+    """Fetch upcoming events across every calendar (within
+    CALENDAR_CACHE_LOOKAHEAD_DAYS) and atomically write them to the local
+    cache file. Called on a background timer (start_background_refresh)
+    and once more right after confirm_pending() succeeds - never from
+    inside a chat request, so a slow iCloud round-trip here never adds
+    latency to a turn.
+
+    Deliberately does NOT touch _last_results - that cache exists only to
+    let stage_edit_event/stage_delete_event recover a fabricated UID right
+    after a model-initiated list/search call. Mixing in background-poll
+    results would let an automatic refresh silently override what the
+    model was just shown.
+    """
+    start_dt = datetime.now()
+    end_dt = start_dt + timedelta(days=CALENDAR_CACHE_LOOKAHEAD_DAYS)
+    events = []
+    try:
+        for cal in _get_calendars():
+            label = cal.name or "(unnamed)"
+            found = _date_search_with_retry(cal, start_dt, end_dt, f"cache refresh: '{label}'")
+            for e in found:
+                ev = _event_to_dict(e, label)
+                # Extra machine-readable fields for check_availability's
+                # cache path, on top of the existing display fields above
+                # (which get_cached_context() formats as-is, unchanged).
+                try:
+                    comp_start, comp_end = _component_start_end(e.icalendar_component)
+                except Exception:
+                    comp_start, comp_end = None, None
+                if comp_start is not None and comp_end is not None:
+                    ev["start_iso"] = comp_start.isoformat()
+                    ev["end_iso"] = comp_end.isoformat()
+                events.append(ev)
+    except CalendarError as e:
+        # Leave whatever cache already exists in place - a failed refresh
+        # should degrade to "slightly stale", not "no context at all".
+        print(f"[calendar_manager] cache refresh failed, keeping previous cache: {e}")
+        return
+
+    events.sort(key=lambda ev: ev["start"])
+    payload = {"refreshed_at": datetime.now().isoformat(), "events": events}
+
+    _CACHE_FILE.parent.mkdir(exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=_CACHE_FILE.parent, prefix=".cache_tmp_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, _CACHE_FILE)  # atomic rename on both Windows and POSIX -
+                                            # a crash mid-write can't leave a half-written file
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def get_cached_context() -> str:
+    """Read-only, single fast local file read - no CalDAV call. Returns ''
+    if no cache exists yet (e.g. right after a fresh install, before the
+    first background refresh completes), so main.py's system-prompt
+    injection can treat this exactly like project_manager's
+    build_context_text() returning ''."""
+    if not _CACHE_FILE.exists():
+        return ""
+    try:
+        payload = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+
+    events = payload.get("events", [])
+    if not events:
+        return (f"[UPCOMING CALENDAR EVENTS]\nNone in the next "
+                 f"{CALENDAR_CACHE_LOOKAHEAD_DAYS} days.")
+
+    lines = [
+        f"[UPCOMING CALENDAR EVENTS] (cached, refreshes every "
+        f"{CALENDAR_CACHE_REFRESH_MINUTES} min - may be a few minutes out of "
+        f"date for very recent changes)"
+    ]
+    for ev in events[:CALENDAR_CACHE_MAX_EVENTS_IN_CONTEXT]:
+        loc = f" @ {ev['location']}" if ev.get("location") else ""
+        lines.append(f"- {ev['start']} to {ev['end']}: {ev['title']}{loc}")
+    return "\n".join(lines)
+
+
+_background_thread_lock = threading.Lock()
+_background_thread_started = False
+
+
+def start_background_refresh():
+    """Starts the timer-driven cache refresh loop, once per process. Safe
+    to call more than once - only the first call actually starts a
+    thread. Call this once at app startup (main.py)."""
+    global _background_thread_started
+    with _background_thread_lock:
+        if _background_thread_started:
+            return
+        _background_thread_started = True
+
+    def _loop():
+        while True:
+            try:
+                refresh_cache()
+            except Exception as e:
+                print(f"[calendar_manager] background cache refresh crashed: {e}")
+            time.sleep(CALENDAR_CACHE_REFRESH_MINUTES * 60)
+
+    threading.Thread(target=_loop, daemon=True, name="calendar-cache-refresh").start()
+    print(f"[calendar_manager] background cache refresh started (every {CALENDAR_CACHE_REFRESH_MINUTES} min)")
+
+
 # ---------------------------------------------------------------------------
 # Staged writes - validate + describe now, apply only on confirm
 # ---------------------------------------------------------------------------
@@ -495,6 +721,151 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
             f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
             + (f" at {location}" if location else "")
             + f" (in calendar '{cal.name or '(unnamed)'}')")
+    return _stage(desc, apply_fn)
+
+
+def _get_busy_intervals(start_dt: datetime, end_dt: datetime) -> list:
+    """Return (busy_start, busy_end, title) tuples, tz-aware, for every
+    event across EVERY calendar on the account that overlaps
+    [start_dt, end_dt). start_dt/end_dt are naive here, consistent with
+    the other read paths in this module (list_events/search_events) -
+    iCloud's date_search accepts naive datetimes fine, same as those.
+    Used by stage_create_events_batch to check a proposed schedule
+    against what's already on the calendar, on ANY calendar - a
+    conflicting event elsewhere should still block scheduling here."""
+    busy = []
+    for cal in _get_calendars():
+        events = _date_search_with_retry(
+            cal, start_dt, end_dt, f"Could not check '{cal.name or '(unnamed)'}' for conflicts"
+        )
+        for event in events:
+            try:
+                component = event.icalendar_component
+            except Exception:
+                continue
+            if component is None:
+                continue
+            dtstart = component.get("dtstart")
+            if dtstart is None:
+                continue
+            dtend = component.get("dtend")
+            s = dtstart.dt
+            e = dtend.dt if dtend is not None else s
+            # Normalize all-day (date-only) events to a full-day interval
+            # in the configured local timezone so they still block a
+            # proposed slot inside that day.
+            if not isinstance(s, datetime):
+                s = datetime.combine(s, datetime.min.time(), tzinfo=_LOCAL_TZ)
+            elif s.tzinfo is None:
+                s = s.replace(tzinfo=_LOCAL_TZ)
+            if not isinstance(e, datetime):
+                e = datetime.combine(e, datetime.min.time(), tzinfo=_LOCAL_TZ)
+            elif e.tzinfo is None:
+                e = e.replace(tzinfo=_LOCAL_TZ)
+            busy.append((s, e, _ical_field(component, "summary", "(no title)")))
+    return busy
+
+
+def _overlaps(a_start, a_end, b_start, b_end) -> bool:
+    return a_start < b_end and b_start < a_end
+
+
+def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
+    """Like stage_create_event, but for MULTIPLE events staged as one
+    pending change - e.g. a proposed morning schedule. Validates that no
+    two proposed events overlap each other, and that none of them
+    overlap anything already on the calendar, before staging anything.
+    A single calendar_confirm_pending call then creates all of them."""
+    if not isinstance(events, list) or len(events) < 1:
+        raise CalendarError("At least one event is required.")
+    if len(events) > CALENDAR_BATCH_MAX_EVENTS:
+        raise CalendarError(f"A batch may contain at most {CALENDAR_BATCH_MAX_EVENTS} events.")
+
+    cal = _resolve_calendar(calendar_name)  # validated up front, same as stage_create_event
+
+    prepared = []
+    for i, ev in enumerate(events):
+        title = str(ev.get("title") or "").strip()
+        if not title:
+            raise CalendarError(f"Event {i + 1}: a title is required.")
+        start_raw = ev.get("start")
+        if not start_raw:
+            raise CalendarError(f"Event {i + 1} ('{title}'): a start time is required.")
+        start_dt = _parse_datetime(start_raw)
+        end_raw = ev.get("end")
+        end_dt = (
+            _parse_datetime(end_raw) if end_raw
+            else start_dt + timedelta(minutes=CALENDAR_BATCH_DEFAULT_DURATION_MINUTES)
+        )
+        if end_dt <= start_dt:
+            raise CalendarError(f"Event {i + 1} ('{title}'): end time must be after the start time.")
+        prepared.append({
+            "title": title,
+            "start_dt": _localize(start_dt),
+            "end_dt": _localize(end_dt),
+            "location": str(ev.get("location") or ""),
+            "description": str(ev.get("description") or ""),
+        })
+
+    # No two proposed events may overlap each other.
+    ordered = sorted(prepared, key=lambda p: p["start_dt"])
+    for a, b in zip(ordered, ordered[1:]):
+        if a["end_dt"] > b["start_dt"]:
+            raise CalendarError(
+                f"Proposed events overlap: '{a['title']}' ({a['start_dt'].strftime('%H:%M')}-"
+                f"{a['end_dt'].strftime('%H:%M')}) and '{b['title']}' "
+                f"({b['start_dt'].strftime('%H:%M')}-{b['end_dt'].strftime('%H:%M')}). "
+                f"Adjust the times so no two proposed events overlap, then retry."
+            )
+
+    # None of the proposed events may collide with what's already on the
+    # calendar - checked across every calendar on the account, not just
+    # the target one for this batch.
+    window_start = min(p["start_dt"] for p in prepared).replace(tzinfo=None)
+    window_end = max(p["end_dt"] for p in prepared).replace(tzinfo=None)
+    busy = _get_busy_intervals(window_start, window_end)  # fetched ONCE for the whole
+                                                            # batch, not once per event -
+                                                            # the earlier per-event fetch
+                                                            # multiplied CalDAV round-trips
+                                                            # (and timeout risk) by batch size
+    for p in prepared:
+        for busy_start, busy_end, busy_title in busy:
+            if _overlaps(p["start_dt"], p["end_dt"], busy_start, busy_end):
+                raise CalendarError(
+                    f"'{p['title']}' ({p['start_dt'].strftime('%a %H:%M')}-{p['end_dt'].strftime('%H:%M')}) "
+                    f"conflicts with an existing event '{busy_title}' ({busy_start.strftime('%H:%M')}-"
+                    f"{busy_end.strftime('%H:%M')}). Adjust the proposed schedule around it, then retry."
+                )
+
+    def apply_fn() -> str:
+        results = []
+        for p in prepared:
+            # Duplicate guard, same as stage_create_event - protects a
+            # retry-after-failure from double-booking events that
+            # actually succeeded on iCloud's side in an earlier attempt.
+            if _find_matching_event(cal, p["title"], p["start_dt"]) is not None:
+                results.append(f"'{p['title']}' already exists - skipped (not duplicated).")
+                continue
+            try:
+                cal.add_event(
+                    dtstart=p["start_dt"], dtend=p["end_dt"], summary=p["title"],
+                    location=p["location"] or None, description=p["description"] or None,
+                )
+            except Exception as e:
+                raise CalendarError(
+                    f"Failed to create '{p['title']}': {e}. {len(results)} of {len(prepared)} "
+                    f"event(s) in this batch were created before this failure - confirming "
+                    f"again will safely skip those and only create the rest."
+                )
+            results.append(f"Created '{p['title']}' {p['start_dt'].strftime('%H:%M')}-{p['end_dt'].strftime('%H:%M')}.")
+        return "\n".join(results)
+
+    lines = [
+        f"- {p['title']}: {p['start_dt'].strftime('%a %Y-%m-%d %H:%M')}-{p['end_dt'].strftime('%H:%M')}"
+        + (f" at {p['location']}" if p["location"] else "")
+        for p in ordered
+    ]
+    desc = f"CREATE {len(prepared)} events in calendar '{cal.name or '(unnamed)'}':\n" + "\n".join(lines)
     return _stage(desc, apply_fn)
 
 
@@ -680,6 +1051,10 @@ def confirm_pending() -> str:
                     time.sleep(_CALENDAR_RETRY_DELAY_SECONDS)
                 continue
             _pending_change = None
+            # One-off refresh so this change shows up in the ambient
+            # context immediately, not after the next timer tick. Runs in
+            # its own thread so confirm_pending() doesn't wait on it.
+            threading.Thread(target=refresh_cache, daemon=True, name="calendar-cache-refresh-oneoff").start()
             return result
         # All attempts failed - deliberately do NOT clear _pending_change
         # here (unlike before). That lets the user just say "confirm"

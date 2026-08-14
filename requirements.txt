@@ -8,5 +8,4 @@ docker
 pypdf
 caldav
 python-dotenv
-dateparser
 tzdata

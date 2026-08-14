@@ -41,35 +41,21 @@ LLAMA_SERVER_URL = f"http://localhost:{LLAMA_SERVER_PORT}"
 
 # The exact model to pull/run via llama.cpp's -hf shorthand.
 #LLAMA_MODEL_REPO = "Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
-#LLAMA_MODEL_REPO = "ggml-org/gpt-oss-20b-GGUF"
-LLAMA_MODEL_REPO = "Qwen/Qwen3-14B-GGUF:Q4_K_M"
+#LLAMA_MODEL_REPO = "Qwen/Qwen3-14B-GGUF:Q4_K_M"
+LLAMA_MODEL_REPO = "HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced"
 
 LLAMA_NGL = 99          # -ngl: layers offloaded to GPU (99 = full offload)
 LLAMA_CONTEXT = 32768    # -c: context window size
-LLAMA_TEMP = 0.6        # 
-LLAMA_FLASH_ATTENTION = 'on'   # -fa: flash attention, speed optimization [on|off|auto]
-LLAMA_USE_JINJA = True         # --jinja: required for structured tool-call output
+LLAMA_TEMP = 0.6
 LLAMA_TOP_P = 0.95
 LLAMA_TOP_K = 20
 LLAMA_MIN_P = 0.0   # new constant - see command builder change below
+LLAMA_FLASH_ATTENTION = 'on'   # -fa: flash attention, speed optimization [on|off|auto]
+LLAMA_USE_JINJA = True         # --jinja: required for structured tool-call output
+LLAMA_REASONING_FORMAT = "deepseek"
+LLAMA_MD = "./llama.cpp/mtp-gemma-4-12B-it.gguf"
+LLAMA_SPEC_TYPE = "draft-mtp"
 
-
-# Controls how llama-server splits the model's reasoning ("analysis
-# channel") from its final answer. "auto" gives you a separate
-# reasoning_content field in the streamed delta, distinct from content -
-# main.py currently only reads delta["content"], so reasoning tokens are
-# silently dropped rather than leaking into the chat. "none" would dump
-# raw <|channel|>analysis<|message|>... markup into content instead, which
-# would look broken in SillyTavern and could confuse the regex-based
-# safety guards in main.py.
-#LLAMA_REASONING_FORMAT = "auto"
-LLAMA_REASONING_FORMAT = "deepseek"   # Qwen3's <think>...</think> block uses
-                                       #   the same parsing convention DeepSeek-R1
-                                       #   established; "auto" isn't reliable for
-                                       #   it across llama.cpp versions, "none"
-                                       #   would leave literal <think> tags in
-                                       #   content instead of a separate
-                                       #   reasoning_content field.
 
 def build_llama_server_command() -> list[str]:
     """
@@ -80,6 +66,8 @@ def build_llama_server_command() -> list[str]:
     cmd = [
         LLAMA_SERVER_EXE,
         "-hf", LLAMA_MODEL_REPO,
+        "-md", LLAMA_MD,
+        "--spec-type", LLAMA_SPEC_TYPE,
         "-ngl", str(LLAMA_NGL),
         "-c", str(LLAMA_CONTEXT),
         "--temp", str(LLAMA_TEMP),
@@ -90,6 +78,10 @@ def build_llama_server_command() -> list[str]:
         "--host", LLAMA_SERVER_HOST,
         "--port", str(LLAMA_SERVER_PORT),
         "-fa", str(LLAMA_FLASH_ATTENTION),
+        "--top-p", str(LLAMA_TOP_P),
+        "--top-k", str(LLAMA_TOP_K),
+        "--min-p", str(LLAMA_MIN_P),
+        #"--reasoning-format", LLAMA_REASONING_FORMAT,
     ]
     if LLAMA_USE_JINJA:
         cmd.append("--jinja")
@@ -182,7 +174,7 @@ CALENDAR_TIMEZONE = "Europe/Amsterdam"
 # Per-request timeout (seconds) for all CalDAV calls to iCloud. Previously
 # unset, which let a single stalled request hang on whatever the caldav
 # library's internal default is (~120s) with no way to recover from it.
-CALDAV_TIMEOUT_SECONDS = 30
+CALDAV_TIMEOUT_SECONDS = 60
 
 # Extra attempts (beyond the first) confirm_pending() makes if writing a
 # staged change to iCloud fails, with a short delay between attempts.
@@ -192,7 +184,7 @@ CALENDAR_WRITE_RETRIES = 2
 # match (or uniquely partially match) one of your real iCloud calendar
 # names - check with calendar_list_calendars if unsure. Falls back to
 # iCloud's first-returned calendar if this name doesn't match anything.
-CALENDAR_DEFAULT_NAME = "Test"
+CALENDAR_DEFAULT_NAME = "Home"
 
 # Names of the environment variables calendar_manager.py reads credentials
 # from (via a .env file in PROJECT_ROOT - see .env.example). Secrets never
@@ -221,6 +213,30 @@ CALENDAR_PENDING_CHANGE_TTL_MINUTES = 10
 # already use successfully, so it's used here too instead.
 CALENDAR_UID_LOOKUP_LOOKBACK_DAYS = 365
 CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS = 365
+
+# calendar_create_events_batch: stages MULTIPLE events (e.g. a proposed
+# morning schedule from project tasks) as one pending change. Safety
+# ceiling on batch size, and the default block length used when an event
+# in the batch doesn't specify an explicit end time (shorter than the
+# single-event default of 1 hour, since this is aimed at task blocks).
+CALENDAR_BATCH_MAX_EVENTS = 12
+CALENDAR_BATCH_DEFAULT_DURATION_MINUTES = 30
+
+# Background cache for ambient context injection (main.py's system
+# prompt) — NOT used by any read/write tool, which stay live. See
+# calendar_manager.refresh_cache()/get_cached_context() and handover-17
+# for why this boundary matters.
+CALENDAR_DATA_DIR = os.path.join(PROJECT_ROOT, "calendar_data")
+CALENDAR_CACHE_FILE = os.path.join(CALENDAR_DATA_DIR, "context_cache.json")
+
+# How often the background timer refreshes the cache, and how far ahead
+# it looks each time.
+CALENDAR_CACHE_REFRESH_MINUTES = 5
+CALENDAR_CACHE_LOOKAHEAD_DAYS = 14
+
+# How many cached events get injected into the system prompt (same idea
+# as MAX_TASKS_IN_CONTEXT above, for the calendar side).
+CALENDAR_CACHE_MAX_EVENTS_IN_CONTEXT = 15
 
 
 # ─────────────────────────────────────────────────────────────
