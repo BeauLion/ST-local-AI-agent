@@ -51,7 +51,19 @@ from config import (
     WRITE_FILE_MAX_CHARS,
 )
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Starts the calendar cache's background refresh thread once, when the
+    # server actually comes up (not on every reload-triggered reimport -
+    # see calendar_manager.start_background_refresh()'s own guard too).
+    calendar_manager.start_background_refresh()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class LlamaServerError(Exception):
@@ -1637,6 +1649,14 @@ async def chat_completions(request: Request):
         messages_to_prepend.append({"role": "system", "content": project_state_text})
         prepend_sections.append(("project_state", project_state_text))
     print(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
+
+    # Read-only, local-file-only - see calendar_manager.get_cached_context()
+    # docstring for why this never triggers a live CalDAV call.
+    calendar_context_text = await asyncio.to_thread(calendar_manager.get_cached_context)
+    if calendar_context_text:
+        messages_to_prepend.append({"role": "system", "content": calendar_context_text})
+        prepend_sections.append(("calendar_cache", calendar_context_text))
+    print(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
 
     # Auto-recall: silently check if any saved memories are relevant to what
     # the user just said, and inject them - no tool call needed for this part.

@@ -41,7 +41,8 @@ LLAMA_SERVER_URL = f"http://localhost:{LLAMA_SERVER_PORT}"
 
 # The exact model to pull/run via llama.cpp's -hf shorthand.
 #LLAMA_MODEL_REPO = "Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
-LLAMA_MODEL_REPO = "Qwen/Qwen3-14B-GGUF:Q4_K_M"
+#LLAMA_MODEL_REPO = "Qwen/Qwen3-14B-GGUF:Q4_K_M"
+LLAMA_MODEL_REPO = "HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced"
 
 LLAMA_NGL = 99          # -ngl: layers offloaded to GPU (99 = full offload)
 LLAMA_CONTEXT = 32768    # -c: context window size
@@ -52,6 +53,8 @@ LLAMA_MIN_P = 0.0   # new constant - see command builder change below
 LLAMA_FLASH_ATTENTION = 'on'   # -fa: flash attention, speed optimization [on|off|auto]
 LLAMA_USE_JINJA = True         # --jinja: required for structured tool-call output
 LLAMA_REASONING_FORMAT = "deepseek"
+LLAMA_MD = "./llama.cpp/mtp-gemma-4-12B-it.gguf"
+LLAMA_SPEC_TYPE = "draft-mtp"
 
 
 def build_llama_server_command() -> list[str]:
@@ -63,6 +66,8 @@ def build_llama_server_command() -> list[str]:
     cmd = [
         LLAMA_SERVER_EXE,
         "-hf", LLAMA_MODEL_REPO,
+        "-md", LLAMA_MD,
+        "--spec-type", LLAMA_SPEC_TYPE,
         "-ngl", str(LLAMA_NGL),
         "-c", str(LLAMA_CONTEXT),
         "--temp", str(LLAMA_TEMP),
@@ -72,7 +77,7 @@ def build_llama_server_command() -> list[str]:
         "--top-p", str(LLAMA_TOP_P),
         "--top-k", str(LLAMA_TOP_K),
         "--min-p", str(LLAMA_MIN_P),
-        "--reasoning-format", LLAMA_REASONING_FORMAT,
+        #"--reasoning-format", LLAMA_REASONING_FORMAT,
     ]
     if LLAMA_USE_JINJA:
         cmd.append("--jinja")
@@ -212,6 +217,22 @@ CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS = 365
 # single-event default of 1 hour, since this is aimed at task blocks).
 CALENDAR_BATCH_MAX_EVENTS = 12
 CALENDAR_BATCH_DEFAULT_DURATION_MINUTES = 30
+
+# Background cache for ambient context injection (main.py's system
+# prompt) — NOT used by any read/write tool, which stay live. See
+# calendar_manager.refresh_cache()/get_cached_context() and handover-17
+# for why this boundary matters.
+CALENDAR_DATA_DIR = os.path.join(PROJECT_ROOT, "calendar_data")
+CALENDAR_CACHE_FILE = os.path.join(CALENDAR_DATA_DIR, "context_cache.json")
+
+# How often the background timer refreshes the cache, and how far ahead
+# it looks each time.
+CALENDAR_CACHE_REFRESH_MINUTES = 5
+CALENDAR_CACHE_LOOKAHEAD_DAYS = 14
+
+# How many cached events get injected into the system prompt (same idea
+# as MAX_TASKS_IN_CONTEXT above, for the calendar side).
+CALENDAR_CACHE_MAX_EVENTS_IN_CONTEXT = 15
 
 
 # ─────────────────────────────────────────────────────────────

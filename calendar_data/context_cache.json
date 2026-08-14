@@ -1,0 +1,50 @@
+{
+  "refreshed_at": "2026-08-14T14:50:38.664747",
+  "events": [
+    {
+      "uid": "6651aa4d-ece6-4e1e-891e-8f9e217926ba",
+      "title": "TP-003 Review API Docs",
+      "start": "2026-08-14 14:00:00+02:00",
+      "end": "2026-08-14 15:00:00+02:00",
+      "location": "Office",
+      "description": "",
+      "calendar": "Test"
+    },
+    {
+      "uid": "B47666A7-983E-4561-8306-DFB2CDCE1FEA",
+      "title": "Walk with Otis",
+      "start": "2026-08-14 17:00:00+02:00",
+      "end": "2026-08-14 18:00:00+02:00",
+      "location": "",
+      "description": "",
+      "calendar": "Home"
+    },
+    {
+      "uid": "20a53d97-dc29-4601-8f28-64545c665c80",
+      "title": "Dinner",
+      "start": "2026-08-14 20:00:00+02:00",
+      "end": "2026-08-14 21:00:00+02:00",
+      "location": "",
+      "description": "",
+      "calendar": "Home"
+    },
+    {
+      "uid": "F1BDCE1B-70E5-45B8-934F-85A76D0E8929",
+      "title": "Otis",
+      "start": "2026-08-17 12:00:00+02:00",
+      "end": "2026-08-17 13:00:00+02:00",
+      "location": "",
+      "description": "",
+      "calendar": "Home"
+    },
+    {
+      "uid": "C65099C4-14FF-4B07-A73D-5443180B140C",
+      "title": "Amber",
+      "start": "2026-08-21",
+      "end": "2026-08-22",
+      "location": "",
+      "description": "",
+      "calendar": "Home"
+    }
+  ]
+}

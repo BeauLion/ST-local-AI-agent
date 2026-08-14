@@ -26,7 +26,9 @@ Only one change can be staged at a time (single-user, single-session use
 case) - staging a new one silently replaces whatever was staged before.
 """
 
+import json
 import os
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -41,6 +43,10 @@ from config import (
     CALDAV_TIMEOUT_SECONDS,
     CALENDAR_BATCH_DEFAULT_DURATION_MINUTES,
     CALENDAR_BATCH_MAX_EVENTS,
+    CALENDAR_CACHE_FILE,
+    CALENDAR_CACHE_LOOKAHEAD_DAYS,
+    CALENDAR_CACHE_MAX_EVENTS_IN_CONTEXT,
+    CALENDAR_CACHE_REFRESH_MINUTES,
     CALENDAR_DEFAULT_LOOKAHEAD_DAYS,
     CALENDAR_DEFAULT_NAME,
     CALENDAR_PENDING_CHANGE_TTL_MINUTES,
@@ -427,6 +433,117 @@ def search_events(query: str, start: str = None, end: str = None, calendar_name:
         _last_results.clear()
         _last_results.extend(matches)
     return matches
+
+
+# ---------------------------------------------------------------------------
+# Background cache - context injection only, never a data source for reads
+# or writes. See handover-17 for the full rationale: a caching bug here can
+# only make the ambient "here's what's coming up" text stale, never cause a
+# wrong tool result or a bad write.
+# ---------------------------------------------------------------------------
+
+_CACHE_FILE = Path(CALENDAR_CACHE_FILE)
+
+
+def refresh_cache():
+    """Fetch upcoming events across every calendar (within
+    CALENDAR_CACHE_LOOKAHEAD_DAYS) and atomically write them to the local
+    cache file. Called on a background timer (start_background_refresh)
+    and once more right after confirm_pending() succeeds - never from
+    inside a chat request, so a slow iCloud round-trip here never adds
+    latency to a turn.
+
+    Deliberately does NOT touch _last_results - that cache exists only to
+    let stage_edit_event/stage_delete_event recover a fabricated UID right
+    after a model-initiated list/search call. Mixing in background-poll
+    results would let an automatic refresh silently override what the
+    model was just shown.
+    """
+    start_dt = datetime.now()
+    end_dt = start_dt + timedelta(days=CALENDAR_CACHE_LOOKAHEAD_DAYS)
+    events = []
+    try:
+        for cal in _get_calendars():
+            label = cal.name or "(unnamed)"
+            found = _date_search_with_retry(cal, start_dt, end_dt, f"cache refresh: '{label}'")
+            events.extend(_event_to_dict(e, label) for e in found)
+    except CalendarError as e:
+        # Leave whatever cache already exists in place - a failed refresh
+        # should degrade to "slightly stale", not "no context at all".
+        print(f"[calendar_manager] cache refresh failed, keeping previous cache: {e}")
+        return
+
+    events.sort(key=lambda ev: ev["start"])
+    payload = {"refreshed_at": datetime.now().isoformat(), "events": events}
+
+    _CACHE_FILE.parent.mkdir(exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=_CACHE_FILE.parent, prefix=".cache_tmp_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, _CACHE_FILE)  # atomic rename on both Windows and POSIX -
+                                            # a crash mid-write can't leave a half-written file
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def get_cached_context() -> str:
+    """Read-only, single fast local file read - no CalDAV call. Returns ''
+    if no cache exists yet (e.g. right after a fresh install, before the
+    first background refresh completes), so main.py's system-prompt
+    injection can treat this exactly like project_manager's
+    build_context_text() returning ''."""
+    if not _CACHE_FILE.exists():
+        return ""
+    try:
+        payload = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+
+    events = payload.get("events", [])
+    if not events:
+        return (f"[UPCOMING CALENDAR EVENTS]\nNone in the next "
+                 f"{CALENDAR_CACHE_LOOKAHEAD_DAYS} days.")
+
+    lines = [
+        f"[UPCOMING CALENDAR EVENTS] (cached, refreshes every "
+        f"{CALENDAR_CACHE_REFRESH_MINUTES} min - may be a few minutes out of "
+        f"date for very recent changes)"
+    ]
+    for ev in events[:CALENDAR_CACHE_MAX_EVENTS_IN_CONTEXT]:
+        loc = f" @ {ev['location']}" if ev.get("location") else ""
+        lines.append(f"- {ev['start']} to {ev['end']}: {ev['title']}{loc}")
+    return "\n".join(lines)
+
+
+_background_thread_lock = threading.Lock()
+_background_thread_started = False
+
+
+def start_background_refresh():
+    """Starts the timer-driven cache refresh loop, once per process. Safe
+    to call more than once - only the first call actually starts a
+    thread. Call this once at app startup (main.py)."""
+    global _background_thread_started
+    with _background_thread_lock:
+        if _background_thread_started:
+            return
+        _background_thread_started = True
+
+    def _loop():
+        while True:
+            try:
+                refresh_cache()
+            except Exception as e:
+                print(f"[calendar_manager] background cache refresh crashed: {e}")
+            time.sleep(CALENDAR_CACHE_REFRESH_MINUTES * 60)
+
+    threading.Thread(target=_loop, daemon=True, name="calendar-cache-refresh").start()
+    print(f"[calendar_manager] background cache refresh started (every {CALENDAR_CACHE_REFRESH_MINUTES} min)")
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +944,10 @@ def confirm_pending() -> str:
                     time.sleep(_CALENDAR_RETRY_DELAY_SECONDS)
                 continue
             _pending_change = None
+            # One-off refresh so this change shows up in the ambient
+            # context immediately, not after the next timer tick. Runs in
+            # its own thread so confirm_pending() doesn't wait on it.
+            threading.Thread(target=refresh_cache, daemon=True, name="calendar-cache-refresh-oneoff").start()
             return result
         # All attempts failed - deliberately do NOT clear _pending_change
         # here (unlike before). That lets the user just say "confirm"
