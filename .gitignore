@@ -20,6 +20,9 @@ calendar_data/
 # Project manager data (projects.json - also personal data)
 project_data/
 
+# Task duration tracking data (durations.json - also personal data)
+duration_data/
+
 # User-provided documents for RAG (same reasoning. Personal content)
 agent_files/*
 !agent_files/.gitkeep

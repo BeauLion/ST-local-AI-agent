@@ -31,9 +31,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 import calendar_manager
+import duration_manager
 import memory
 import project_manager
 from calendar_manager import CalendarError
+from duration_manager import DurationError
 from project_manager import ProjectManagerError
 from config import (
     CORS_ALLOWED_ORIGINS,
@@ -577,8 +579,11 @@ def project_manager_update_task_status(args: dict) -> str:
         status = args.get("status")
         if task["status"] == status:
             return f"No change needed; \u201c{task['title']}\u201d is already {status}."
-        updated = project_manager.set_task_status(project["id"], task["id"], status)
-        return f"Set {updated['short_id']} (\u201c{updated['title']}\u201d) to {status}."
+        updated, flag = project_manager.set_task_status(project["id"], task["id"], status)
+        message = f"Set {updated['short_id']} (\u201c{updated['title']}\u201d) to {status}."
+        if flag:
+            message += "\n\n" + flag
+        return message
     except ProjectManagerError as e:
         return f"Error: {e}"
 
@@ -603,10 +608,13 @@ def project_manager_set_all_tasks_status(args: dict) -> str:
         state = project_manager._load()
         project = project_manager.resolve_project(state, args.get("project"))
         status = args.get("status")
-        applied = project_manager.set_all_tasks_status(project["id"], status)
+        applied, flags = project_manager.set_all_tasks_status(project["id"], status)
         if not applied:
             return f"No change needed; every non-archived task in {project['short_code']} \u2014 {project['name']} is already {status}."
-        return f"Set {len(applied)} task(s) in {project['short_code']} to {status}:\n" + "\n".join(applied)
+        message = f"Set {len(applied)} task(s) in {project['short_code']} to {status}:\n" + "\n".join(applied)
+        if flags:
+            message += "\n\n" + "\n".join(flags)
+        return message
     except ProjectManagerError as e:
         return f"Error: {e}"
 
@@ -615,11 +623,40 @@ def project_manager_batch_update(args: dict) -> str:
     try:
         state = project_manager._load()
         project = project_manager.resolve_project(state, args.get("project"))
-        applied = project_manager.batch_update(project["id"], args.get("operations", []))
+        applied, flags = project_manager.batch_update(project["id"], args.get("operations", []))
         if not applied:
             return "No change needed; every requested batch operation is already satisfied."
-        return f"Applied {len(applied)} change(s) to {project['short_code']}:\n" + "\n".join(applied)
+        message = f"Applied {len(applied)} change(s) to {project['short_code']}:\n" + "\n".join(applied)
+        if flags:
+            message += "\n\n" + "\n".join(flags)
+        return message
     except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Duration tracking tools (duration_manager.py). Task completions log a
+# duration anchor automatically (see project_manager._apply_task_status) -
+# these three tools are the model-facing surface for reading estimates and
+# handling corrections/new categories.
+# ---------------------------------------------------------------------------
+
+def duration_get_estimate(args: dict) -> str:
+    result = duration_manager.get_estimate(args.get("query", ""))
+    return json.dumps(result, ensure_ascii=False)
+
+
+def duration_correct_entry(args: dict) -> str:
+    try:
+        return duration_manager.correct_entry(args.get("task", ""), args.get("value", ""))
+    except DurationError as e:
+        return f"Error: {e}"
+
+
+def duration_confirm_new_category(args: dict) -> str:
+    try:
+        return duration_manager.confirm_new_category(args.get("name", ""))
+    except DurationError as e:
         return f"Error: {e}"
 
 
@@ -1057,6 +1094,66 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "duration_get_estimate",
+            "description": (
+                "Get a data-grounded duration estimate for a task/category, based on the "
+                "user's own logged history - use this INSTEAD of guessing a duration yourself "
+                "whenever the user asks how long something will take. Returns JSON with "
+                "'resolved' (false if no matching category exists yet), and if resolved: "
+                "'confidence' (insufficient/rough/confident), 'median_minutes', 'mad_minutes', "
+                "and 'n' (entry count). If confidence is 'insufficient' or not resolved, tell "
+                "the user there isn't enough personal history yet rather than inventing a number."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The task or category to estimate, e.g. 'writing a report' or 'email'."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "duration_correct_entry",
+            "description": (
+                "Correct the most recently logged duration for a task or category, when the "
+                "user says the auto-logged time was off (e.g. 'that email actually took like "
+                "20 minutes'). Loose shorthand is fine for value ('~20min', '1h', '90')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Task title or category to identify which entry to correct. Omit to correct the single most recent entry."},
+                    "value": {"type": "string", "description": "The corrected duration, loose shorthand OK, e.g. '~20min', '1.5h', '90'."},
+                },
+                "required": ["value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "duration_confirm_new_category",
+            "description": (
+                "Confirm creating a new tracked duration category, ONLY after you asked the "
+                "user (following an 'uncategorized' duration-logging flag) and they explicitly "
+                "agreed to a specific category name. Never call this speculatively or without "
+                "an explicit yes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The new category name, in the user's own words is fine."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 TOOL_FUNCTIONS = {
@@ -1088,6 +1185,9 @@ TOOL_FUNCTIONS = {
     "project_manager_update_task_notes": project_manager_update_task_notes,
     "project_manager_set_all_tasks_status": project_manager_set_all_tasks_status,
     "project_manager_batch_update": project_manager_batch_update,
+    "duration_get_estimate": duration_get_estimate,
+    "duration_correct_entry": duration_correct_entry,
+    "duration_confirm_new_category": duration_confirm_new_category,
 }
 
 
@@ -1571,7 +1671,8 @@ async def chat_completions(request: Request):
             "calendar_delete_event, calendar_confirm_pending, calendar_cancel_pending, "
             "project_manager_get_overview, project_manager_create_task, "
             "project_manager_update_task_status, project_manager_update_task_notes, "
-            "project_manager_set_all_tasks_status, project_manager_batch_update. "
+            "project_manager_set_all_tasks_status, project_manager_batch_update, "
+            "duration_get_estimate, duration_correct_entry, duration_confirm_new_category. "
             "You MUST call the relevant tool whenever the user "
             "asks about current events, real-time facts, dates/times, weather, "
             "exact arithmetic, or anything you are not fully certain of from "
@@ -1630,6 +1731,22 @@ async def chat_completions(request: Request):
             "Project-manager changes apply immediately - there is no separate "
             "confirmation step, so only call these tools when the user's intent is "
             "unambiguous. "
+            "Use duration_get_estimate whenever the user asks how long a task/category "
+            "will take - never guess a duration yourself, since the whole point of this "
+            "tool is grounding the answer in the user's own logged history instead of a "
+            "generic guess. If confidence comes back 'insufficient' or resolved is "
+            "false, say so plainly instead of presenting a number anyway."
+            "Task completions automatically log a rough duration anchor in the background - "
+            "you don't need to call any tool for that. But if the tool result from marking "
+            "a task done includes a duration line (e.g. '~N min logged for ... category: ...'), "
+            "always relay that line to the user in your reply, verbatim or close to it - "
+            "don't silently drop it. This matters most when the category is 'uncategorized', "
+            "since that line is asking the user whether to create a tracked category for it. "
+            "If the user corrects a duration "
+            "you just reported, or references a past task's duration being wrong, use "
+            "duration_correct_entry. Only call duration_confirm_new_category after the "
+            "user explicitly agrees to a specific new category name you proposed "
+            "following an 'uncategorized' flag - never on your own initiative. "
             + (
                 f"Additional tools provided by the connected frontend are also "
                 f"available this turn: {', '.join(sorted(client_tool_names))}. Call "
