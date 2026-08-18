@@ -780,7 +780,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save a new, durable fact about the user for recall in future conversations (e.g. their preferences, ongoing projects). Do not save trivial small talk. If this fact corrects or replaces something already remembered, use update_memory instead - don't call save_memory for a fact that already exists in a different form. If the fact is their name, occupation, location, or pronouns, pass the matching `slot` instead of leaving it plain - this makes it always visible to you in every future conversation, not just when it's semantically relevant, and safely overwrites any previous value for that slot instead of creating a duplicate.",
+            "description": "Save a new, durable fact about the user for recall in future conversations (e.g. their preferences, ongoing projects). Do not save trivial small talk. If this fact corrects or replaces something already remembered, use update_memory instead - don't call save_memory for a fact that already exists in a different form. If the fact is their identity (name and/or pronouns - combined into a single slot), occupation, or location, pass the matching `slot` instead of leaving it plain - this makes it always visible to you in every future conversation, not just when it's semantically relevant, and safely overwrites any previous value for that slot instead of creating a duplicate. When saving to the `identity` slot, always include BOTH the name and pronouns in the text even if only one changed - it's a single field, so a partial update silently drops whichever part you leave out.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -788,7 +788,7 @@ TOOLS = [
                     "slot": {
                         "type": "string",
                         "enum": list(MEMORY_IDENTITY_SLOTS),
-                        "description": "Optional. Set only when the fact is the user's name, occupation, location, or pronouns - upserts into that slot instead of creating a new freeform memory. Omit for anything else.",
+                        "description": "Optional. Set only when the fact is the user's identity (name and/or pronouns), occupation, or location - upserts into that slot instead of creating a new freeform memory. Omit for anything else.",
                     },
                 },
                 "required": ["fact"],
@@ -836,7 +836,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "pin_memory",
-            "description": "Mark an existing freeform memory (one saved without a slot) as always-shown, so it appears in every future conversation instead of only when it's semantically relevant to what's being discussed. Use for facts worth always knowing that don't fit the fixed name/occupation/location/pronouns slots (e.g. a standing dietary restriction or strong preference). There's a cap on how many freeform memories can be pinned at once - if you hit it, the tool result will say so.",
+            "description": "Mark an existing freeform memory (one saved without a slot) as always-shown, so it appears in every future conversation instead of only when it's semantically relevant to what's being discussed. Use for facts worth always knowing that don't fit the fixed identity/occupation/location slots (e.g. a standing dietary restriction or strong preference). There's a cap on how many freeform memories can be pinned at once - if you hit it, the tool result will say so.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -850,7 +850,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "unpin_memory",
-            "description": "Undo pin_memory - the memory goes back to only surfacing when it's semantically relevant, instead of always. Has no effect on slotted memories (name/occupation/location/pronouns are always shown by design and can't be unpinned - use delete_memory to remove one of those instead).",
+            "description": "Undo pin_memory - the memory goes back to only surfacing when it's semantically relevant, instead of always. Has no effect on slotted memories (identity/occupation/location are always shown by design and can't be unpinned - use delete_memory to remove one of those instead).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1831,14 +1831,15 @@ async def chat_completions(request: Request):
             "calculate for simple arithmetic, or run_python for anything needing "
             "actual code logic. Call save_memory when the user shares a durable "
             "fact about themselves worth remembering - not for small talk. If the "
-            "fact is their name, occupation, location, or pronouns, always pass the "
+            "fact is their identity (name and/or pronouns - combined into one "
+            "slot), occupation, or location, always pass the "
             "matching `slot` argument rather than leaving it plain - this makes it "
             "always visible to you in every conversation, not just when it happens "
             "to match what's being discussed, and safely overwrites the old value "
             "instead of creating a duplicate if that slot is already filled. If the "
             "user corrects or changes a fact you already remember about them (e.g. "
             "a job, name, or preference that's now different) and it's NOT one of "
-            "the four slots, call update_memory with that memory's id and the "
+            "the three slots, call update_memory with that memory's id and the "
             "corrected text - do NOT call save_memory again, since that would leave "
             "both the old and new fact stored side by side and confuse future "
             "recall. The id is usually already visible in the '[id: ...]' tag next "
@@ -1853,7 +1854,7 @@ async def chat_completions(request: Request):
             "really the same fact restated - if so, use update_memory or "
             "delete_memory to reconcile them instead of leaving both. Use "
             "pin_memory on a freeform memory (one saved without a slot) when a fact "
-            "is worth always knowing but doesn't fit the four fixed slots (e.g. a "
+            "is worth always knowing but doesn't fit the three fixed slots (e.g. a "
             "standing dietary restriction or strong preference) - pinned memories, "
             "like slots, are always shown to you rather than only when relevant. "
             "Use unpin_memory to undo that; it has no effect on slotted memories, "

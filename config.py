@@ -133,7 +133,7 @@ DOCUMENT_SIMILARITY_THRESHOLD = 0.3
 # prompt regardless of query (see main.py's auto-recall block); saved via
 # save_memory's optional `slot` param, which upserts instead of appending.
 # See brainstorm-memory-structure-and-dedupe.md for the full design.
-MEMORY_IDENTITY_SLOTS = ("name", "occupation", "location", "pronouns")
+MEMORY_IDENTITY_SLOTS = ("identity", "occupation", "location")
 
 # Cap on freeform (non-slot) pinned memories, toggled via pin_memory/
 # unpin_memory. Slots don't count against this - they're bounded
