@@ -7,6 +7,9 @@ if you find one, it belongs in this file instead.
 """
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 # ─────────────────────────────────────────────────────────────
 # Paths
@@ -15,6 +18,13 @@ import os
 # Root of this repo (folder this config.py file lives in). Everything else
 # below is built relative to this, so the project stays portable.
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Load .env here too (not just in calendar_manager.py) - CORS_ALLOWED_ORIGINS
+# below is built at module-load time, so the env vars it reads need to
+# already be in os.environ by the time this file runs, not just by the time
+# some other module happens to get imported later. Calling load_dotenv()
+# twice (here and in calendar_manager.py) is harmless - it's idempotent.
+load_dotenv(Path(PROJECT_ROOT) / ".env")
 
 # Full path to your llama-server.exe (llama.cpp build). Update this if you
 # ever move or reinstall llama.cpp.
@@ -79,6 +89,8 @@ def build_llama_server_command() -> list[str]:
         "--min-p", str(LLAMA_MIN_P),
         #"--reasoning-format", LLAMA_REASONING_FORMAT,
     ]
+    if AGENT_API_KEY:
+        cmd += ["--api-key", AGENT_API_KEY]
     if LLAMA_USE_JINJA:
         cmd.append("--jinja")
     return cmd
@@ -90,6 +102,13 @@ def build_llama_server_command() -> list[str]:
 
 AGENT_SERVER_HOST = "0.0.0.0"
 AGENT_SERVER_PORT = 8100
+
+# Shared secret SillyTavern must send as its connection's "API Key" to reach
+# /v1/chat/completions and /v1/models. Loaded from .env (see .env.example).
+# If left empty, auth is skipped entirely (with a console warning) so a
+# fresh clone still boots without extra setup - see verify_api_key() in
+# main.py. Deliberately NOT applied to /projects - see handover-21.
+AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
 
 # Ceiling on how many tool-call round-trips the agent will do before
 # forcing a final answer, to prevent infinite tool-calling loops.
@@ -144,13 +163,14 @@ PROJECT_STATUSES = ("active", "paused", "completed")
 TASK_STATUSES = ("pending", "active", "blocked", "done", "cancelled")
 TASK_PRIORITIES = ("low", "normal", "high")
 
-# Origins allowed to call the agent server's HTTP API from the browser.
-# SillyTavern's own page (wherever it's hosted) needs to be listed here for
-# the project-manager extension's fetch() calls to be allowed by CORS.
-# "*" is fine for a single-user local setup; tighten this if you ever expose
-# the agent server beyond localhost.
-CORS_ALLOWED_ORIGINS = ["*"]
+# localhost is always allowed below. Anything else (Tailscale IPs, LAN IPs,
+# etc.) goes in .env as EXTRA_CORS_ORIGINS - a comma-separated list - so
+# real IPs never end up committed to the repo. See .env.example for the
+# expected format.
+_extra_origins = os.getenv("EXTRA_CORS_ORIGINS", "")
+_extra_origins_list = [origin.strip() for origin in _extra_origins.split(",") if origin.strip()]
 
+CORS_ALLOWED_ORIGINS = ["http://localhost:8000"] + _extra_origins_list
 
 # ─────────────────────────────────────────────────────────────
 # Calendar (calendar_manager.py) — iCloud via CalDAV
@@ -233,6 +253,46 @@ CALENDAR_CACHE_LOOKAHEAD_DAYS = 14
 # How many cached events get injected into the system prompt (same idea
 # as MAX_TASKS_IN_CONTEXT above, for the calendar side).
 CALENDAR_CACHE_MAX_EVENTS_IN_CONTEXT = 15
+
+
+# ─────────────────────────────────────────────────────────────
+# Task duration tracking (duration_manager.py)
+# ─────────────────────────────────────────────────────────────
+
+DURATION_DATA_DIR = os.path.join(PROJECT_ROOT, "duration_data")
+
+# Confidence-state thresholds by entry count per category (see
+# brainstorm-task-duration-tracking.md - three states, not a hard cutoff).
+MIN_ENTRIES_FOR_ESTIMATE = 5
+MIN_ENTRIES_FOR_CONFIDENT_ESTIMATE = 10
+
+# Minimum cosine-similarity score for a task title to match an existing
+# category by meaning rather than exact text/alias. Same pattern as
+# MEMORY_SIMILARITY_THRESHOLD/DOCUMENT_SIMILARITY_THRESHOLD above.
+DURATION_CATEGORY_SIMILARITY_THRESHOLD = 0.5
+
+# Seeded canonical category list - deliberately NOT allowed to grow on its
+# own (see brainstorm doc §5). Personalized for academic/research work as
+# the primary focus, plus work admin/communication and household/personal
+# admin. New categories beyond this only ever get added via explicit
+# confirmation (duration_confirm_new_category), never silently.
+DURATION_CANONICAL_CATEGORIES = (
+    "reading", "writing", "data_analysis", "research_admin",
+    "email", "meetings", "planning", "household",
+)
+
+# Small hand-maintained alias table for obvious synonyms, checked before
+# the embedding fallback. Extend as you notice fragmentation.
+DURATION_CATEGORY_ALIASES = {
+    "literature review": "reading", "lit review": "reading", "paper reading": "reading",
+    "drafting": "writing", "thesis": "writing", "thesis writing": "writing",
+    "analysis": "data_analysis", "data analysis": "data_analysis", "coding": "data_analysis",
+    "grant": "research_admin", "grant application": "research_admin",
+    "funding": "research_admin", "paperwork": "research_admin",
+    "e-mail": "email", "mail": "email", "correspondence": "email",
+    "call": "meetings", "calls": "meetings", "meeting": "meetings", "supervisor": "meetings",
+    "chores": "household", "errands": "household", "cleaning": "household", "shopping": "household",
+}
 
 
 # ─────────────────────────────────────────────────────────────

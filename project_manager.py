@@ -31,6 +31,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import duration_manager
 from config import (
     MAX_BATCH_OPERATIONS,
     MAX_PROJECT_CODE_LENGTH,
@@ -355,15 +356,25 @@ def create_task(project_id: str, title: str, *, priority="normal", notes="") -> 
         return task
 
 
-def _apply_task_status(task: dict, status: str):
+def _apply_task_status(task: dict, status: str, project_id: str):
+    if task["status"] == "active" and status not in ("active", "done"):
+        duration_manager.on_task_inactive(task["id"])
+
     task["status"] = status
     task["updated_at"] = _now()
     task["completed_at"] = _now() if status == "done" else None
     task["archived"] = status == "done"
     task["archived_at"] = _now() if status == "done" else None
 
+    if status == "active":
+        duration_manager.on_task_active(task["id"], project_id)
+        return None
+    if status == "done":
+        return duration_manager.on_task_done(task["id"], project_id, task["title"])
+    return None
 
-def set_task_status(project_id: str, task_id: str, status: str) -> dict:
+
+def set_task_status(project_id: str, task_id: str, status: str) -> tuple:
     if status not in TASK_STATUSES:
         raise ProjectManagerError(f"Invalid task status: {status}")
     with _lock:
@@ -373,19 +384,20 @@ def set_task_status(project_id: str, task_id: str, status: str) -> dict:
             raise ProjectManagerError("Task not found in the selected project.")
         task = project["tasks"][task_id]
         if task["status"] == status:
-            return task
+            return task, None
 
-        _apply_task_status(task, status)
+        flag = _apply_task_status(task, status, project_id)
         if status == "active":
             for other in project["tasks"].values():
                 if other["id"] != task_id and other["status"] == "active":
                     other["status"] = "pending"
                     other["updated_at"] = _now()
+                    duration_manager.on_task_inactive(other["id"])
 
         project["updated_at"] = _now()
         _recalculate_next_action(project)
         _save(state)
-        return task
+        return task, flag
 
 
 def update_task_details(project_id: str, task_id: str, *, title=None, priority=None, notes=None) -> dict:
@@ -577,7 +589,7 @@ def _apply_operation_to_project(project: dict, operation: dict):
             "notes": operation.get("notes", ""),
             "sort_order": len(project["tasks"]),
         }
-        return
+        return None
 
     task = project["tasks"].get(operation["task_id"])
     if not task:
@@ -586,13 +598,14 @@ def _apply_operation_to_project(project: dict, operation: dict):
     if operation["type"] == "update_task_status":
         if task["status"] == operation["status"]:
             raise ProjectManagerError(f"\u201c{task['title']}\u201d is already {operation['status']}.")
-        _apply_task_status(task, operation["status"])
+        flag = _apply_task_status(task, operation["status"], project["id"])
         if operation["status"] == "active":
             for other in project["tasks"].values():
                 if other["id"] != task["id"] and other["status"] == "active":
                     other["status"] = "pending"
                     other["updated_at"] = _now()
-        return
+                    duration_manager.on_task_inactive(other["id"])
+        return flag
 
     if operation["type"] == "update_task_notes":
         current = task.get("notes", "")
@@ -606,12 +619,12 @@ def _apply_operation_to_project(project: dict, operation: dict):
             raise ProjectManagerError(f"Notes for \u201c{task['title']}\u201d already match the requested result.")
         task["notes"] = next_notes[:MAX_TASK_NOTE_LENGTH]
         task["updated_at"] = _now()
-        return
+        return None
 
     raise ProjectManagerError("Unsupported batch operation.")
 
 
-def batch_update(project_id: str, operations: list) -> list:
+def batch_update(project_id: str, operations: list) -> tuple:
     """Validates and applies a batch atomically: nothing is written to disk
     unless every operation in the (already de-duplicated) batch succeeds."""
     with _lock:
@@ -621,18 +634,21 @@ def batch_update(project_id: str, operations: list) -> list:
             raise ProjectManagerError("Project not found.")
         actionable = _validate_batch_operations(project, operations)
         if not actionable:
-            return []
+            return [], []
 
         descriptions = [_describe_batch_operation(op, project) for op in actionable]
+        flags = []
         for op in actionable:
-            _apply_operation_to_project(project, op)
+            flag = _apply_operation_to_project(project, op)
+            if flag:
+                flags.append(flag)
         project["updated_at"] = _now()
         _recalculate_next_action(project)
         _save(state)
-        return descriptions
+        return descriptions, flags
 
 
-def set_all_tasks_status(project_id: str, status: str) -> list:
+def set_all_tasks_status(project_id: str, status: str) -> tuple:
     """Sets every non-archived task to `status` in one batch, without ever
     touching the project's own status - even if that empties the open list."""
     if status not in TASK_STATUSES:
@@ -648,14 +664,17 @@ def set_all_tasks_status(project_id: str, status: str) -> list:
             if not t["archived"] and t["status"] != status
         ]
         if not operations:
-            return []
+            return [], []
         descriptions = [_describe_batch_operation(op, project) for op in operations]
+        flags = []
         for op in operations:
-            _apply_operation_to_project(project, op)
+            flag = _apply_operation_to_project(project, op)
+            if flag:
+                flags.append(flag)
         project["updated_at"] = _now()
         _recalculate_next_action(project)
         _save(state)
-        return descriptions
+        return descriptions, flags
 
 
 # --------------------------- read-only views ---------------------------
