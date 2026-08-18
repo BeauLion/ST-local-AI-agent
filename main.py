@@ -49,6 +49,7 @@ from config import (
     LLAMA_CONTEXT,
     LLAMA_SERVER_URL,
     MAX_TOOL_ITERATIONS,
+    MEMORY_IDENTITY_SLOTS,
     SAFE_FILES_DIR,
     WRITE_FILE_ALLOWED_EXTENSIONS,
     WRITE_FILE_MAX_CHARS,
@@ -238,10 +239,25 @@ def get_weather(args: dict) -> str:
 
 def save_memory_tool(args: dict) -> str:
     fact = args.get("fact", "")
+    slot = args.get("slot") or None
     if not fact:
         return "Error: no fact provided."
-    new_id = memory.save_memory(fact)
-    return f"Saved to long-term memory [id: {new_id}]: {fact}"
+    if slot and slot not in MEMORY_IDENTITY_SLOTS:
+        return f"Error: '{slot}' is not a valid slot. Valid slots: {', '.join(MEMORY_IDENTITY_SLOTS)}."
+    result = memory.save_memory(fact, slot=slot)
+    if slot:
+        verb = "Updated" if result["action"] == "updated" else "Saved"
+        return f"{verb} slot '{slot}' [id: {result['id']}]: {fact}"
+    msg = f"Saved to long-term memory [id: {result['id']}]: {fact}"
+    similar = result.get("similar")
+    if similar:
+        msg += (
+            f"\nNote: this looks similar to an existing memory - "
+            f"[id: {similar['id']}] {similar['text']} (similarity {similar['score']:.2f}). "
+            f"If it's the same fact restated, use update_memory or delete_memory instead of "
+            f"leaving both stored."
+        )
+    return msg
 
 
 def update_memory_tool(args: dict) -> str:
@@ -259,11 +275,29 @@ def delete_memory_tool(args: dict) -> str:
     return memory.delete_memory(memory_id)
 
 
+def pin_memory_tool(args: dict) -> str:
+    memory_id = args.get("id", "")
+    if not memory_id:
+        return "Error: id is required."
+    return memory.pin_memory(memory_id)
+
+
+def unpin_memory_tool(args: dict) -> str:
+    memory_id = args.get("id", "")
+    if not memory_id:
+        return "Error: id is required."
+    return memory.unpin_memory(memory_id)
+
+
 def list_memories_tool(args: dict) -> str:
     memories = memory.list_memories()
     if not memories:
         return "No memories saved yet."
-    return "\n".join(f"[id: {m['id']}] {m['text']}" for m in memories)
+    lines = []
+    for m in memories:
+        tag = f" (slot: {m['slot']})" if m.get("slot") else (" (pinned)" if m.get("pinned") else "")
+        lines.append(f"[id: {m['id']}]{tag} {m['text']}")
+    return "\n".join(lines)
 
 
 def search_documents_tool(args: dict) -> str:
@@ -746,11 +780,16 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save a new, durable fact about the user for recall in future conversations (e.g. their name, preferences, ongoing projects). Do not save trivial small talk. If this fact corrects or replaces something already remembered, use update_memory instead - don't call save_memory for a fact that already exists in a different form.",
+            "description": "Save a new, durable fact about the user for recall in future conversations (e.g. their preferences, ongoing projects). Do not save trivial small talk. If this fact corrects or replaces something already remembered, use update_memory instead - don't call save_memory for a fact that already exists in a different form. If the fact is their name, occupation, location, or pronouns, pass the matching `slot` instead of leaving it plain - this makes it always visible to you in every future conversation, not just when it's semantically relevant, and safely overwrites any previous value for that slot instead of creating a duplicate.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "fact": {"type": "string", "description": "The fact to remember, written as a standalone sentence."}
+                    "fact": {"type": "string", "description": "The fact to remember, written as a standalone sentence."},
+                    "slot": {
+                        "type": "string",
+                        "enum": list(MEMORY_IDENTITY_SLOTS),
+                        "description": "Optional. Set only when the fact is the user's name, occupation, location, or pronouns - upserts into that slot instead of creating a new freeform memory. Omit for anything else.",
+                    },
                 },
                 "required": ["fact"],
             },
@@ -791,6 +830,34 @@ TOOLS = [
             "name": "list_memories",
             "description": "List every fact currently saved in long-term memory, each with its id. Use this to find the id of a memory to update or delete when it wasn't already shown in context, or when the user asks what you remember about them.",
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pin_memory",
+            "description": "Mark an existing freeform memory (one saved without a slot) as always-shown, so it appears in every future conversation instead of only when it's semantically relevant to what's being discussed. Use for facts worth always knowing that don't fit the fixed name/occupation/location/pronouns slots (e.g. a standing dietary restriction or strong preference). There's a cap on how many freeform memories can be pinned at once - if you hit it, the tool result will say so.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the existing freeform memory to pin."}
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unpin_memory",
+            "description": "Undo pin_memory - the memory goes back to only surfacing when it's semantically relevant, instead of always. Has no effect on slotted memories (name/occupation/location/pronouns are always shown by design and can't be unpinned - use delete_memory to remove one of those instead).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the pinned freeform memory to unpin."}
+                },
+                "required": ["id"],
+            },
         },
     },
     {
@@ -1227,6 +1294,8 @@ TOOL_FUNCTIONS = {
     "save_memory": save_memory_tool,
     "update_memory": update_memory_tool,
     "delete_memory": delete_memory_tool,
+    "pin_memory": pin_memory_tool,
+    "unpin_memory": unpin_memory_tool,
     "list_memories": list_memories_tool,
     "search_documents": search_documents_tool,
     "write_file": write_file,
@@ -1744,7 +1813,7 @@ async def chat_completions(request: Request):
         "content": (
             "You have tools available: get_current_time, calculate, run_python, "
             "web_search, get_weather, list_files, read_file, save_memory, update_memory, "
-            "delete_memory, list_memories, write_file, "
+            "delete_memory, pin_memory, unpin_memory, list_memories, write_file, "
             "edit_file, delete_file, search_documents, calendar_list_calendars, "
             "calendar_list_events, "
             "calendar_search_events, calendar_create_event, calendar_edit_event, "
@@ -1762,16 +1831,33 @@ async def chat_completions(request: Request):
             "calculate for simple arithmetic, or run_python for anything needing "
             "actual code logic. Call save_memory when the user shares a durable "
             "fact about themselves worth remembering - not for small talk. If the "
+            "fact is their name, occupation, location, or pronouns, always pass the "
+            "matching `slot` argument rather than leaving it plain - this makes it "
+            "always visible to you in every conversation, not just when it happens "
+            "to match what's being discussed, and safely overwrites the old value "
+            "instead of creating a duplicate if that slot is already filled. If the "
             "user corrects or changes a fact you already remember about them (e.g. "
-            "a job, name, or preference that's now different), call update_memory "
-            "with that memory's id and the corrected text - do NOT call save_memory "
-            "again, since that would leave both the old and new fact stored side by "
-            "side and confuse future recall. The id is usually already visible in "
-            "the '[id: ...]' tag next to a fact shown to you in the 'Relevant things "
-            "you remember about this user' context; only call list_memories or "
-            "search_memories to look one up if it isn't already visible. Never "
-            "guess an id. Call delete_memory (with an id, same rule) only when the "
-            "user explicitly asks you to forget something, with no replacement fact. "
+            "a job, name, or preference that's now different) and it's NOT one of "
+            "the four slots, call update_memory with that memory's id and the "
+            "corrected text - do NOT call save_memory again, since that would leave "
+            "both the old and new fact stored side by side and confuse future "
+            "recall. The id is usually already visible in the '[id: ...]' tag next "
+            "to a fact shown to you in the 'Core facts you always know about this "
+            "user' or 'Relevant things you remember about this user' context; only "
+            "call list_memories or search_memories to look one up if it isn't "
+            "already visible. Never guess an id. Call delete_memory (with an id, "
+            "same rule) only when the user explicitly asks you to forget something, "
+            "with no replacement fact - this also works on a slotted memory, which "
+            "just empties that slot. If a save_memory result includes a note that "
+            "the new fact looks similar to an existing memory, check whether it's "
+            "really the same fact restated - if so, use update_memory or "
+            "delete_memory to reconcile them instead of leaving both. Use "
+            "pin_memory on a freeform memory (one saved without a slot) when a fact "
+            "is worth always knowing but doesn't fit the four fixed slots (e.g. a "
+            "standing dietary restriction or strong preference) - pinned memories, "
+            "like slots, are always shown to you rather than only when relevant. "
+            "Use unpin_memory to undo that; it has no effect on slotted memories, "
+            "which are always shown by design - use delete_memory on those instead. "
             "Use write_file when the user asks you to create, save, write out, or "
             "update a .txt or .md file - use mode 'overwrite' to replace a file's "
             "contents (or create a new one) and mode 'append' to add to the end of "
@@ -1904,14 +1990,37 @@ async def chat_completions(request: Request):
         prepend_sections.append(("calendar_cache", calendar_context_text))
     print(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
 
-    # Auto-recall: silently check if any saved memories are relevant to what
-    # the user just said, and inject them - no tool call needed for this part.
+    # Auto-recall, part 1: pinned memories (identity slots + freeform pins)
+    # are always shown, every turn, regardless of what's being discussed -
+    # unlike the query-based search below, this isn't conditional on
+    # last_user_msg existing or matching anything semantically.
+    pinned = await asyncio.to_thread(memory.get_pinned_memories)
+    pinned_ids = {m["id"] for m in pinned}
+    if pinned:
+        print(f"[AGENT] {len(pinned)} pinned memory item(s) always shown")
+        pinned_text = (
+            "Core facts you always know about this user (id shown so you can "
+            "call update_memory/delete_memory/unpin_memory directly if one of "
+            "these needs correcting or removing - never guess an id):\n"
+            + "\n".join(
+                f"- [id: {m['id']}]" + (f" (slot: {m['slot']})" if m["slot"] else "") + f" {m['text']}"
+                for m in pinned
+            )
+        )
+        messages_to_prepend.append({"role": "system", "content": pinned_text})
+        prepend_sections.append(("memory_pinned", pinned_text))
+
+    # Auto-recall, part 2: silently check if any OTHER saved memories are
+    # relevant to what the user just said, and inject them - no tool call
+    # needed for this part. Pinned memories are excluded here since they're
+    # already always shown above; this is only for everything else.
     last_user_msg = next(
         (m["content"] for m in reversed(body["messages"]) if m.get("role") == "user"),
         None,
     )
     if last_user_msg:
         relevant = await asyncio.to_thread(memory.search_memories, last_user_msg)
+        relevant = [m for m in relevant if m["id"] not in pinned_ids]
         if relevant:
             print(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
             memory_recall_text = (

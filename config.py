@@ -129,6 +129,24 @@ MEMORY_SIMILARITY_THRESHOLD = 0.15
 # are larger/noisier than short personal-memory facts.
 DOCUMENT_SIMILARITY_THRESHOLD = 0.3
 
+# Fixed, singleton identity facts. Always injected into every system
+# prompt regardless of query (see main.py's auto-recall block); saved via
+# save_memory's optional `slot` param, which upserts instead of appending.
+# See brainstorm-memory-structure-and-dedupe.md for the full design.
+MEMORY_IDENTITY_SLOTS = ("name", "occupation", "location", "pronouns")
+
+# Cap on freeform (non-slot) pinned memories, toggled via pin_memory/
+# unpin_memory. Slots don't count against this - they're bounded
+# separately by MEMORY_IDENTITY_SLOTS itself (max 4).
+MEMORY_MAX_FREEFORM_PINS = 10
+
+# Similarity threshold for save_memory's dedupe nudge - deliberately
+# higher than MEMORY_SIMILARITY_THRESHOLD (recall) since this needs to
+# avoid flagging merely-related facts as duplicates, only near-identical
+# or contradicting ones. Starting point only - needs live tuning against
+# real memories once this is in use.
+MEMORY_DEDUPE_SIMILARITY_THRESHOLD = 0.65
+
 
 # ─────────────────────────────────────────────────────────────
 # write_file tool
