@@ -240,8 +240,30 @@ def save_memory_tool(args: dict) -> str:
     fact = args.get("fact", "")
     if not fact:
         return "Error: no fact provided."
-    memory.save_memory(fact)
-    return f"Saved to long-term memory: {fact}"
+    new_id = memory.save_memory(fact)
+    return f"Saved to long-term memory [id: {new_id}]: {fact}"
+
+
+def update_memory_tool(args: dict) -> str:
+    memory_id = args.get("id", "")
+    new_text = args.get("new_text", "")
+    if not memory_id or not new_text:
+        return "Error: both id and new_text are required."
+    return memory.update_memory(memory_id, new_text)
+
+
+def delete_memory_tool(args: dict) -> str:
+    memory_id = args.get("id", "")
+    if not memory_id:
+        return "Error: id is required."
+    return memory.delete_memory(memory_id)
+
+
+def list_memories_tool(args: dict) -> str:
+    memories = memory.list_memories()
+    if not memories:
+        return "No memories saved yet."
+    return "\n".join(f"[id: {m['id']}] {m['text']}" for m in memories)
 
 
 def search_documents_tool(args: dict) -> str:
@@ -724,7 +746,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save an important fact about the user for recall in future conversations (e.g. their name, preferences, ongoing projects). Do not save trivial small talk.",
+            "description": "Save a new, durable fact about the user for recall in future conversations (e.g. their name, preferences, ongoing projects). Do not save trivial small talk. If this fact corrects or replaces something already remembered, use update_memory instead - don't call save_memory for a fact that already exists in a different form.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -732,6 +754,43 @@ TOOLS = [
                 },
                 "required": ["fact"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_memory",
+            "description": "Overwrite an existing memory in place when the user corrects or changes a previously-stored fact (e.g. 'I'm actually a nurse now, not a teacher'). Requires the exact id of the memory being replaced - get it from a memory shown in the 'Relevant things you remember' context, or from list_memories/search_memories if you don't already have it. Never guess an id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the existing memory to overwrite."},
+                    "new_text": {"type": "string", "description": "The corrected fact, written as a standalone sentence."}
+                },
+                "required": ["id", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory",
+            "description": "Permanently remove a memory when the user asks you to forget something, with no replacement fact. Requires the exact id - get it from context, list_memories, or search_memories. Never guess an id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the memory to delete."}
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_memories",
+            "description": "List every fact currently saved in long-term memory, each with its id. Use this to find the id of a memory to update or delete when it wasn't already shown in context, or when the user asks what you remember about them.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -1166,6 +1225,9 @@ TOOL_FUNCTIONS = {
     "list_files": list_files,
     "read_file": read_file,
     "save_memory": save_memory_tool,
+    "update_memory": update_memory_tool,
+    "delete_memory": delete_memory_tool,
+    "list_memories": list_memories_tool,
     "search_documents": search_documents_tool,
     "write_file": write_file,
     "edit_file": edit_file,
@@ -1681,7 +1743,8 @@ async def chat_completions(request: Request):
         "role": "system",
         "content": (
             "You have tools available: get_current_time, calculate, run_python, "
-            "web_search, get_weather, list_files, read_file, save_memory, write_file, "
+            "web_search, get_weather, list_files, read_file, save_memory, update_memory, "
+            "delete_memory, list_memories, write_file, "
             "edit_file, delete_file, search_documents, calendar_list_calendars, "
             "calendar_list_events, "
             "calendar_search_events, calendar_create_event, calendar_edit_event, "
@@ -1698,7 +1761,17 @@ async def chat_completions(request: Request):
             "for specific information inside long or multiple documents. Use "
             "calculate for simple arithmetic, or run_python for anything needing "
             "actual code logic. Call save_memory when the user shares a durable "
-            "fact about themselves worth remembering - not for small talk. "
+            "fact about themselves worth remembering - not for small talk. If the "
+            "user corrects or changes a fact you already remember about them (e.g. "
+            "a job, name, or preference that's now different), call update_memory "
+            "with that memory's id and the corrected text - do NOT call save_memory "
+            "again, since that would leave both the old and new fact stored side by "
+            "side and confuse future recall. The id is usually already visible in "
+            "the '[id: ...]' tag next to a fact shown to you in the 'Relevant things "
+            "you remember about this user' context; only call list_memories or "
+            "search_memories to look one up if it isn't already visible. Never "
+            "guess an id. Call delete_memory (with an id, same rule) only when the "
+            "user explicitly asks you to forget something, with no replacement fact. "
             "Use write_file when the user asks you to create, save, write out, or "
             "update a .txt or .md file - use mode 'overwrite' to replace a file's "
             "contents (or create a new one) and mode 'append' to add to the end of "
@@ -1843,7 +1916,9 @@ async def chat_completions(request: Request):
             print(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
             memory_recall_text = (
                 "Relevant things you remember about this user from past "
-                "conversations:\n" + "\n".join(f"- {m}" for m in relevant)
+                "conversations (id shown so you can call update_memory/delete_memory "
+                "directly if one of these needs correcting - never guess an id):\n"
+                + "\n".join(f"- [id: {m['id']}] {m['text']}" for m in relevant)
             )
             messages_to_prepend.append({"role": "system", "content": memory_recall_text})
             prepend_sections.append(("memory_recall", memory_recall_text))

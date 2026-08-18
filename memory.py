@@ -15,7 +15,9 @@ Storage is just JSON files + numpy cosine similarity - no external vector
 database needed at this scale (hundreds to a few thousand chunks/memories).
 """
 
+import datetime
 import json
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -58,33 +60,100 @@ def _cosine_search(query_vec, items, top_k=3, min_score=0.05):
 
 # --------------------------- Personal memory ---------------------------
 
+def _now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
 def _load_memories() -> list:
-    if MEMORY_FILE.exists():
-        return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-    return []
+    if not MEMORY_FILE.exists():
+        return []
+    memories = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+
+    # Migration: older memories.json entries (pre-ID) only have text/embedding.
+    # Backfill id/created_at/updated_at in place so the file only needs to be
+    # upgraded once, on first load after this change ships.
+    migrated = False
+    for m in memories:
+        if "id" not in m:
+            m["id"] = uuid.uuid4().hex[:8]
+            migrated = True
+        if "created_at" not in m:
+            m["created_at"] = _now_iso()
+            migrated = True
+        if "updated_at" not in m:
+            m["updated_at"] = m["created_at"]
+            migrated = True
+    if migrated:
+        _save_memories(memories)
+
+    return memories
 
 
 def _save_memories(memories: list):
     MEMORY_FILE.write_text(json.dumps(memories, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_memory(text: str):
+def save_memory(text: str) -> str:
+    """Append a new memory. Returns its id."""
     memories = _load_memories()
-    memories.append({"text": text, "embedding": embed(text)})
+    new_id = uuid.uuid4().hex[:8]
+    now = _now_iso()
+    memories.append({
+        "id": new_id,
+        "text": text,
+        "embedding": embed(text),
+        "created_at": now,
+        "updated_at": now,
+    })
     _save_memories(memories)
+    return new_id
+
+
+def update_memory(memory_id: str, new_text: str) -> str:
+    """Replace an existing memory's text in place, by id. Returns a status
+    string - never raises, since this is called from a model tool wrapper."""
+    memories = _load_memories()
+    for m in memories:
+        if m["id"] == memory_id:
+            old_text = m["text"]
+            m["text"] = new_text
+            m["embedding"] = embed(new_text)
+            m["updated_at"] = _now_iso()
+            _save_memories(memories)
+            return f"Updated memory {memory_id} (was: {old_text!r}) -> {new_text!r}"
+    return f"No memory found with id {memory_id!r}. Use list_memories or search_memories to find the correct id."
+
+
+def delete_memory(memory_id: str) -> str:
+    """Remove a memory by id. Returns a status string - never raises."""
+    memories = _load_memories()
+    for m in memories:
+        if m["id"] == memory_id:
+            memories.remove(m)
+            _save_memories(memories)
+            return f"Deleted memory {memory_id}: {m['text']!r}"
+    return f"No memory found with id {memory_id!r}. Use list_memories or search_memories to find the correct id."
+
+
+def list_memories() -> list:
+    """Return every saved memory as {id, text}, most recently updated first."""
+    memories = _load_memories()
+    memories = sorted(memories, key=lambda m: m["updated_at"], reverse=True)
+    return [{"id": m["id"], "text": m["text"]} for m in memories]
 
 
 def search_memories(query: str, top_k: int = 3) -> list:
+    """Return relevant memories as [{"id": ..., "text": ...}, ...]."""
     memories = _load_memories()
     results = _cosine_search(embed(query), memories, top_k=top_k, min_score=MEMORY_SIMILARITY_THRESHOLD)
     print(f"[MEMORY] Query: {query!r}")
     for m, score in results:
-        print(f"[MEMORY]   {score:.3f}  {m['text']}")
+        print(f"[MEMORY]   {score:.3f}  [{m['id']}] {m['text']}")
     if not results:
         all_scored = _cosine_search(embed(query), memories, top_k=3, min_score=-1)
         for m, score in all_scored:
-            print(f"[MEMORY]   (below threshold) {score:.3f}  {m['text']}")
-    return [m["text"] for m, score in results]
+            print(f"[MEMORY]   (below threshold) {score:.3f}  [{m['id']}] {m['text']}")
+    return [{"id": m["id"], "text": m["text"]} for m, score in results]
 
 
 # --------------------------- Document RAG ---------------------------
