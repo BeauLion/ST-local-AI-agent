@@ -264,6 +264,32 @@ def list_memories() -> list:
     return [{"id": m["id"], "text": m["text"], "slot": m.get("slot"), "pinned": m.get("pinned", False)} for m in ordered]
 
 
+def list_memories_full() -> list:
+    """Like list_memories(), but includes created_at/updated_at and skips
+    the token-saving omission that's fine for model context but not for a
+    browsing UI. Same slots-first-then-recent ordering. Excludes the
+    embedding vector (never needed client-side)."""
+    memories = _load_memories()
+    slot_order = {s: i for i, s in enumerate(MEMORY_IDENTITY_SLOTS)}
+    slotted = sorted(
+        (m for m in memories if m.get("slot") in slot_order),
+        key=lambda m: slot_order[m["slot"]],
+    )
+    rest = sorted(
+        (m for m in memories if m.get("slot") not in slot_order),
+        key=lambda m: m["updated_at"], reverse=True,
+    )
+    ordered = slotted + rest
+    return [
+        {
+            "id": m["id"], "text": m["text"], "slot": m.get("slot"),
+            "pinned": m.get("pinned", False),
+            "created_at": m.get("created_at"), "updated_at": m.get("updated_at"),
+        }
+        for m in ordered
+    ]
+
+
 def get_pinned_memories() -> list:
     """Return every always-injected memory (slots + freeform pins), in the
     same slots-first-then-recent order as list_memories. Used by the

@@ -28,7 +28,7 @@ import httpx
 from ddgs import DDGS
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 import calendar_manager
 import duration_manager
@@ -1495,6 +1495,52 @@ async def api_reorder_tasks(project_id: str, request: Request):
     except ProjectManagerError as e:
         _pm_error(e)
     return _serialize_project(project)
+
+
+# ---------------------------------------------------------------------------
+# Memory browser HTTP API - plain REST for the /memory-browser page. Same
+# pattern as /projects above: the UI drives the exact same memory.py
+# functions the model's tools use, so they can never disagree about state.
+# ---------------------------------------------------------------------------
+
+@app.get("/memories")
+async def api_list_memories():
+    memories = await asyncio.to_thread(memory.list_memories_full)
+    return {"memories": memories}
+
+
+@app.patch("/memories/{memory_id}")
+async def api_update_memory(memory_id: str, request: Request):
+    body = await request.json()
+    all_memories = await asyncio.to_thread(memory._load_memories)
+    if not any(m["id"] == memory_id for m in all_memories):
+        raise HTTPException(status_code=404, detail="Memory not found.")
+
+    message = None
+    if "text" in body:
+        message = await asyncio.to_thread(memory.update_memory, memory_id, body["text"])
+    if "pinned" in body:
+        fn = memory.pin_memory if body["pinned"] else memory.unpin_memory
+        message = await asyncio.to_thread(fn, memory_id)
+
+    memories = await asyncio.to_thread(memory.list_memories_full)
+    updated = next((m for m in memories if m["id"] == memory_id), None)
+    return {"memory": updated, "message": message}
+
+
+@app.delete("/memories/{memory_id}")
+async def api_delete_memory(memory_id: str):
+    all_memories = await asyncio.to_thread(memory._load_memories)
+    if not any(m["id"] == memory_id for m in all_memories):
+        raise HTTPException(status_code=404, detail="Memory not found.")
+    await asyncio.to_thread(memory.delete_memory, memory_id)
+    return {"deleted": memory_id}
+
+
+@app.get("/memory-browser")
+async def memory_browser_page():
+    html_path = Path(__file__).parent / "web" / "memory_browser.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
