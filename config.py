@@ -89,6 +89,8 @@ def build_llama_server_command() -> list[str]:
         "--min-p", str(LLAMA_MIN_P),
         #"--reasoning-format", LLAMA_REASONING_FORMAT,
     ]
+    if AGENT_API_KEY:
+        cmd += ["--api-key", AGENT_API_KEY]
     if LLAMA_USE_JINJA:
         cmd.append("--jinja")
     return cmd
@@ -100,6 +102,13 @@ def build_llama_server_command() -> list[str]:
 
 AGENT_SERVER_HOST = "0.0.0.0"
 AGENT_SERVER_PORT = 8100
+
+# Shared secret SillyTavern must send as its connection's "API Key" to reach
+# /v1/chat/completions and /v1/models. Loaded from .env (see .env.example).
+# If left empty, auth is skipped entirely (with a console warning) so a
+# fresh clone still boots without extra setup - see verify_api_key() in
+# main.py. Deliberately NOT applied to /projects - see handover-21.
+AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
 
 # Ceiling on how many tool-call round-trips the agent will do before
 # forcing a final answer, to prevent infinite tool-calling loops.

@@ -26,7 +26,7 @@ import docker
 
 import httpx
 from ddgs import DDGS
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -38,6 +38,7 @@ from calendar_manager import CalendarError
 from duration_manager import DurationError
 from project_manager import ProjectManagerError
 from config import (
+    AGENT_API_KEY,
     CORS_ALLOWED_ORIGINS,
     DELETE_FILE_ALLOWED_EXTENSIONS,
     DOCKER_CPU_COUNT,
@@ -1193,9 +1194,25 @@ TOOL_FUNCTIONS = {
 
 # ---------------------------------------------------------------------------
 
-@app.get("/v1/models")
+def verify_api_key(authorization: str = Header(default="")):
+    """
+    Gatekeeper for the two SillyTavern-facing endpoints. SillyTavern's
+    Custom OpenAI-compatible connection sends its "API Key" field as a
+    standard 'Authorization: Bearer <key>' header - compared here against
+    AGENT_API_KEY from .env. Deliberately NOT applied to /projects (see
+    handover-21) - only the model-facing chat endpoints are gated for now.
+    If AGENT_API_KEY is unset, auth is skipped with a console warning
+    instead of hard-failing, so a fresh clone still boots.
+    """
+    if not AGENT_API_KEY:
+        print("[AUTH] WARNING: AGENT_API_KEY not set in .env - endpoint is unprotected.")
+        return
+    if authorization != f"Bearer {AGENT_API_KEY}":
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models():
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as client:
         resp = await client.get(f"{LLAMA_SERVER_URL}/v1/models")
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
@@ -1431,7 +1448,7 @@ async def agent_loop(upstream_body: dict):
     happens, the server-owned tools simply get called again next turn once
     the client resolves its half and sends the follow-up request.
     """
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=None, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as client:
         for _ in range(MAX_TOOL_ITERATIONS):
             content = ""
             tool_calls = {}
@@ -1634,7 +1651,7 @@ async def agent_loop(upstream_body: dict):
         yield ("done", {"role": "assistant", "content": bail_message})
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request):
     body = await request.json()
     client_wants_stream = body.get("stream", False)
@@ -1853,7 +1870,7 @@ async def chat_completions(request: Request):
         ("tools_schema", tools_schema_text),
     ] + prepend_sections
 
-    async with httpx.AsyncClient(timeout=10.0) as tokenize_client:
+    async with httpx.AsyncClient(timeout=10.0, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as tokenize_client:
         counts = await asyncio.gather(
             *(_count_tokens(tokenize_client, text) for _, text in sections)
         )
