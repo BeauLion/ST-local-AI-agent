@@ -165,6 +165,42 @@ MEMORY_DEDUPE_SIMILARITY_THRESHOLD = 0.65
 
 
 # ─────────────────────────────────────────────────────────────
+# Dynamic tool selection (main.py's select_tools) — sends only the tool
+# groups relevant to the user's last message instead of this server's full
+# ~28-tool schema on every request, to cut prompt tokens. Scored the same
+# way as memory recall: embed the query, cosine-similarity against a short
+# description of each tool group (see TOOL_GROUP_DESCRIPTIONS in main.py).
+# ─────────────────────────────────────────────────────────────
+
+# Master switch - False sends every tool on every request (the old
+# behavior), useful for A/B-ing prompt size against answer quality.
+TOOL_SELECTION_ENABLED = True
+
+# Minimum cosine-similarity score for a tool group to be included. Same
+# scale/reasoning as MEMORY_SIMILARITY_THRESHOLD above - needs live tuning;
+# the tool_selection_debug block _log_prompt() writes when PROMPT_LOG_ENABLED
+# is on (see main.py) shows every group's actual score, which is the
+# intended way to tune this from real traffic instead of guessing blind.
+TOOL_SELECTION_MIN_SCORE = 0.2
+
+# Secondary, much looser threshold used ONLY when nothing clears
+# TOOL_SELECTION_MIN_SCORE - rescues genuinely ambiguous tool requests
+# (e.g. oddly-phrased ones) without dragging in the full 34-tool list the
+# way an unconditional fallback would. Plain conversation, where nothing
+# clears even this, correctly gets just the core always-include set.
+TOOL_SELECTION_RESCUE_SCORE = 0.18
+
+# Cap on how many tools the rescue tier can add, so a weak/ambiguous match
+# still stays small rather than ballooning back toward "everything".
+TOOL_SELECTION_RESCUE_TOP_K = 3
+
+# Individual tool names always sent regardless of score - cheap, frequently
+# needed across unrelated requests, and their absence is confusing to a
+# user who expects e.g. "what's 12*7" to always work.
+TOOL_SELECTION_ALWAYS_INCLUDE = ("get_current_time", "calculate")
+
+
+# ─────────────────────────────────────────────────────────────
 # write_file tool
 # ─────────────────────────────────────────────────────────────
 
