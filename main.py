@@ -837,7 +837,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save a new, durable fact about the user for recall in future conversations (e.g. their preferences, ongoing projects). Do not save trivial small talk. If this fact corrects or replaces something already remembered, use update_memory instead - don't call save_memory for a fact that already exists in a different form. If the fact is their identity (name and/or pronouns - combined into a single slot), occupation, or location, pass the matching `slot` instead of leaving it plain - this makes it always visible to you in every future conversation, not just when it's semantically relevant, and safely overwrites any previous value for that slot instead of creating a duplicate. When saving to the `identity` slot, always include BOTH the name and pronouns in the text even if only one changed - it's a single field, so a partial update silently drops whichever part you leave out.",
+            "description": "Save a new, durable fact about the user (preferences, ongoing projects, etc.) for future recall. Skip trivial small talk. If this corrects/replaces an existing memory, use update_memory instead. For identity (name+pronouns, one combined slot), occupation, or location, pass `slot` - makes it always-visible every turn instead of only when relevant, and overwrites that slot instead of duplicating. For the `identity` slot, always include BOTH name and pronouns even if only one changed - it's one field, so a partial update silently drops whichever part you omit.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1027,7 +1027,7 @@ TOOLS = [
                 "properties": {
                     "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the same date for both start and end - that returns the whole day."},
                     "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start. Same value as start is valid and means 'just that one day'."},
-                    "calendar_name": {"type": "string", "description": "Only needed if the user has multiple iCloud calendars and named one. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": [],
             },
@@ -1044,7 +1044,7 @@ TOOLS = [
                     "query": {"type": "string", "description": "Keyword to search for."},
                     "start": {"type": "string", "description": "Optional start of search range, 'YYYY-MM-DD'. Defaults to 7 days ago."},
                     "end": {"type": "string", "description": "Optional end of search range, 'YYYY-MM-DD'. Defaults to 90 days ahead."},
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["query"],
             },
@@ -1054,7 +1054,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_create_event",
-            "description": "Propose creating a new REAL event on the user's iCloud calendar (an actual appointment, meeting, or plan - not an in-character/roleplay scheduled action). This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending.",
+            "description": "Stage creating a new REAL event on the user's iCloud calendar (an actual appointment, meeting, or plan - not an in-character/roleplay scheduled action). See the calendar write convention in your system context for the confirm step.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1063,7 +1063,7 @@ TOOLS = [
                     "end": {"type": "string", "description": "End time, same format. Defaults to 1 hour after start."},
                     "location": {"type": "string", "description": "Optional location."},
                     "description": {"type": "string", "description": "Optional notes/description."},
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["title", "start"],
             },
@@ -1074,17 +1074,12 @@ TOOLS = [
         "function": {
             "name": "calendar_create_events_batch",
             "description": (
-                "Stage MULTIPLE new calendar events at once as a SINGLE pending change - e.g. "
-                "a proposed schedule of task blocks for the morning. Use this instead of calling "
-                "calendar_create_event repeatedly whenever proposing more than one event together; "
-                "calendar_confirm_pending then creates all of them in one go. Before calling this, "
-                "check what's already on the calendar for the relevant time range "
-                "(calendar_list_events) so the times you propose don't conflict - this tool "
-                "validates that anyway and rejects the whole batch with a clear reason if any "
-                "proposed event overlaps another proposed event or an existing calendar event, so "
-                "you can adjust and retry. After staging, tell the user the full proposed schedule "
-                "and wait for their explicit confirmation in a separate message before calling "
-                "calendar_confirm_pending - never call it in the same response as this tool."
+                "Stage MULTIPLE new calendar events at once as a SINGLE pending change (e.g. a "
+                "proposed schedule of task blocks) - use instead of repeated calendar_create_event "
+                "calls; calendar_confirm_pending then creates all of them in one go. Validates "
+                "against existing events and against each other, rejecting the whole batch with a "
+                "clear reason if anything overlaps, so you can adjust and retry. See the calendar "
+                "write convention in your system context for the confirm step."
             ),
             "parameters": {
                 "type": "object",
@@ -1103,7 +1098,7 @@ TOOLS = [
                             "required": ["title", "start"],
                         },
                     },
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit to use the default calendar."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["events"],
             },
@@ -1113,7 +1108,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_edit_event",
-            "description": "Propose editing an existing iCloud calendar event by its UID (get this from calendar_list_events or calendar_search_events first - never guess a UID). This does NOT apply the edit yet - it only stages the change and returns a description of exactly what would change. Relay that to the user and get explicit confirmation before calling calendar_confirm_pending.",
+            "description": "Stage editing an existing iCloud calendar event by its UID (from calendar_list_events/calendar_search_events - never guess a UID). See the calendar write convention in your system context for the confirm step.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1123,7 +1118,7 @@ TOOLS = [
                     "end": {"type": "string", "description": "New end time, if changing it."},
                     "location": {"type": "string", "description": "New location, if changing it."},
                     "description": {"type": "string", "description": "New description/notes, if changing it."},
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["event_uid"],
             },
@@ -1133,12 +1128,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_delete_event",
-            "description": "Propose permanently deleting an existing iCloud calendar event by its UID (get this from calendar_list_events or calendar_search_events first - never guess a UID). This does NOT delete it yet - it only stages the change. Relay the description to the user and get explicit confirmation before calling calendar_confirm_pending.",
+            "description": "Stage permanently deleting an existing iCloud calendar event by its UID (from calendar_list_events/calendar_search_events - never guess a UID). See the calendar write convention in your system context for the confirm step.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "event_uid": {"type": "string", "description": "Exact UID of the event to delete, from a prior list/search result."},
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["event_uid"],
             },
@@ -1192,7 +1187,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "title": {"type": "string", "description": "Short, concrete, verb-led task title."},
                 },
                 "required": ["title"],
@@ -1207,7 +1202,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
                     "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                 },
@@ -1223,7 +1218,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
                     "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
                     "text": {"type": "string", "description": "Note text. Required for replace and append; omit for clear."},
@@ -1240,7 +1235,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit when the focused project is intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                 },
                 "required": ["status"],
@@ -1255,7 +1250,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "operations": {
                         "type": "array", "minItems": 1, "maxItems": 25,
                         "items": {
@@ -2139,6 +2134,25 @@ async def chat_completions(request: Request):
         messages_to_prepend.append({"role": "system", "content": calendar_context_text})
         prepend_sections.append(("calendar_cache", calendar_context_text))
     print(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
+
+    # Shared explanation of the calendar staging convention (propose -> confirm/cancel),
+    # sent once here instead of being repeated near-verbatim inside four separate
+    # tool descriptions (calendar_create_event, calendar_create_events_batch,
+    # calendar_edit_event, calendar_delete_event) - same information, sent once
+    # per request instead of four times.
+    calendar_staging_text = (
+        "Calendar write convention: calendar_create_event, "
+        "calendar_create_events_batch, calendar_edit_event, and "
+        "calendar_delete_event never apply immediately - each only stages a "
+        "pending change and returns a description of exactly what would "
+        "happen. Relay that description to the user and wait for their "
+        "explicit confirmation in a SEPARATE message before calling "
+        "calendar_confirm_pending - never call calendar_confirm_pending in "
+        "the same response as a staging call. If the user declines or wants "
+        "something different, call calendar_cancel_pending instead."
+    )
+    messages_to_prepend.append({"role": "system", "content": calendar_staging_text})
+    prepend_sections.append(("calendar_staging_convention", calendar_staging_text))
 
     # Auto-recall, part 1: pinned memories (identity slots + freeform pins)
     # are always shown, every turn, regardless of what's being discussed -
