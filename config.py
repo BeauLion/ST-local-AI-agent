@@ -116,6 +116,22 @@ MAX_TOOL_ITERATIONS = 8
 
 
 # ─────────────────────────────────────────────────────────────
+# Prompt inspection logging
+# ─────────────────────────────────────────────────────────────
+
+# Folder where the exact request body sent to llama-server gets logged.
+PROMPT_LOG_DIR = os.path.join(PROJECT_ROOT, "prompt_logs")
+
+# One log file is created per server run (a "session"). Every request to
+# llama-server appends one entry - full messages array, tools schema, and
+# sampling params, exactly as sent. Set False to disable without touching
+# main.py. Off cost to be aware of: the tools schema alone is several KB,
+# and it's re-logged on every single entry, so long sessions produce large
+# files - that's expected, this is a debug tool, not meant to run forever.
+PROMPT_LOG_ENABLED = True
+
+
+# ─────────────────────────────────────────────────────────────
 # Memory / RAG (memory.py)
 # ─────────────────────────────────────────────────────────────
 

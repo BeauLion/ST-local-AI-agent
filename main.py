@@ -17,6 +17,7 @@ import asyncio
 import json
 import re
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -50,6 +51,8 @@ from config import (
     LLAMA_SERVER_URL,
     MAX_TOOL_ITERATIONS,
     MEMORY_IDENTITY_SLOTS,
+    PROMPT_LOG_DIR,
+    PROMPT_LOG_ENABLED,
     SAFE_FILES_DIR,
     WRITE_FILE_ALLOWED_EXTENSIONS,
     WRITE_FILE_MAX_CHARS,
@@ -68,6 +71,40 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Prompt-inspection logging: writes the EXACT JSON body this server sends to
+# llama-server (real, final prompt - system messages, full history, tools
+# schema, sampling params) to one file per server run. This is ground truth
+# of what the model actually saw - different from the per-section token-
+# count diagnostic further down, which only measures size, not content.
+# ---------------------------------------------------------------------------
+_PROMPT_LOG_DIR = Path(PROMPT_LOG_DIR)
+_PROMPT_LOG_DIR.mkdir(exist_ok=True)
+SESSION_LOG_PATH = _PROMPT_LOG_DIR / f"session_{datetime.now():%Y%m%d_%H%M%S}.log"
+_prompt_log_lock = threading.Lock()
+
+
+def _log_prompt(upstream_body: dict, iteration: int) -> None:
+    """Append the exact request body about to be POSTed to llama-server's
+    /v1/chat/completions to this run's session log file. One entry per
+    tool-calling iteration - a multi-step turn produces multiple entries,
+    each the real prompt for that specific request. Best-effort: a write
+    failure is printed but never blocks the actual turn."""
+    if not PROMPT_LOG_ENABLED:
+        return
+    try:
+        entry = (
+            f"\n{'=' * 100}\n"
+            f"[{datetime.now().isoformat()}] iteration {iteration}\n"
+            f"{'=' * 100}\n"
+            f"{json.dumps(upstream_body, indent=2, ensure_ascii=False)}\n"
+        )
+        with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception as e:
+        print(f"[AGENT] Prompt log write failed: {e}")
 
 
 class LlamaServerError(Exception):
@@ -1626,12 +1663,13 @@ async def agent_loop(upstream_body: dict):
     the client resolves its half and sends the follow-up request.
     """
     async with httpx.AsyncClient(timeout=None, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as client:
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for iteration in range(MAX_TOOL_ITERATIONS):
             content = ""
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
 
             try:
+                _log_prompt(upstream_body, iteration)
                 async for chunk in _stream_chat(client, upstream_body):
                     delta = chunk["choices"][0].get("delta", {})
 
