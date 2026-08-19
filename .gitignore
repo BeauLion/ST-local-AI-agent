@@ -41,3 +41,5 @@ prompt_logs/*
 .DS_Store
 Thumbs.db
 calendar_data/context_cache.json
+
+audit_tool_tokens.py
