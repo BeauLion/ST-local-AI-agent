@@ -197,7 +197,7 @@ TOOL_SELECTION_RESCUE_TOP_K = 3
 # Individual tool names always sent regardless of score - cheap, frequently
 # needed across unrelated requests, and their absence is confusing to a
 # user who expects e.g. "what's 12*7" to always work.
-TOOL_SELECTION_ALWAYS_INCLUDE = ("get_current_time", "calculate")
+TOOL_SELECTION_ALWAYS_INCLUDE = ("get_current_time", "calculate", "run_python")
 
 
 # ─────────────────────────────────────────────────────────────
