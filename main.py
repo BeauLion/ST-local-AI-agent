@@ -86,23 +86,43 @@ SESSION_LOG_PATH = _PROMPT_LOG_DIR / f"session_{datetime.now():%Y%m%d_%H%M%S}.lo
 _prompt_log_lock = threading.Lock()
 
 
-def _log_prompt(upstream_body: dict, iteration: int) -> None:
-    """Append the exact request body about to be POSTed to llama-server's
-    /v1/chat/completions to this run's session log file. One entry per
-    tool-calling iteration - a multi-step turn produces multiple entries,
-    each the real prompt for that specific request. Best-effort: a write
-    failure is printed but never blocks the actual turn."""
+def _log_prompt(upstream_body: dict, iteration: int, section_labels: list[str]) -> None:
+    """Append one JSON object (one line) to this run's session log file,
+    describing the exact request about to be POSTed to llama-server. Each
+    message is tagged with a `section` label so the log viewer page can
+    filter by chunk type, not just role. section_labels is positional -
+    section_labels[i] describes upstream_body["messages"][i]; anything
+    beyond that list's length is ordinary conversation history/tool-call
+    round-trip messages, which grow between iterations. Best-effort: a
+    write failure is printed but never blocks the actual turn."""
     if not PROMPT_LOG_ENABLED:
         return
     try:
-        entry = (
-            f"\n{'=' * 100}\n"
-            f"[{datetime.now().isoformat()}] iteration {iteration}\n"
-            f"{'=' * 100}\n"
-            f"{json.dumps(upstream_body, indent=2, ensure_ascii=False)}\n"
-        )
+        chunks = []
+        for i, msg in enumerate(upstream_body["messages"]):
+            section = section_labels[i] if i < len(section_labels) else "conversation"
+            content = msg.get("content")
+            if content is None and msg.get("tool_calls"):
+                content = json.dumps(msg["tool_calls"])
+            chunks.append({
+                "role": msg.get("role", "unknown"),
+                "section": section,
+                "content": content or "",
+            })
+        if upstream_body.get("tools"):
+            chunks.append({
+                "role": "tools",
+                "section": "tools_schema",
+                "content": json.dumps(upstream_body["tools"], indent=2),
+            })
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "iteration": iteration,
+            "model": upstream_body.get("model"),
+            "chunks": chunks,
+        }
         with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(entry)
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[AGENT] Prompt log write failed: {e}")
 
@@ -1580,6 +1600,51 @@ async def memory_browser_page():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
+# ---------------------------------------------------------------------------
+# Prompt-log viewer HTTP API - plain REST for the /prompt-log-viewer page,
+# reading the JSONL files _log_prompt() writes to PROMPT_LOG_DIR.
+# ---------------------------------------------------------------------------
+
+@app.get("/prompt-logs")
+async def list_prompt_logs():
+    """Lists available session log files, most recent first."""
+    files = sorted(_PROMPT_LOG_DIR.glob("session_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [
+        {
+            "filename": f.name,
+            "size_kb": round(f.stat().st_size / 1024, 1),
+            "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+        }
+        for f in files
+    ]
+
+
+@app.get("/prompt-logs/{filename}")
+async def get_prompt_log(filename: str):
+    """Returns one session log file's entries, parsed from JSONL."""
+    safe_name = Path(filename).name  # strips any path components - blocks traversal
+    path = _PROMPT_LOG_DIR / safe_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Log file not found")
+    entries = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"[AGENT] Skipping malformed log line {line_num} in {filename}")
+    return entries
+
+
+@app.get("/prompt-log-viewer")
+async def prompt_log_viewer_page():
+    html_path = Path(__file__).parent / "web" / "prompt_log_viewer.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
     """POST one chat-completion request with stream=True and yield the
     decoded JSON of each SSE chunk from llama-server."""
@@ -1631,7 +1696,7 @@ async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
         return None
 
 
-async def agent_loop(upstream_body: dict):
+async def agent_loop(upstream_body: dict, section_labels: list[str] | None = None):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
     way. Yields:
@@ -1668,8 +1733,8 @@ async def agent_loop(upstream_body: dict):
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
 
+            _log_prompt(upstream_body, iteration, section_labels or [])
             try:
-                _log_prompt(upstream_body, iteration)
                 async for chunk in _stream_chat(client, upstream_body):
                     delta = chunk["choices"][0].get("delta", {})
 
@@ -2134,6 +2199,14 @@ async def chat_completions(request: Request):
     # fixed cost in the whole prompt.
     tools_schema_text = json.dumps(upstream_body["tools"])
 
+    # Positional labels aligned to upstream_body["messages"] indices, used
+    # only by _log_prompt (see prompt-log-viewer). Order matches exactly
+    # how messages_to_prepend + the original messages get concatenated
+    # below - see that line for why this ordering is safe to rely on.
+    message_section_labels = [name for name, _ in prepend_sections]
+    if character_card_text is not None:
+        message_section_labels.append("character_card")
+
     sections = [
         ("character_card", character_card_text),
         ("tools_schema", tools_schema_text),
@@ -2170,7 +2243,7 @@ async def chat_completions(request: Request):
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
         finish_reason = "stop"
-        async for kind, payload in agent_loop(upstream_body):
+        async for kind, payload in agent_loop(upstream_body, message_section_labels):
             if kind in ("done", "handoff"):
                 final_message = payload
                 finish_reason = "tool_calls" if kind == "handoff" else "stop"
@@ -2197,7 +2270,7 @@ async def chat_completions(request: Request):
         return f"data: {json.dumps(payload)}\n\n".encode()
 
     async def event_stream():
-        async for kind, payload in agent_loop(upstream_body):
+        async for kind, payload in agent_loop(upstream_body, message_section_labels):
             if kind == "delta":
                 yield sse({"index": 0, "delta": {"content": payload}, "finish_reason": None})
                 continue
