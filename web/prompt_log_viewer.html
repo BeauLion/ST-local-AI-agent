@@ -97,6 +97,31 @@
   label.chk input { accent-color: var(--accent); }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 
+  .req-item {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-bottom: 2px;
+    border: 1px solid transparent;
+  }
+  .req-item:hover { background: var(--panel-2); }
+  .req-item.active {
+    background: #223047;
+    border-color: var(--accent);
+  }
+  .req-item .req-title {
+    font-size: 12.5px;
+    color: var(--text);
+    font-family: var(--mono);
+  }
+  .req-item .req-meta {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
   main { flex: 1; padding: 18px 22px; max-width: 980px; }
   .status { color: var(--text-dim); font-size: 13px; margin-bottom: 14px; }
 
@@ -186,6 +211,8 @@
 
 <div class="layout">
   <div class="sidebar">
+    <h2>Request</h2>
+    <div id="requestFilter"></div>
     <h2>Role</h2>
     <div id="roleFilters"></div>
     <h2>Chunk / Section</h2>
@@ -207,6 +234,7 @@ const ROLE_COLORS = {
 let allEntries = [];
 let activeRoles = new Set();
 let activeSections = new Set();
+let selectedEntryIndex = null; // null = show all requests
 
 async function loadFileList() {
   const res = await fetch('/prompt-logs');
@@ -231,8 +259,40 @@ async function loadFile(filename) {
   document.getElementById('status').textContent = 'Loading ' + filename + '...';
   const res = await fetch('/prompt-logs/' + encodeURIComponent(filename));
   allEntries = await res.json();
+  selectedEntryIndex = null;
+  buildRequestList();
   buildFilterLists();
   render();
+}
+
+function buildRequestList() {
+  const box = document.getElementById('requestFilter');
+  box.innerHTML = '';
+
+  const allItem = document.createElement('div');
+  allItem.className = 'req-item' + (selectedEntryIndex === null ? ' active' : '');
+  allItem.innerHTML = `<span class="req-title">All requests</span><span class="req-meta">${allEntries.length} total</span>`;
+  allItem.addEventListener('click', () => {
+    selectedEntryIndex = null;
+    buildRequestList();
+    render();
+  });
+  box.appendChild(allItem);
+
+  allEntries.forEach((entry, idx) => {
+    const time = (entry.timestamp || '').split('T')[1]?.split('.')[0] || entry.timestamp || '?';
+    const item = document.createElement('div');
+    item.className = 'req-item' + (selectedEntryIndex === idx ? ' active' : '');
+    item.innerHTML = `
+      <span class="req-title">iteration ${entry.iteration} &middot; ${time}</span>
+      <span class="req-meta">${entry.chunks.length} chunks</span>`;
+    item.addEventListener('click', () => {
+      selectedEntryIndex = idx;
+      buildRequestList();
+      render();
+    });
+    box.appendChild(item);
+  });
 }
 
 function buildFilterLists() {
@@ -305,7 +365,11 @@ function render() {
   let shownIterations = 0;
   let shownChunks = 0;
 
-  for (const entry of allEntries) {
+  const entriesToShow = selectedEntryIndex === null
+    ? allEntries
+    : [allEntries[selectedEntryIndex]];
+
+  for (const entry of entriesToShow) {
     const matchingChunks = entry.chunks.filter(c => {
       if (!activeRoles.has(c.role)) return false;
       if (!activeSections.has(c.section)) return false;
@@ -344,9 +408,12 @@ function render() {
     resultsEl.appendChild(iterDiv);
   }
 
+  const focusNote = selectedEntryIndex === null
+    ? (allEntries.length ? ` (of ${allEntries.length} logged requests total)` : '')
+    : ` (focused on iteration ${allEntries[selectedEntryIndex]?.iteration})`;
   document.getElementById('status').textContent =
     `${shownIterations} request${shownIterations === 1 ? '' : 's'} / ${shownChunks} chunk${shownChunks === 1 ? '' : 's'} shown`
-    + (allEntries.length ? ` (of ${allEntries.length} logged requests total)` : '');
+    + focusNote;
 
   if (!shownChunks) {
     resultsEl.innerHTML = '<div class="empty">No chunks match the current filters.</div>';
