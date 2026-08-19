@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory Browser</title>
+<style>
+  :root{
+    --bg: #12141a;
+    --panel: #181b22;
+    --card: #1c2029;
+    --card-hover: #212635;
+    --border: #262b36;
+    --text: #e7e5e0;
+    --text-dim: #9096a6;
+    --text-faint: #5b6172;
+    --accent: #7c9eff;
+    --accent-dim: #3d4a7a;
+    --pin: #e6b45e;
+    --pin-dim: #4a3f27;
+    --danger: #e2685f;
+    --danger-dim: #4a2b28;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --sans: -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  *{ box-sizing: border-box; }
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:var(--sans); -webkit-font-smoothing:antialiased;
+  }
+  .wrap{ max-width:840px; margin:0 auto; padding:36px 20px 80px; }
+
+  header{ margin-bottom:28px; }
+  .eyebrow{
+    font-family:var(--mono); font-size:11px; letter-spacing:.12em;
+    color:var(--text-faint); text-transform:uppercase; margin:0 0 6px;
+  }
+  h1{ font-size:26px; font-weight:650; margin:0 0 4px; letter-spacing:-.01em; }
+  .sub{ color:var(--text-dim); font-size:13.5px; margin:0; }
+
+  .toolbar{
+    display:flex; gap:10px; align-items:center; margin:22px 0 18px;
+    flex-wrap:wrap;
+  }
+  .search{
+    flex:1; min-width:200px; background:var(--panel); border:1px solid var(--border);
+    border-radius:8px; padding:10px 12px; color:var(--text); font-size:14px;
+    font-family:var(--sans);
+  }
+  .search:focus{ outline:none; border-color:var(--accent-dim); }
+  .search::placeholder{ color:var(--text-faint); }
+
+  .toggle-group{ display:flex; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:2px; }
+  .toggle-group button{
+    border:none; background:transparent; color:var(--text-dim); font-size:12.5px;
+    padding:7px 12px; border-radius:6px; cursor:pointer; font-family:var(--sans);
+  }
+  .toggle-group button.active{ background:var(--card-hover); color:var(--text); }
+
+  .icon-btn{
+    background:var(--panel); border:1px solid var(--border); color:var(--text-dim);
+    border-radius:8px; padding:9px 12px; cursor:pointer; font-size:12.5px;
+    font-family:var(--sans);
+  }
+  .icon-btn:hover{ color:var(--text); border-color:var(--accent-dim); }
+
+  .count{ font-family:var(--mono); font-size:11.5px; color:var(--text-faint); margin:0 0 14px; }
+
+  .card{
+    background:var(--card); border:1px solid var(--border); border-radius:10px;
+    padding:15px 16px 13px; margin-bottom:10px; transition:border-color .12s;
+  }
+  .card:hover{ border-color:#33394a; }
+  .card.pinned{ border-left:2px solid var(--pin); }
+  .card.slot{ border-left:2px solid var(--accent); }
+
+  .card-top{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+  .badges{ display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap; }
+  .badge{
+    font-family:var(--mono); font-size:10px; letter-spacing:.04em; text-transform:uppercase;
+    padding:2px 7px; border-radius:20px; border:1px solid transparent;
+  }
+  .badge.slot{ color:var(--accent); border-color:var(--accent-dim); background:rgba(124,158,255,.08); }
+  .badge.pinned{ color:var(--pin); border-color:var(--pin-dim); background:rgba(230,180,94,.08); }
+
+  .text{ font-size:14.5px; line-height:1.5; margin:0; white-space:pre-wrap; word-break:break-word; }
+  .text.editing{ display:none; }
+
+  textarea.edit-box{
+    width:100%; background:var(--panel); border:1px solid var(--accent-dim); border-radius:6px;
+    color:var(--text); font-family:var(--sans); font-size:14.5px; line-height:1.5;
+    padding:8px 10px; resize:vertical; min-height:60px;
+  }
+  textarea.edit-box:focus{ outline:none; }
+
+  .meta-row{
+    display:flex; justify-content:space-between; align-items:center; margin-top:10px;
+    padding-top:10px; border-top:1px solid var(--border);
+  }
+  .meta{ font-family:var(--mono); font-size:10.5px; color:var(--text-faint); }
+  .meta span{ margin-right:12px; }
+
+  .actions{ display:flex; gap:6px; }
+  .actions button{
+    background:transparent; border:1px solid var(--border); color:var(--text-dim);
+    font-family:var(--sans); font-size:11.5px; padding:5px 10px; border-radius:6px; cursor:pointer;
+  }
+  .actions button:hover{ color:var(--text); border-color:#3a4050; }
+  .actions button.pin-on{ color:var(--pin); border-color:var(--pin-dim); }
+  .actions button.danger:hover{ color:var(--danger); border-color:var(--danger-dim); }
+  .actions button.save{ color:var(--accent); border-color:var(--accent-dim); }
+  .actions button:disabled{ opacity:.35; cursor:default; }
+
+  .empty{ text-align:center; padding:60px 20px; color:var(--text-faint); }
+  .empty .glyph{ font-family:var(--mono); font-size:28px; margin-bottom:10px; opacity:.5; }
+
+  .toast{
+    position:fixed; bottom:22px; left:50%; transform:translateX(-50%) translateY(0);
+    background:var(--panel); border:1px solid var(--border); color:var(--text);
+    padding:10px 16px; border-radius:8px; font-size:13px; opacity:0; pointer-events:none;
+    transition:opacity .2s, transform .2s; max-width:90%; text-align:center;
+  }
+  .toast.show{ opacity:1; transform:translateX(-50%) translateY(-6px); }
+  .toast.err{ border-color:var(--danger-dim); color:#f0a8a2; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">local agent &middot; memory store</p>
+    <h1>Memory Browser</h1>
+    <p class="sub">Everything the agent has chosen to remember about you, readable — not raw JSON.</p>
+  </header>
+
+  <div class="toolbar">
+    <input class="search" id="search" type="text" placeholder="Filter memories&hellip;">
+    <div class="toggle-group" id="filterGroup">
+      <button data-filter="all" class="active">All</button>
+      <button data-filter="pinned">Pinned</button>
+    </div>
+    <button class="icon-btn" id="refreshBtn">Refresh</button>
+  </div>
+
+  <p class="count" id="count"></p>
+  <div id="list"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = ""; // same origin as this page
+let memories = [];
+let filter = "all";
+
+const listEl = document.getElementById("list");
+const countEl = document.getElementById("count");
+const searchEl = document.getElementById("search");
+const toastEl = document.getElementById("toast");
+
+function showToast(msg, isErr){
+  toastEl.textContent = msg;
+  toastEl.className = "toast show" + (isErr ? " err" : "");
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { toastEl.className = "toast"; }, 3200);
+}
+
+function fmtDate(iso){
+  if(!iso) return "";
+  const d = new Date(iso);
+  if(isNaN(d)) return iso;
+  return d.toLocaleDateString(undefined, {year:"numeric", month:"short", day:"numeric"}) +
+    " " + d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit"});
+}
+
+async function loadMemories(){
+  try{
+    const res = await fetch(`${API}/memories`);
+    if(!res.ok) throw new Error(`Server returned ${res.status}`);
+    const data = await res.json();
+    memories = data.memories || [];
+    render();
+  }catch(e){
+    listEl.innerHTML = `<div class="empty"><div class="glyph">&times;</div>Couldn't reach the agent server.<br>Is it running on this address?</div>`;
+    countEl.textContent = "";
+    showToast(e.message, true);
+  }
+}
+
+function matchesSearch(m, q){
+  if(!q) return true;
+  q = q.toLowerCase();
+  return m.text.toLowerCase().includes(q) || (m.slot || "").toLowerCase().includes(q);
+}
+
+function render(){
+  const q = searchEl.value.trim();
+  const filtered = memories.filter(m => {
+    if(filter === "pinned" && !m.pinned) return false;
+    return matchesSearch(m, q);
+  });
+
+  countEl.textContent = `${filtered.length} of ${memories.length} memories`;
+
+  if(filtered.length === 0){
+    listEl.innerHTML = `<div class="empty"><div class="glyph">&mdash;</div>Nothing here${q ? " for that search" : ""}.</div>`;
+    return;
+  }
+
+  listEl.innerHTML = "";
+  for(const m of filtered) listEl.appendChild(renderCard(m));
+}
+
+function renderCard(m){
+  const card = document.createElement("div");
+  card.className = "card" + (m.pinned ? " pinned" : "") + (m.slot ? " slot" : "");
+
+  const badges = [];
+  if(m.slot) badges.push(`<span class="badge slot">${escapeHtml(m.slot)}</span>`);
+  if(m.pinned) badges.push(`<span class="badge pinned">pinned</span>`);
+
+  card.innerHTML = `
+    <div class="badges">${badges.join("")}</div>
+    <p class="text">${escapeHtml(m.text)}</p>
+    <textarea class="edit-box" style="display:none">${escapeHtml(m.text)}</textarea>
+    <div class="meta-row">
+      <div class="meta">
+        <span>id ${m.id}</span><span>updated ${fmtDate(m.updated_at)}</span>
+      </div>
+      <div class="actions"></div>
+    </div>
+  `;
+
+  const textEl = card.querySelector(".text");
+  const editBox = card.querySelector(".edit-box");
+  const actions = card.querySelector(".actions");
+
+  function buildActions(editing){
+    actions.innerHTML = "";
+    if(editing){
+      const save = mkBtn("Save", "save", async () => {
+        const newText = editBox.value.trim();
+        if(!newText) return showToast("Memory text can't be empty.", true);
+        await patchMemory(m.id, { text: newText });
+      });
+      const cancel = mkBtn("Cancel", "", () => {
+        editBox.value = m.text;
+        toggleEdit(false);
+      });
+      actions.append(save, cancel);
+    }else{
+      const pinBtn = mkBtn(m.pinned ? "Unpin" : "Pin", m.pinned ? "pin-on" : "", async () => {
+        await patchMemory(m.id, { pinned: !m.pinned });
+      });
+      if(m.slot) pinBtn.disabled = true; // slots are always-pinned by design
+      const editBtn = mkBtn("Edit", "", () => toggleEdit(true));
+      const delBtn = mkBtn("Delete", "danger", () => confirmDelete(m));
+      actions.append(pinBtn, editBtn, delBtn);
+    }
+  }
+
+  function toggleEdit(on){
+    textEl.style.display = on ? "none" : "block";
+    editBox.style.display = on ? "block" : "none";
+    buildActions(on);
+  }
+
+  buildActions(false);
+  return card;
+}
+
+function mkBtn(label, cls, onClick){
+  const b = document.createElement("button");
+  b.textContent = label;
+  if(cls) b.className = cls;
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+function confirmDelete(m){
+  const warn = m.slot
+    ? `This is your "${m.slot}" identity memory — deleting it clears that slot. Delete anyway?`
+    : "Delete this memory? This can't be undone.";
+  if(confirm(warn)) deleteMemory(m.id);
+}
+
+async function patchMemory(id, body){
+  try{
+    const res = await fetch(`${API}/memories/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if(!res.ok) throw new Error(`Server returned ${res.status}`);
+    const data = await res.json();
+    const idx = memories.findIndex(x => x.id === id);
+    if(idx !== -1 && data.memory) memories[idx] = data.memory;
+    if(data.message) showToast(data.message);
+    render();
+  }catch(e){
+    showToast(`Couldn't save: ${e.message}`, true);
+  }
+}
+
+async function deleteMemory(id){
+  try{
+    const res = await fetch(`${API}/memories/${id}`, { method: "DELETE" });
+    if(!res.ok) throw new Error(`Server returned ${res.status}`);
+    memories = memories.filter(x => x.id !== id);
+    render();
+    showToast("Memory deleted.");
+  }catch(e){
+    showToast(`Couldn't delete: ${e.message}`, true);
+  }
+}
+
+function escapeHtml(s){
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : s;
+  return d.innerHTML;
+}
+
+document.getElementById("filterGroup").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-filter]");
+  if(!btn) return;
+  filter = btn.dataset.filter;
+  document.querySelectorAll("#filterGroup button").forEach(b => b.classList.toggle("active", b === btn));
+  render();
+});
+searchEl.addEventListener("input", render);
+document.getElementById("refreshBtn").addEventListener("click", loadMemories);
+
+loadMemories();
+</script>
+</body>
+</html>

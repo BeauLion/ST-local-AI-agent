@@ -116,6 +116,22 @@ MAX_TOOL_ITERATIONS = 8
 
 
 # ─────────────────────────────────────────────────────────────
+# Prompt inspection logging
+# ─────────────────────────────────────────────────────────────
+
+# Folder where the exact request body sent to llama-server gets logged.
+PROMPT_LOG_DIR = os.path.join(PROJECT_ROOT, "prompt_logs")
+
+# One log file is created per server run (a "session"). Every request to
+# llama-server appends one entry - full messages array, tools schema, and
+# sampling params, exactly as sent. Set False to disable without touching
+# main.py. Off cost to be aware of: the tools schema alone is several KB,
+# and it's re-logged on every single entry, so long sessions produce large
+# files - that's expected, this is a debug tool, not meant to run forever.
+PROMPT_LOG_ENABLED = True
+
+
+# ─────────────────────────────────────────────────────────────
 # Memory / RAG (memory.py)
 # ─────────────────────────────────────────────────────────────
 
@@ -128,6 +144,24 @@ MEMORY_SIMILARITY_THRESHOLD = 0.15
 # Stricter threshold for document RAG (search_documents), since documents
 # are larger/noisier than short personal-memory facts.
 DOCUMENT_SIMILARITY_THRESHOLD = 0.3
+
+# Fixed, singleton identity facts. Always injected into every system
+# prompt regardless of query (see main.py's auto-recall block); saved via
+# save_memory's optional `slot` param, which upserts instead of appending.
+# See brainstorm-memory-structure-and-dedupe.md for the full design.
+MEMORY_IDENTITY_SLOTS = ("identity", "occupation", "location")
+
+# Cap on freeform (non-slot) pinned memories, toggled via pin_memory/
+# unpin_memory. Slots don't count against this - they're bounded
+# separately by MEMORY_IDENTITY_SLOTS itself (max 4).
+MEMORY_MAX_FREEFORM_PINS = 10
+
+# Similarity threshold for save_memory's dedupe nudge - deliberately
+# higher than MEMORY_SIMILARITY_THRESHOLD (recall) since this needs to
+# avoid flagging merely-related facts as duplicates, only near-identical
+# or contradicting ones. Starting point only - needs live tuning against
+# real memories once this is in use.
+MEMORY_DEDUPE_SIMILARITY_THRESHOLD = 0.65
 
 
 # ─────────────────────────────────────────────────────────────

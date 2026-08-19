@@ -28,6 +28,7 @@ case) - staging a new one silently replaces whatever was staged before.
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -269,6 +270,43 @@ def _ical_field(component, name: str, default: str = ""):
     if hasattr(value, "dt"):
         return str(value.dt)
     return str(value)
+
+
+# Emoji and similar multi-byte symbol characters have been observed to make
+# iCloud's CalDAV server hang instead of failing cleanly - live-tested case
+# was a title containing an emoji, which caused repeated write timeouts
+# (through all CALENDAR_WRITE_RETRIES) until the emoji was removed by hand.
+# Likely cause: something in the caldav/icalendar/HTTP stack miscalculates
+# Content-Length for 4-byte UTF-8 characters, so iCloud's server waits for
+# bytes that never arrive. Rather than patch that stack, unsafe characters
+# are stripped from free-text fields before a change is even staged, so the
+# staged preview the user sees already reflects exactly what will be sent.
+_UNSAFE_TEXT_PATTERN = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"  # regional indicator symbols (flag emoji)
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F680-\U0001F6FF"  # transport & map symbols
+    "\U0001F900-\U0001F9FF"  # supplemental symbols & pictographs
+    "\U0001FA00-\U0001FAFF"  # symbols & pictographs extended-A
+    "\U00002600-\U000026FF"  # misc symbols
+    "\U00002700-\U000027BF"  # dingbats
+    "\U00002B00-\U00002BFF"  # misc symbols and arrows
+    "\U0000FE0F"             # variation selector-16 (emoji presentation)
+    "\U0000200D"             # zero-width joiner (emoji sequences, e.g. family emoji)
+    "]+"
+)
+
+
+def _strip_unsafe_text(value: str) -> str:
+    """Remove emoji/symbol characters from a free-text field (title,
+    location, description) before it's staged. Collapses any resulting
+    double-spaces left behind by the removal. Safe to call on None/empty -
+    returns it unchanged."""
+    if not value:
+        return value
+    cleaned = _UNSAFE_TEXT_PATTERN.sub("", value)
+    return re.sub(r" {2,}", " ", cleaned).strip()
 
 
 def _event_to_dict(event, calendar_label: str = "") -> dict:
@@ -696,6 +734,15 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
                         description: str = "", calendar_name: str = None) -> str:
     if not title or not title.strip():
         raise CalendarError("An event title is required.")
+    title = _strip_unsafe_text(title)
+    location = _strip_unsafe_text(location)
+    description = _strip_unsafe_text(description)
+    if not title:
+        raise CalendarError(
+            "An event title is required (the title given was emoji/symbols "
+            "only, which had to be removed - see calendar_manager.py's "
+            "_strip_unsafe_text for why)."
+        )
     cal = _resolve_calendar(calendar_name)  # validated up front so a bad name fails before staging
     start_dt = _parse_datetime(start)
     end_dt = _parse_datetime(end) if end else start_dt + timedelta(hours=1)
@@ -791,7 +838,7 @@ def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
 
     prepared = []
     for i, ev in enumerate(events):
-        title = str(ev.get("title") or "").strip()
+        title = _strip_unsafe_text(str(ev.get("title") or "").strip())
         if not title:
             raise CalendarError(f"Event {i + 1}: a title is required.")
         start_raw = ev.get("start")
@@ -809,8 +856,8 @@ def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
             "title": title,
             "start_dt": _localize(start_dt),
             "end_dt": _localize(end_dt),
-            "location": str(ev.get("location") or ""),
-            "description": str(ev.get("description") or ""),
+            "location": _strip_unsafe_text(str(ev.get("location") or "")),
+            "description": _strip_unsafe_text(str(ev.get("description") or "")),
         })
 
     # No two proposed events may overlap each other.
@@ -963,6 +1010,12 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
     if not event_uid or not event_uid.strip():
         raise CalendarError("event_uid is required - use calendar_list_events or "
                              "calendar_search_events to find it first. Never guess a UID.")
+    if title:
+        title = _strip_unsafe_text(title)
+    if location is not None:
+        location = _strip_unsafe_text(location)
+    if description is not None:
+        description = _strip_unsafe_text(description)
     event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, event_uid.strip())
 
     changes = []

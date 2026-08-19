@@ -17,6 +17,7 @@ import asyncio
 import json
 import re
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -28,7 +29,7 @@ import httpx
 from ddgs import DDGS
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 import calendar_manager
 import duration_manager
@@ -49,6 +50,9 @@ from config import (
     LLAMA_CONTEXT,
     LLAMA_SERVER_URL,
     MAX_TOOL_ITERATIONS,
+    MEMORY_IDENTITY_SLOTS,
+    PROMPT_LOG_DIR,
+    PROMPT_LOG_ENABLED,
     SAFE_FILES_DIR,
     WRITE_FILE_ALLOWED_EXTENSIONS,
     WRITE_FILE_MAX_CHARS,
@@ -67,6 +71,60 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Prompt-inspection logging: writes the EXACT JSON body this server sends to
+# llama-server (real, final prompt - system messages, full history, tools
+# schema, sampling params) to one file per server run. This is ground truth
+# of what the model actually saw - different from the per-section token-
+# count diagnostic further down, which only measures size, not content.
+# ---------------------------------------------------------------------------
+_PROMPT_LOG_DIR = Path(PROMPT_LOG_DIR)
+_PROMPT_LOG_DIR.mkdir(exist_ok=True)
+SESSION_LOG_PATH = _PROMPT_LOG_DIR / f"session_{datetime.now():%Y%m%d_%H%M%S}.log"
+_prompt_log_lock = threading.Lock()
+
+
+def _log_prompt(upstream_body: dict, iteration: int, section_labels: list[str]) -> None:
+    """Append one JSON object (one line) to this run's session log file,
+    describing the exact request about to be POSTed to llama-server. Each
+    message is tagged with a `section` label so the log viewer page can
+    filter by chunk type, not just role. section_labels is positional -
+    section_labels[i] describes upstream_body["messages"][i]; anything
+    beyond that list's length is ordinary conversation history/tool-call
+    round-trip messages, which grow between iterations. Best-effort: a
+    write failure is printed but never blocks the actual turn."""
+    if not PROMPT_LOG_ENABLED:
+        return
+    try:
+        chunks = []
+        for i, msg in enumerate(upstream_body["messages"]):
+            section = section_labels[i] if i < len(section_labels) else "conversation"
+            content = msg.get("content")
+            if content is None and msg.get("tool_calls"):
+                content = json.dumps(msg["tool_calls"])
+            chunks.append({
+                "role": msg.get("role", "unknown"),
+                "section": section,
+                "content": content or "",
+            })
+        if upstream_body.get("tools"):
+            chunks.append({
+                "role": "tools",
+                "section": "tools_schema",
+                "content": json.dumps(upstream_body["tools"], indent=2),
+            })
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "iteration": iteration,
+            "model": upstream_body.get("model"),
+            "chunks": chunks,
+        }
+        with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[AGENT] Prompt log write failed: {e}")
 
 
 class LlamaServerError(Exception):
@@ -238,10 +296,65 @@ def get_weather(args: dict) -> str:
 
 def save_memory_tool(args: dict) -> str:
     fact = args.get("fact", "")
+    slot = args.get("slot") or None
     if not fact:
         return "Error: no fact provided."
-    memory.save_memory(fact)
-    return f"Saved to long-term memory: {fact}"
+    if slot and slot not in MEMORY_IDENTITY_SLOTS:
+        return f"Error: '{slot}' is not a valid slot. Valid slots: {', '.join(MEMORY_IDENTITY_SLOTS)}."
+    result = memory.save_memory(fact, slot=slot)
+    if slot:
+        verb = "Updated" if result["action"] == "updated" else "Saved"
+        return f"{verb} slot '{slot}' [id: {result['id']}]: {fact}"
+    msg = f"Saved to long-term memory [id: {result['id']}]: {fact}"
+    similar = result.get("similar")
+    if similar:
+        msg += (
+            f"\nNote: this looks similar to an existing memory - "
+            f"[id: {similar['id']}] {similar['text']} (similarity {similar['score']:.2f}). "
+            f"If it's the same fact restated, use update_memory or delete_memory instead of "
+            f"leaving both stored."
+        )
+    return msg
+
+
+def update_memory_tool(args: dict) -> str:
+    memory_id = args.get("id", "")
+    new_text = args.get("new_text", "")
+    if not memory_id or not new_text:
+        return "Error: both id and new_text are required."
+    return memory.update_memory(memory_id, new_text)
+
+
+def delete_memory_tool(args: dict) -> str:
+    memory_id = args.get("id", "")
+    if not memory_id:
+        return "Error: id is required."
+    return memory.delete_memory(memory_id)
+
+
+def pin_memory_tool(args: dict) -> str:
+    memory_id = args.get("id", "")
+    if not memory_id:
+        return "Error: id is required."
+    return memory.pin_memory(memory_id)
+
+
+def unpin_memory_tool(args: dict) -> str:
+    memory_id = args.get("id", "")
+    if not memory_id:
+        return "Error: id is required."
+    return memory.unpin_memory(memory_id)
+
+
+def list_memories_tool(args: dict) -> str:
+    memories = memory.list_memories()
+    if not memories:
+        return "No memories saved yet."
+    lines = []
+    for m in memories:
+        tag = f" (slot: {m['slot']})" if m.get("slot") else (" (pinned)" if m.get("pinned") else "")
+        lines.append(f"[id: {m['id']}]{tag} {m['text']}")
+    return "\n".join(lines)
 
 
 def search_documents_tool(args: dict) -> str:
@@ -724,13 +837,83 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save an important fact about the user for recall in future conversations (e.g. their name, preferences, ongoing projects). Do not save trivial small talk.",
+            "description": "Save a new, durable fact about the user for recall in future conversations (e.g. their preferences, ongoing projects). Do not save trivial small talk. If this fact corrects or replaces something already remembered, use update_memory instead - don't call save_memory for a fact that already exists in a different form. If the fact is their identity (name and/or pronouns - combined into a single slot), occupation, or location, pass the matching `slot` instead of leaving it plain - this makes it always visible to you in every future conversation, not just when it's semantically relevant, and safely overwrites any previous value for that slot instead of creating a duplicate. When saving to the `identity` slot, always include BOTH the name and pronouns in the text even if only one changed - it's a single field, so a partial update silently drops whichever part you leave out.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "fact": {"type": "string", "description": "The fact to remember, written as a standalone sentence."}
+                    "fact": {"type": "string", "description": "The fact to remember, written as a standalone sentence."},
+                    "slot": {
+                        "type": "string",
+                        "enum": list(MEMORY_IDENTITY_SLOTS),
+                        "description": "Optional. Set only when the fact is the user's identity (name and/or pronouns), occupation, or location - upserts into that slot instead of creating a new freeform memory. Omit for anything else.",
+                    },
                 },
                 "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_memory",
+            "description": "Overwrite an existing memory in place when the user corrects or changes a previously-stored fact (e.g. 'I'm actually a nurse now, not a teacher'). Requires the exact id of the memory being replaced - get it from a memory shown in the 'Relevant things you remember' context, or from list_memories/search_memories if you don't already have it. Never guess an id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the existing memory to overwrite."},
+                    "new_text": {"type": "string", "description": "The corrected fact, written as a standalone sentence."}
+                },
+                "required": ["id", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory",
+            "description": "Permanently remove a memory when the user asks you to forget something, with no replacement fact. Requires the exact id - get it from context, list_memories, or search_memories. Never guess an id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the memory to delete."}
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_memories",
+            "description": "List every fact currently saved in long-term memory, each with its id. Use this to find the id of a memory to update or delete when it wasn't already shown in context, or when the user asks what you remember about them.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pin_memory",
+            "description": "Mark an existing freeform memory (one saved without a slot) as always-shown, so it appears in every future conversation instead of only when it's semantically relevant to what's being discussed. Use for facts worth always knowing that don't fit the fixed identity/occupation/location slots (e.g. a standing dietary restriction or strong preference). There's a cap on how many freeform memories can be pinned at once - if you hit it, the tool result will say so.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the existing freeform memory to pin."}
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unpin_memory",
+            "description": "Undo pin_memory - the memory goes back to only surfacing when it's semantically relevant, instead of always. Has no effect on slotted memories (identity/occupation/location are always shown by design and can't be unpinned - use delete_memory to remove one of those instead).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the pinned freeform memory to unpin."}
+                },
+                "required": ["id"],
             },
         },
     },
@@ -1166,6 +1349,11 @@ TOOL_FUNCTIONS = {
     "list_files": list_files,
     "read_file": read_file,
     "save_memory": save_memory_tool,
+    "update_memory": update_memory_tool,
+    "delete_memory": delete_memory_tool,
+    "pin_memory": pin_memory_tool,
+    "unpin_memory": unpin_memory_tool,
+    "list_memories": list_memories_tool,
     "search_documents": search_documents_tool,
     "write_file": write_file,
     "edit_file": edit_file,
@@ -1366,6 +1554,97 @@ async def api_reorder_tasks(project_id: str, request: Request):
     return _serialize_project(project)
 
 
+# ---------------------------------------------------------------------------
+# Memory browser HTTP API - plain REST for the /memory-browser page. Same
+# pattern as /projects above: the UI drives the exact same memory.py
+# functions the model's tools use, so they can never disagree about state.
+# ---------------------------------------------------------------------------
+
+@app.get("/memories")
+async def api_list_memories():
+    memories = await asyncio.to_thread(memory.list_memories_full)
+    return {"memories": memories}
+
+
+@app.patch("/memories/{memory_id}")
+async def api_update_memory(memory_id: str, request: Request):
+    body = await request.json()
+    all_memories = await asyncio.to_thread(memory._load_memories)
+    if not any(m["id"] == memory_id for m in all_memories):
+        raise HTTPException(status_code=404, detail="Memory not found.")
+
+    message = None
+    if "text" in body:
+        message = await asyncio.to_thread(memory.update_memory, memory_id, body["text"])
+    if "pinned" in body:
+        fn = memory.pin_memory if body["pinned"] else memory.unpin_memory
+        message = await asyncio.to_thread(fn, memory_id)
+
+    memories = await asyncio.to_thread(memory.list_memories_full)
+    updated = next((m for m in memories if m["id"] == memory_id), None)
+    return {"memory": updated, "message": message}
+
+
+@app.delete("/memories/{memory_id}")
+async def api_delete_memory(memory_id: str):
+    all_memories = await asyncio.to_thread(memory._load_memories)
+    if not any(m["id"] == memory_id for m in all_memories):
+        raise HTTPException(status_code=404, detail="Memory not found.")
+    await asyncio.to_thread(memory.delete_memory, memory_id)
+    return {"deleted": memory_id}
+
+
+@app.get("/memory-browser")
+async def memory_browser_page():
+    html_path = Path(__file__).parent / "web" / "memory_browser.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Prompt-log viewer HTTP API - plain REST for the /prompt-log-viewer page,
+# reading the JSONL files _log_prompt() writes to PROMPT_LOG_DIR.
+# ---------------------------------------------------------------------------
+
+@app.get("/prompt-logs")
+async def list_prompt_logs():
+    """Lists available session log files, most recent first."""
+    files = sorted(_PROMPT_LOG_DIR.glob("session_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [
+        {
+            "filename": f.name,
+            "size_kb": round(f.stat().st_size / 1024, 1),
+            "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+        }
+        for f in files
+    ]
+
+
+@app.get("/prompt-logs/{filename}")
+async def get_prompt_log(filename: str):
+    """Returns one session log file's entries, parsed from JSONL."""
+    safe_name = Path(filename).name  # strips any path components - blocks traversal
+    path = _PROMPT_LOG_DIR / safe_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Log file not found")
+    entries = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"[AGENT] Skipping malformed log line {line_num} in {filename}")
+    return entries
+
+
+@app.get("/prompt-log-viewer")
+async def prompt_log_viewer_page():
+    html_path = Path(__file__).parent / "web" / "prompt_log_viewer.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
     """POST one chat-completion request with stream=True and yield the
     decoded JSON of each SSE chunk from llama-server."""
@@ -1417,7 +1696,7 @@ async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
         return None
 
 
-async def agent_loop(upstream_body: dict):
+async def agent_loop(upstream_body: dict, section_labels: list[str] | None = None):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
     way. Yields:
@@ -1449,11 +1728,12 @@ async def agent_loop(upstream_body: dict):
     the client resolves its half and sends the follow-up request.
     """
     async with httpx.AsyncClient(timeout=None, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as client:
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for iteration in range(MAX_TOOL_ITERATIONS):
             content = ""
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
 
+            _log_prompt(upstream_body, iteration, section_labels or [])
             try:
                 async for chunk in _stream_chat(client, upstream_body):
                     delta = chunk["choices"][0].get("delta", {})
@@ -1681,7 +1961,8 @@ async def chat_completions(request: Request):
         "role": "system",
         "content": (
             "You have tools available: get_current_time, calculate, run_python, "
-            "web_search, get_weather, list_files, read_file, save_memory, write_file, "
+            "web_search, get_weather, list_files, read_file, save_memory, update_memory, "
+            "delete_memory, pin_memory, unpin_memory, list_memories, write_file, "
             "edit_file, delete_file, search_documents, calendar_list_calendars, "
             "calendar_list_events, "
             "calendar_search_events, calendar_create_event, calendar_edit_event, "
@@ -1698,7 +1979,35 @@ async def chat_completions(request: Request):
             "for specific information inside long or multiple documents. Use "
             "calculate for simple arithmetic, or run_python for anything needing "
             "actual code logic. Call save_memory when the user shares a durable "
-            "fact about themselves worth remembering - not for small talk. "
+            "fact about themselves worth remembering - not for small talk. If the "
+            "fact is their identity (name and/or pronouns - combined into one "
+            "slot), occupation, or location, always pass the "
+            "matching `slot` argument rather than leaving it plain - this makes it "
+            "always visible to you in every conversation, not just when it happens "
+            "to match what's being discussed, and safely overwrites the old value "
+            "instead of creating a duplicate if that slot is already filled. If the "
+            "user corrects or changes a fact you already remember about them (e.g. "
+            "a job, name, or preference that's now different) and it's NOT one of "
+            "the three slots, call update_memory with that memory's id and the "
+            "corrected text - do NOT call save_memory again, since that would leave "
+            "both the old and new fact stored side by side and confuse future "
+            "recall. The id is usually already visible in the '[id: ...]' tag next "
+            "to a fact shown to you in the 'Core facts you always know about this "
+            "user' or 'Relevant things you remember about this user' context; only "
+            "call list_memories or search_memories to look one up if it isn't "
+            "already visible. Never guess an id. Call delete_memory (with an id, "
+            "same rule) only when the user explicitly asks you to forget something, "
+            "with no replacement fact - this also works on a slotted memory, which "
+            "just empties that slot. If a save_memory result includes a note that "
+            "the new fact looks similar to an existing memory, check whether it's "
+            "really the same fact restated - if so, use update_memory or "
+            "delete_memory to reconcile them instead of leaving both. Use "
+            "pin_memory on a freeform memory (one saved without a slot) when a fact "
+            "is worth always knowing but doesn't fit the three fixed slots (e.g. a "
+            "standing dietary restriction or strong preference) - pinned memories, "
+            "like slots, are always shown to you rather than only when relevant. "
+            "Use unpin_memory to undo that; it has no effect on slotted memories, "
+            "which are always shown by design - use delete_memory on those instead. "
             "Use write_file when the user asks you to create, save, write out, or "
             "update a .txt or .md file - use mode 'overwrite' to replace a file's "
             "contents (or create a new one) and mode 'append' to add to the end of "
@@ -1831,19 +2140,44 @@ async def chat_completions(request: Request):
         prepend_sections.append(("calendar_cache", calendar_context_text))
     print(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
 
-    # Auto-recall: silently check if any saved memories are relevant to what
-    # the user just said, and inject them - no tool call needed for this part.
+    # Auto-recall, part 1: pinned memories (identity slots + freeform pins)
+    # are always shown, every turn, regardless of what's being discussed -
+    # unlike the query-based search below, this isn't conditional on
+    # last_user_msg existing or matching anything semantically.
+    pinned = await asyncio.to_thread(memory.get_pinned_memories)
+    pinned_ids = {m["id"] for m in pinned}
+    if pinned:
+        print(f"[AGENT] {len(pinned)} pinned memory item(s) always shown")
+        pinned_text = (
+            "Core facts you always know about this user (id shown so you can "
+            "call update_memory/delete_memory/unpin_memory directly if one of "
+            "these needs correcting or removing - never guess an id):\n"
+            + "\n".join(
+                f"- [id: {m['id']}]" + (f" (slot: {m['slot']})" if m["slot"] else "") + f" {m['text']}"
+                for m in pinned
+            )
+        )
+        messages_to_prepend.append({"role": "system", "content": pinned_text})
+        prepend_sections.append(("memory_pinned", pinned_text))
+
+    # Auto-recall, part 2: silently check if any OTHER saved memories are
+    # relevant to what the user just said, and inject them - no tool call
+    # needed for this part. Pinned memories are excluded here since they're
+    # already always shown above; this is only for everything else.
     last_user_msg = next(
         (m["content"] for m in reversed(body["messages"]) if m.get("role") == "user"),
         None,
     )
     if last_user_msg:
         relevant = await asyncio.to_thread(memory.search_memories, last_user_msg)
+        relevant = [m for m in relevant if m["id"] not in pinned_ids]
         if relevant:
             print(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
             memory_recall_text = (
                 "Relevant things you remember about this user from past "
-                "conversations:\n" + "\n".join(f"- {m}" for m in relevant)
+                "conversations (id shown so you can call update_memory/delete_memory "
+                "directly if one of these needs correcting - never guess an id):\n"
+                + "\n".join(f"- [id: {m['id']}] {m['text']}" for m in relevant)
             )
             messages_to_prepend.append({"role": "system", "content": memory_recall_text})
             prepend_sections.append(("memory_recall", memory_recall_text))
@@ -1864,6 +2198,14 @@ async def chat_completions(request: Request):
     # system message like the others, but it's often the single largest
     # fixed cost in the whole prompt.
     tools_schema_text = json.dumps(upstream_body["tools"])
+
+    # Positional labels aligned to upstream_body["messages"] indices, used
+    # only by _log_prompt (see prompt-log-viewer). Order matches exactly
+    # how messages_to_prepend + the original messages get concatenated
+    # below - see that line for why this ordering is safe to rely on.
+    message_section_labels = [name for name, _ in prepend_sections]
+    if character_card_text is not None:
+        message_section_labels.append("character_card")
 
     sections = [
         ("character_card", character_card_text),
@@ -1901,7 +2243,7 @@ async def chat_completions(request: Request):
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
         finish_reason = "stop"
-        async for kind, payload in agent_loop(upstream_body):
+        async for kind, payload in agent_loop(upstream_body, message_section_labels):
             if kind in ("done", "handoff"):
                 final_message = payload
                 finish_reason = "tool_calls" if kind == "handoff" else "stop"
@@ -1928,7 +2270,7 @@ async def chat_completions(request: Request):
         return f"data: {json.dumps(payload)}\n\n".encode()
 
     async def event_stream():
-        async for kind, payload in agent_loop(upstream_body):
+        async for kind, payload in agent_loop(upstream_body, message_section_labels):
             if kind == "delta":
                 yield sse({"index": 0, "delta": {"content": payload}, "finish_reason": None})
                 continue
