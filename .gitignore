@@ -27,6 +27,10 @@ duration_data/
 agent_files/*
 !agent_files/.gitkeep
 
+#logging documents
+prompt_logs/*
+!prompt_logs/.gitkeep
+
 # Environment variables / secrets, if you ever add an .env file later
 .env
 
