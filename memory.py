@@ -31,6 +31,7 @@ import numpy as np
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
+from console_log import alog
 from config import (
     DOCUMENT_SIMILARITY_THRESHOLD,
     EMBEDDING_MODEL,
@@ -304,13 +305,13 @@ def search_memories(query: str, top_k: int = 3) -> list:
     separately and filtering them out of this result to avoid duplicates)."""
     memories = _load_memories()
     results = _cosine_search(embed(query), memories, top_k=top_k, min_score=MEMORY_SIMILARITY_THRESHOLD)
-    print(f"[MEMORY] Query: {query!r}")
+    alog(f"[MEMORY] Query: {query!r}")
     for m, score in results:
-        print(f"[MEMORY]   {score:.3f}  [{m['id']}] {m['text']}")
+        alog(f"[MEMORY]   {score:.3f}  [{m['id']}] {m['text']}")
     if not results:
         all_scored = _cosine_search(embed(query), memories, top_k=3, min_score=-1)
         for m, score in all_scored:
-            print(f"[MEMORY]   (below threshold) {score:.3f}  [{m['id']}] {m['text']}")
+            alog(f"[MEMORY]   (below threshold) {score:.3f}  [{m['id']}] {m['text']}")
     return [{"id": m["id"], "text": m["text"], "slot": m.get("slot"), "pinned": m.get("pinned", False)} for m, score in results]
 
 

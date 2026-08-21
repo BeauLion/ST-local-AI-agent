@@ -62,7 +62,7 @@ LLAMA_TOP_K = 20
 LLAMA_MIN_P = 0.0   # new constant - see command builder change below
 LLAMA_FLASH_ATTENTION = 'on'   # -fa: flash attention, speed optimization [on|off|auto]
 LLAMA_USE_JINJA = True         # --jinja: required for structured tool-call output
-LLAMA_REASONING_FORMAT = "deepseek"
+#LLAMA_REASONING_FORMAT = "deepseek"
 LLAMA_MD = "./llama.cpp/mtp-gemma-4-12B-it.gguf"
 LLAMA_SPEC_TYPE = "draft-mtp"
 

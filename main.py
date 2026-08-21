@@ -36,6 +36,7 @@ import calendar_manager
 import duration_manager
 import memory
 import project_manager
+from console_log import alog, flush as flush_console
 from calendar_manager import CalendarError
 from duration_manager import DurationError
 from project_manager import ProjectManagerError
@@ -134,6 +135,7 @@ def _log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], 
             })
         entry = {
             "timestamp": datetime.now().isoformat(),
+            "type": "prompt",
             "iteration": iteration,
             "model": upstream_body.get("model"),
             "chunks": chunks,
@@ -142,6 +144,31 @@ def _log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], 
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[AGENT] Prompt log write failed: {e}")
+
+
+def _log_console(iteration: int) -> None:
+    """Flushes everything buffered via console_log.alog() since the last
+    flush and appends it as its own JSONL entry, immediately after the
+    prompt entry it belongs to - prompt_log_viewer.html pairs them by
+    position. Writes nothing if nothing was buffered, so quiet iterations
+    (e.g. no tool calls, nothing notable printed) don't clutter the log."""
+    if not PROMPT_LOG_ENABLED:
+        flush_console()  # still drain it so it can't leak into a later request
+        return
+    lines = flush_console()
+    if not lines:
+        return
+    try:
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "console",
+            "iteration": iteration,
+            "lines": lines,
+        }
+        with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[AGENT] Console log write failed: {e}")
 
 
 class LlamaServerError(Exception):
@@ -1961,7 +1988,7 @@ async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
         resp.raise_for_status()
         return len(resp.json().get("tokens", []))
     except Exception as e:
-        print(f"[AGENT] Token count lookup failed: {e}")
+        alog(f"[AGENT] Token count lookup failed: {e}")
         return None
 
 
@@ -2033,7 +2060,8 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         content += delta_content
                         # buffered, not yielded here — see below
             except LlamaServerError as e:
-                print(f"[AGENT] {e}")
+                alog(f"[AGENT] {e}")
+                _log_console(iteration)
                 yield ("delta", f"⚠️ {e}")
                 yield ("done", {"role": "assistant", "content": str(e)})
                 return
@@ -2045,11 +2073,12 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                 unknown = [c for c in calls if c["function"]["name"] not in TOOL_FUNCTIONS]
                 if unknown:
                     names = [c["function"]["name"] for c in unknown]
-                    print(f"[AGENT] Handing off {len(unknown)} client-owned tool call(s) to SillyTavern: {names}")
+                    alog(f"[AGENT] Handing off {len(unknown)} client-owned tool call(s) to SillyTavern: {names}")
+                    _log_console(iteration)
                     yield ("handoff", message)
                     return
 
-                print(f"[AGENT] Model requested {len(calls)} tool call(s)")
+                alog(f"[AGENT] Model requested {len(calls)} tool call(s)")
                 upstream_body["messages"].append(message)
 
                 names_in_batch = {c["function"]["name"] for c in calls}
@@ -2118,8 +2147,8 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         # Run in a thread so a slow web search doesn't freeze the server.
                         result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
 
-                    print(f"[AGENT] {name}({args}) ->")
-                    print(f"[AGENT]   {str(result)[:400]}")
+                    alog(f"[AGENT] {name}({args}) ->")
+                    alog(f"[AGENT]   {str(result)[:400]}")
 
                     upstream_body["messages"].append(
                         {
@@ -2146,6 +2175,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                                 ),
                             }
                         )
+                _log_console(iteration)
                 continue  # loop again so the model can use the tool result
 
             # No tool call -> normally the final answer. But if the user's
@@ -2169,9 +2199,9 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                 and bool(_BARE_CONFIRMATION_RE.match(str(last_user_text_for_check or "").strip()))
             )
             if unresolved_confirmation:
-                print("[AGENT] Model claimed a calendar change is resolved but never called "
-                      "confirm/cancel - forcing it to actually do so instead of returning "
-                      "the false answer.")
+                alog("[AGENT] Model claimed a calendar change is resolved but never called "
+                     "confirm/cancel - forcing it to actually do so instead of returning "
+                     "the false answer.")
                 upstream_body["messages"].append({"role": "assistant", "content": content or None})
                 upstream_body["messages"].append({
                     "role": "system",
@@ -2186,15 +2216,19 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         "of these tools first."
                     ),
                 })
+                _log_console(iteration)
                 continue
 
-            print("[AGENT] Model answered directly, without calling any tool.")
+            alog("[AGENT] Model answered directly, without calling any tool.")
+            _log_console(iteration)
             if content:
                 yield ("delta", content)
             yield ("done", {"role": "assistant", "content": content})
             return
 
         # Hit MAX_TOOL_ITERATIONS without a final answer - bail out safely.
+        alog(f"[AGENT] Bailed out after {MAX_TOOL_ITERATIONS} tool-call iterations without a final answer.")
+        _log_console(MAX_TOOL_ITERATIONS - 1)
         bail_message = "(Agent stopped: too many tool calls in a row.)"
         yield ("delta", bail_message)
         yield ("done", {"role": "assistant", "content": bail_message})
@@ -2278,7 +2312,7 @@ async def chat_completions(request: Request):
     if project_state_text:
         messages_to_prepend.append({"role": "system", "content": project_state_text})
         prepend_sections.append(("project_state", project_state_text))
-    print(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
+    alog(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
 
     # Read-only, local-file-only - see calendar_manager.get_cached_context()
     # docstring for why this never triggers a live CalDAV call.
@@ -2286,7 +2320,7 @@ async def chat_completions(request: Request):
     if calendar_context_text:
         messages_to_prepend.append({"role": "system", "content": calendar_context_text})
         prepend_sections.append(("calendar_cache", calendar_context_text))
-    print(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
+    alog(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
 
     # Shared explanation of the calendar staging convention (propose -> confirm/cancel),
     # sent once here instead of being repeated near-verbatim inside four separate
@@ -2314,7 +2348,7 @@ async def chat_completions(request: Request):
     pinned = await asyncio.to_thread(memory.get_pinned_memories)
     pinned_ids = {m["id"] for m in pinned}
     if pinned:
-        print(f"[AGENT] {len(pinned)} pinned memory item(s) always shown")
+        alog(f"[AGENT] {len(pinned)} pinned memory item(s) always shown")
         pinned_text = (
             "Core facts you always know about this user (id shown so you can "
             "call update_memory/delete_memory/unpin_memory directly if one of "
@@ -2339,7 +2373,7 @@ async def chat_completions(request: Request):
         relevant = await asyncio.to_thread(memory.search_memories, last_user_msg)
         relevant = [m for m in relevant if m["id"] not in pinned_ids]
         if relevant:
-            print(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
+            alog(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
             memory_recall_text = (
                 "Relevant things you remember about this user from past "
                 "conversations (id shown so you can call update_memory/delete_memory "
@@ -2388,7 +2422,7 @@ async def chat_completions(request: Request):
         for (name, _), count in zip(sections, counts)
     )
     known_total = sum(c for c in counts if c is not None)
-    print(
+    alog(
         f"[AGENT] System prompt section sizes (tokens): {breakdown} "
         f"| known total: {known_total} / {LLAMA_CONTEXT} context"
     )

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Prompt Log Viewer</title>
+<title>Prompt &amp; Console Log Viewer</title>
 <style>
   :root {
     --bg: #14161a;
@@ -20,6 +20,7 @@
     --c-assistant: #ffb454;
     --c-tool: #ff7a90;
     --c-tools: #c58fff;
+    --c-console: #6fd1c9;
   }
   * { box-sizing: border-box; }
   body {
@@ -166,6 +167,7 @@
   .badge.role-assistant { background: #3a2c10; color: var(--c-assistant); }
   .badge.role-tool { background: #3a1620; color: var(--c-tool); }
   .badge.role-tools { background: #2a1a3a; color: var(--c-tools); }
+  .badge.role-console { background: #103a36; color: var(--c-console); }
   .section-name {
     font-family: var(--mono);
     font-size: 12px;
@@ -195,6 +197,7 @@
     max-height: 480px;
     overflow-y: auto;
   }
+  .chunk.role-console-chunk .chunk-body pre { color: var(--c-console); }
   mark { background: #5fa8ff55; color: inherit; border-radius: 2px; }
   .empty { color: var(--text-dim); padding: 30px 0; text-align: center; }
 </style>
@@ -202,7 +205,7 @@
 <body>
 
 <header>
-  <h1>Prompt Log Viewer</h1>
+  <h1>Prompt &amp; Console Log Viewer</h1>
   <select id="fileSelect"></select>
   <input type="text" id="searchBox" placeholder="Search chunk content...">
   <button id="expandAllBtn">Expand all</button>
@@ -228,13 +231,68 @@
 <script>
 const ROLE_COLORS = {
   system: 'role-system', user: 'role-user', assistant: 'role-assistant',
-  tool: 'role-tool', tools: 'role-tools',
+  tool: 'role-tool', tools: 'role-tools', console: 'role-console',
 };
 
 let allEntries = [];
+let groups = [];
 let activeRoles = new Set();
 let activeSections = new Set();
 let selectedEntryIndex = null; // null = show all requests
+
+// Older log files (written before console capture existed) have entries
+// with no "type" field at all - infer "prompt" for those from the
+// presence of "chunks", "console" otherwise, so old logs still load fine.
+function entryType(e) {
+  return e.type || (e.chunks ? 'prompt' : 'console');
+}
+
+// Console entries are always written immediately after the prompt entry
+// they belong to (see main.py's _log_console). Pair them up here so the
+// rest of the page can treat "one iteration" as one thing to render,
+// instead of two separate array elements. A console entry with no
+// preceding prompt (rare - e.g. the max-iterations bail-out case) still
+// gets its own standalone group so nothing is silently dropped.
+function buildGroups(entries) {
+  const out = [];
+  let i = 0;
+  while (i < entries.length) {
+    const e = entries[i];
+    if (entryType(e) === 'console') {
+      out.push({ prompt: null, console: e });
+      i++;
+      continue;
+    }
+    const group = { prompt: e, console: null };
+    const next = entries[i + 1];
+    if (next && entryType(next) === 'console') {
+      group.console = next;
+      i += 2;
+    } else {
+      i += 1;
+    }
+    out.push(group);
+  }
+  return out;
+}
+
+// A group's console lines are exposed as one more chunk, so the existing
+// role/section filter + collapsible-chunk UI handles it for free.
+function groupChunks(group) {
+  const chunks = group.prompt ? [...group.prompt.chunks] : [];
+  if (group.console) {
+    chunks.push({
+      role: 'console',
+      section: 'console_output',
+      content: group.console.lines.join('\n'),
+    });
+  }
+  return chunks;
+}
+
+function groupRef(group) {
+  return group.prompt || group.console;
+}
 
 async function loadFileList() {
   const res = await fetch('/prompt-logs');
@@ -259,6 +317,7 @@ async function loadFile(filename) {
   document.getElementById('status').textContent = 'Loading ' + filename + '...';
   const res = await fetch('/prompt-logs/' + encodeURIComponent(filename));
   allEntries = await res.json();
+  groups = buildGroups(allEntries);
   selectedEntryIndex = null;
   buildRequestList();
   buildFilterLists();
@@ -271,7 +330,7 @@ function buildRequestList() {
 
   const allItem = document.createElement('div');
   allItem.className = 'req-item' + (selectedEntryIndex === null ? ' active' : '');
-  allItem.innerHTML = `<span class="req-title">All requests</span><span class="req-meta">${allEntries.length} total</span>`;
+  allItem.innerHTML = `<span class="req-title">All requests</span><span class="req-meta">${groups.length} total</span>`;
   allItem.addEventListener('click', () => {
     selectedEntryIndex = null;
     buildRequestList();
@@ -279,13 +338,15 @@ function buildRequestList() {
   });
   box.appendChild(allItem);
 
-  allEntries.forEach((entry, idx) => {
-    const time = (entry.timestamp || '').split('T')[1]?.split('.')[0] || entry.timestamp || '?';
+  groups.forEach((group, idx) => {
+    const ref = groupRef(group);
+    const time = (ref.timestamp || '').split('T')[1]?.split('.')[0] || ref.timestamp || '?';
+    const consoleMark = group.console ? ' \u{1F5A5}' : ''; // small monitor icon = has console output
     const item = document.createElement('div');
     item.className = 'req-item' + (selectedEntryIndex === idx ? ' active' : '');
     item.innerHTML = `
-      <span class="req-title">iteration ${entry.iteration} &middot; ${time}</span>
-      <span class="req-meta">${entry.chunks.length} chunks</span>`;
+      <span class="req-title">iteration ${ref.iteration} &middot; ${time}${consoleMark}</span>
+      <span class="req-meta">${groupChunks(group).length} chunks</span>`;
     item.addEventListener('click', () => {
       selectedEntryIndex = idx;
       buildRequestList();
@@ -298,8 +359,8 @@ function buildRequestList() {
 function buildFilterLists() {
   const roles = new Set();
   const sections = new Set();
-  for (const entry of allEntries) {
-    for (const c of entry.chunks) {
+  for (const group of groups) {
+    for (const c of groupChunks(group)) {
       roles.add(c.role);
       sections.add(c.section);
     }
@@ -311,10 +372,11 @@ function buildFilterLists() {
   roleBox.innerHTML = '';
   for (const r of [...roles].sort()) {
     const id = 'role-' + r;
+    const colorKey = ROLE_COLORS[r] ? ROLE_COLORS[r].replace('role-', '') : 'tools';
     roleBox.insertAdjacentHTML('beforeend', `
       <label class="chk">
         <input type="checkbox" id="${id}" checked>
-        <span class="dot" style="background:var(--c-${ROLE_COLORS[r] ? ROLE_COLORS[r].replace('role-','') : 'tools'})"></span>
+        <span class="dot" style="background:var(--c-${colorKey})"></span>
         ${r}
       </label>`);
   }
@@ -365,12 +427,14 @@ function render() {
   let shownIterations = 0;
   let shownChunks = 0;
 
-  const entriesToShow = selectedEntryIndex === null
-    ? allEntries
-    : [allEntries[selectedEntryIndex]];
+  const groupsToShow = selectedEntryIndex === null
+    ? groups
+    : [groups[selectedEntryIndex]];
 
-  for (const entry of entriesToShow) {
-    const matchingChunks = entry.chunks.filter(c => {
+  for (const group of groupsToShow) {
+    if (!group) continue;
+    const ref = groupRef(group);
+    const matchingChunks = groupChunks(group).filter(c => {
       if (!activeRoles.has(c.role)) return false;
       if (!activeSections.has(c.section)) return false;
       if (query && !c.content.toLowerCase().includes(query.toLowerCase())) return false;
@@ -383,15 +447,15 @@ function render() {
     iterDiv.className = 'iteration';
     iterDiv.innerHTML = `
       <div class="iteration-head">
-        <span>${entry.timestamp}</span>
-        <span>iteration ${entry.iteration} &middot; model: ${entry.model || '?'}</span>
+        <span>${ref.timestamp}</span>
+        <span>iteration ${ref.iteration} &middot; model: ${group.prompt?.model || '?'}</span>
       </div>`;
 
     for (const c of matchingChunks) {
       shownChunks++;
       const roleClass = ROLE_COLORS[c.role] || 'role-tools';
       const chunkDiv = document.createElement('div');
-      chunkDiv.className = 'chunk';
+      chunkDiv.className = 'chunk' + (c.role === 'console' ? ' role-console-chunk' : '');
       chunkDiv.innerHTML = `
         <div class="chunk-head">
           <span class="badge ${roleClass}">${c.role}</span>
@@ -409,8 +473,8 @@ function render() {
   }
 
   const focusNote = selectedEntryIndex === null
-    ? (allEntries.length ? ` (of ${allEntries.length} logged requests total)` : '')
-    : ` (focused on iteration ${allEntries[selectedEntryIndex]?.iteration})`;
+    ? (groups.length ? ` (of ${groups.length} logged requests total)` : '')
+    : ` (focused on iteration ${groupRef(groups[selectedEntryIndex])?.iteration})`;
   document.getElementById('status').textContent =
     `${shownIterations} request${shownIterations === 1 ? '' : 's'} / ${shownChunks} chunk${shownChunks === 1 ? '' : 's'} shown`
     + focusNote;
