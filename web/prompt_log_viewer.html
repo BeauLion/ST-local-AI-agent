@@ -21,6 +21,7 @@
     --c-tool: #ff7a90;
     --c-tools: #c58fff;
     --c-console: #6fd1c9;
+    --c-response: #d4e157;
   }
   * { box-sizing: border-box; }
   body {
@@ -168,6 +169,7 @@
   .badge.role-tool { background: #3a1620; color: var(--c-tool); }
   .badge.role-tools { background: #2a1a3a; color: var(--c-tools); }
   .badge.role-console { background: #103a36; color: var(--c-console); }
+  .badge.role-response { background: #2d3410; color: var(--c-response); }
   .section-name {
     font-family: var(--mono);
     font-size: 12px;
@@ -198,6 +200,7 @@
     overflow-y: auto;
   }
   .chunk.role-console-chunk .chunk-body pre { color: var(--c-console); }
+  .chunk.role-response-chunk .chunk-body pre { color: var(--c-response); }
   mark { background: #5fa8ff55; color: inherit; border-radius: 2px; }
   .empty { color: var(--text-dim); padding: 30px 0; text-align: center; }
 </style>
@@ -232,6 +235,7 @@
 const ROLE_COLORS = {
   system: 'role-system', user: 'role-user', assistant: 'role-assistant',
   tool: 'role-tool', tools: 'role-tools', console: 'role-console',
+  response: 'role-response',
 };
 
 let allEntries = [];
@@ -276,16 +280,26 @@ function buildGroups(entries) {
   return out;
 }
 
-// A group's console lines are exposed as one more chunk, so the existing
-// role/section filter + collapsible-chunk UI handles it for free.
+// A group's console lines and the model's actual output for that
+// iteration are exposed as ordinary chunks, so the existing role/section
+// filter + collapsible-chunk UI handles both for free.
 function groupChunks(group) {
   const chunks = group.prompt ? [...group.prompt.chunks] : [];
   if (group.console) {
-    chunks.push({
-      role: 'console',
-      section: 'console_output',
-      content: group.console.lines.join('\n'),
-    });
+    if (group.console.lines && group.console.lines.length) {
+      chunks.push({
+        role: 'console',
+        section: 'console_output',
+        content: group.console.lines.join('\n'),
+      });
+    }
+    if (group.console.response) {
+      chunks.push({
+        role: 'response',
+        section: group.console.response.kind || 'response',
+        content: group.console.response.text || '',
+      });
+    }
   }
   return chunks;
 }
@@ -455,7 +469,9 @@ function render() {
       shownChunks++;
       const roleClass = ROLE_COLORS[c.role] || 'role-tools';
       const chunkDiv = document.createElement('div');
-      chunkDiv.className = 'chunk' + (c.role === 'console' ? ' role-console-chunk' : '');
+      chunkDiv.className = 'chunk'
+        + (c.role === 'console' ? ' role-console-chunk' : '')
+        + (c.role === 'response' ? ' role-response-chunk' : '');
       chunkDiv.innerHTML = `
         <div class="chunk-head">
           <span class="badge ${roleClass}">${c.role}</span>

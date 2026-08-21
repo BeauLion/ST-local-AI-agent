@@ -146,17 +146,20 @@ def _log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], 
         print(f"[AGENT] Prompt log write failed: {e}")
 
 
-def _log_console(iteration: int) -> None:
+def _log_console(iteration: int, response: dict | None = None) -> None:
     """Flushes everything buffered via console_log.alog() since the last
     flush and appends it as its own JSONL entry, immediately after the
     prompt entry it belongs to - prompt_log_viewer.html pairs them by
-    position. Writes nothing if nothing was buffered, so quiet iterations
-    (e.g. no tool calls, nothing notable printed) don't clutter the log."""
+    position. `response`, if given, is {"kind": ..., "text": ...} - the
+    model's actual output for this iteration (final answer text, the raw
+    tool_calls it requested, etc.), attached as its own chunk in the
+    viewer. Writes nothing if there's neither buffered lines nor a
+    response, so quiet iterations don't clutter the log."""
     if not PROMPT_LOG_ENABLED:
         flush_console()  # still drain it so it can't leak into a later request
         return
     lines = flush_console()
-    if not lines:
+    if not lines and not response:
         return
     try:
         entry = {
@@ -165,6 +168,8 @@ def _log_console(iteration: int) -> None:
             "iteration": iteration,
             "lines": lines,
         }
+        if response:
+            entry["response"] = response
         with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -2061,7 +2066,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         # buffered, not yielded here — see below
             except LlamaServerError as e:
                 alog(f"[AGENT] {e}")
-                _log_console(iteration)
+                _log_console(iteration, {"kind": "error", "text": str(e)})
                 yield ("delta", f"⚠️ {e}")
                 yield ("done", {"role": "assistant", "content": str(e)})
                 return
@@ -2074,7 +2079,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                 if unknown:
                     names = [c["function"]["name"] for c in unknown]
                     alog(f"[AGENT] Handing off {len(unknown)} client-owned tool call(s) to SillyTavern: {names}")
-                    _log_console(iteration)
+                    _log_console(iteration, {"kind": "handoff", "text": json.dumps(calls, indent=2)})
                     yield ("handoff", message)
                     return
 
@@ -2175,7 +2180,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                                 ),
                             }
                         )
-                _log_console(iteration)
+                _log_console(iteration, {"kind": "tool_calls", "text": json.dumps(calls, indent=2)})
                 continue  # loop again so the model can use the tool result
 
             # No tool call -> normally the final answer. But if the user's
@@ -2216,20 +2221,20 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         "of these tools first."
                     ),
                 })
-                _log_console(iteration)
+                _log_console(iteration, {"kind": "content_discarded", "text": content or ""})
                 continue
 
             alog("[AGENT] Model answered directly, without calling any tool.")
-            _log_console(iteration)
+            _log_console(iteration, {"kind": "content", "text": content or ""})
             if content:
                 yield ("delta", content)
             yield ("done", {"role": "assistant", "content": content})
             return
 
         # Hit MAX_TOOL_ITERATIONS without a final answer - bail out safely.
-        alog(f"[AGENT] Bailed out after {MAX_TOOL_ITERATIONS} tool-call iterations without a final answer.")
-        _log_console(MAX_TOOL_ITERATIONS - 1)
         bail_message = "(Agent stopped: too many tool calls in a row.)"
+        alog(f"[AGENT] Bailed out after {MAX_TOOL_ITERATIONS} tool-call iterations without a final answer.")
+        _log_console(MAX_TOOL_ITERATIONS - 1, {"kind": "bailout", "text": bail_message})
         yield ("delta", bail_message)
         yield ("done", {"role": "assistant", "content": bail_message})
 
