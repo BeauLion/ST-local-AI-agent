@@ -452,11 +452,10 @@ _last_results: list[dict] = []
 
 
 def list_events(start: str = None, end: str = None, calendar_name: str = None, when: str = None) -> list[dict]:
-    # Default to searching EVERY calendar on the account - a named
-    # calendar_name narrows to just one. Without this, events silently
-    # wouldn't show up if they live on any calendar other than whichever
-    # one iCloud happens to return first.
-    calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
+    # A named calendar_name is used as-is; when omitted, _resolve_calendar
+    # falls back to CALENDAR_DEFAULT_NAME (config.py), or the first
+    # calendar iCloud returns if that's unset/unmatched.
+    calendars = [_resolve_calendar(calendar_name)]
 
     if when and not (start or end):
         start_dt, end_dt = resolve_when(when)

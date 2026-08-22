@@ -1073,12 +1073,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_list_events",
-            "description": "List events across ALL of the user's iCloud calendars in a date range (or just one calendar if calendar_name is given). Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately.",
+            "description": "List events of the default calendar in a date range (or a specific calendar if calendar_name is given). Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the same date for both start and end - that returns the whole day."},
-                    "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start. Same value as start is valid and means 'just that one day'."},
+                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the corresponding date for start and the date for the next day for end - that returns the whole day."},
+                    "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start."},
                     "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": [],
