@@ -309,8 +309,17 @@ _PHRASE_MINUTES = {
     "a couple hours": 120, "couple of hours": 120, "two hours": 120,
 }
 
+# Compound "1h30m" / "1hr 30min" / "1 hour 30 minutes" - matched before the
+# single-unit pattern below since e.g. "1h30m" would otherwise fail to
+# match (it has two number+unit chunks, not one). Needed so that
+# project_manager.py's note-tag round-trip (writing "dur: 1h30m", then
+# re-parsing it later) never loses data.
+_COMPOUND_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\s*(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)$"
+)
 
-def _parse_duration_minutes(value_text: str) -> float | None:
+
+def parse_duration_minutes(value_text: str) -> float | None:
     clean = _normalize_key(value_text)
     clean = clean.replace("~", "").replace("about", "").replace("approx", "").strip()
     if not clean:
@@ -318,6 +327,10 @@ def _parse_duration_minutes(value_text: str) -> float | None:
 
     if clean in _PHRASE_MINUTES:
         return float(_PHRASE_MINUTES[clean])
+
+    compound = _COMPOUND_RE.match(clean)
+    if compound:
+        return float(compound.group(1)) * 60 + float(compound.group(2))
 
     match = re.match(
         r"^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)?$", clean
@@ -332,7 +345,7 @@ def _parse_duration_minutes(value_text: str) -> float | None:
 
 
 def correct_entry(task_or_category: str, value_text: str) -> str:
-    minutes = _parse_duration_minutes(value_text)
+    minutes = parse_duration_minutes(value_text)
     if minutes is None:
         raise DurationError(f"Couldn't parse a duration from “{value_text}”. Try e.g. '20min', '1h', '90'.")
 

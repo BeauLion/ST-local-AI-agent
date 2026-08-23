@@ -1174,7 +1174,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "project_manager_update_task_notes",
-            "description": "Replace, append to, or clear the notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten.",
+            "description": "Replace, append to, or clear the notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task (not just when asked), put recognized tag lines at the very top of the text, one per line: 'dur: 45m' (also accepts '1h', '1h30m', '90'), 'effort: low' / 'effort: medium' / 'effort: high', and 'when: morning' / 'afternoon' / 'evening', optionally followed by 'weekday' or 'weekend' (e.g. 'when: afternoon weekend'). Any text after the tag lines is kept as freeform notes. Appending new tag lines only updates those specific tags and leaves the rest of the note (including other existing tags) intact - no need to replace the whole note to change one tag.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1219,11 +1219,11 @@ TOOLS = [
                                 "type": {"type": "string", "enum": ["create_task", "update_task_status", "update_task_notes"]},
                                 "title": {"type": "string", "description": "For create_task."},
                                 "priority": {"type": "string", "enum": ["low", "normal", "high"]},
-                                "notes": {"type": "string"},
+                                "notes": {"type": "string", "description": "For create_task. Optional tag lines at the top ('dur: 45m', 'effort: medium', 'when: afternoon weekend') show up automatically next to the task - see project_manager_update_task_notes for the exact syntax."},
                                 "task": {"type": "string", "description": "For status or note updates: task ID, short ID, or unambiguous title."},
                                 "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                                 "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
-                                "text": {"type": "string"},
+                                "text": {"type": "string", "description": "For update_task_notes. Same 'dur:'/'effort:'/'when:' tag syntax as project_manager_update_task_notes applies here."},
                             },
                             "required": ["type"],
                         },

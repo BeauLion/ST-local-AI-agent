@@ -233,6 +233,21 @@ PROJECT_STATUSES = ("active", "paused", "completed")
 TASK_STATUSES = ("pending", "active", "blocked", "done", "cancelled")
 TASK_PRIORITIES = ("low", "normal", "high")
 
+# Lightweight "key: value" tag syntax recognized only at the very top of a
+# task's notes (front-matter style - stops at the first unrecognized line)
+# and rendered compactly next to the task in the project context block.
+# See project_manager.py's _parse_note_tags()/_format_tags_inline().
+# Recognized keys: "dur" (reuses duration_manager.parse_duration_minutes),
+# "effort" (below), and "when" (TASK_NOTE_WHEN_TIMES, optionally followed
+# by a TASK_NOTE_WHEN_MODIFIERS word, e.g. "when: afternoon weekend").
+TASK_NOTE_EFFORT_ALIASES = {
+    "low": "low", "lo": "low",
+    "medium": "medium", "med": "medium", "normal": "medium",
+    "high": "high", "hi": "high",
+}
+TASK_NOTE_WHEN_TIMES = ("morning", "afternoon", "evening")
+TASK_NOTE_WHEN_MODIFIERS = ("weekday", "weekend")
+
 # localhost is always allowed below. Anything else (Tailscale IPs, LAN IPs,
 # etc.) goes in .env as EXTRA_CORS_ORIGINS - a comma-separated list - so
 # real IPs never end up committed to the repo. See .env.example for the
