@@ -351,6 +351,7 @@ function render() {
 
     const iterDiv = document.createElement('div');
     iterDiv.className = 'iteration';
+    iterDiv.dataset.groupIndex = String(groupIndex);
     iterDiv.innerHTML = `
       <div class="iteration-head">
         <span>${ref.timestamp}</span>
@@ -368,6 +369,7 @@ function render() {
         + (c.role === 'console' ? ' role-console-chunk' : '')
         + (c.role === 'response' ? ' role-response-chunk' : '')
         + (c.role === 'thinking' ? ' role-thinking-chunk' : '');
+      chunkDiv.dataset.chunkIndex = String(c._chunkIndex);
       chunkDiv.innerHTML = `
         <div class="chunk-head">
           <span class="badge ${roleClass}">${c.role}</span>
@@ -398,6 +400,179 @@ function render() {
     resultsEl.innerHTML = '<div class="empty">No chunks match the current filters.</div>';
   }
 }
+
+// ---------------------------------------------------------------------
+// Cross-session note search. The heavy lifting (reading every file's
+// annotations, resolving matches back to their iteration/chunk) happens
+// server-side in prompt_log_engine.py's /notes/search - this is just a
+// fetch and a shape adjustment for the render/navigate functions below.
+// ---------------------------------------------------------------------
+
+let noteSearchDebounce = null;
+let noteSearchRequestId = 0; // guards against an older, slower request's response landing after a newer one
+
+async function runNoteSearch(query) {
+  const res = await fetch('/notes/search?q=' + encodeURIComponent(query));
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  return (data.results || []).map(r => ({
+    filename: r.filename,
+    groupIndex: r.group_index,
+    chunkIndex: r.chunk_index,
+    kind: r.kind,
+    chunk: r.chunk,
+    noteText: r.note_text,
+    ref: { timestamp: r.timestamp, iteration: r.iteration, model: r.model },
+  }));
+}
+
+function renderNoteSearchResults(results, query) {
+  const box = document.getElementById('noteSearchResults');
+  const status = document.getElementById('noteSearchStatus');
+  box.innerHTML = '';
+
+  if (!query) {
+    status.textContent = 'Type to search note content across every session.';
+    return;
+  }
+  status.textContent = `${results.length} matching note${results.length === 1 ? '' : 's'}`;
+  if (!results.length) return;
+
+  for (const r of results) {
+    const time = (r.ref.timestamp || '').split('T')[1]?.split('.')[0] || r.ref.timestamp || '?';
+    const card = document.createElement('div');
+    card.className = 'note-search-result';
+
+    const meta = document.createElement('div');
+    meta.className = 'note-search-meta';
+    if (r.kind === 'chunk') {
+      const roleClass = ROLE_COLORS[r.chunk.role] || 'role-tools';
+      meta.innerHTML = `
+        <span>${escapeHtml(r.filename)}</span>
+        <span>&middot;</span>
+        <span>iteration ${r.ref.iteration} &middot; ${time}</span>
+        <span>&middot;</span>
+        <span class="badge ${roleClass}">${r.chunk.role}</span>
+        <span>${escapeHtml(r.chunk.section)}</span>`;
+    } else {
+      meta.innerHTML = `
+        <span>${escapeHtml(r.filename)}</span>
+        <span>&middot;</span>
+        <span>iteration ${r.ref.iteration} &middot; ${time}</span>
+        <span>&middot;</span>
+        <span>iteration-level note</span>`;
+    }
+
+    const note = document.createElement('div');
+    note.className = 'note-search-note';
+    note.innerHTML = highlight(r.noteText, query);
+
+    card.appendChild(meta);
+    card.appendChild(note);
+
+    if (r.kind === 'chunk' && r.chunk) {
+      const pre = document.createElement('pre');
+      pre.className = 'note-search-chunk-content';
+      pre.textContent = r.chunk.content;
+      card.appendChild(pre);
+    } else {
+      const info = document.createElement('div');
+      info.className = 'note-search-chunk-content';
+      info.textContent = `Note on the whole iteration (model: ${r.ref.model || '?'}).`;
+      card.appendChild(info);
+    }
+
+    const open = document.createElement('div');
+    open.className = 'note-search-open';
+    open.textContent = 'Open in viewer \u2192';
+    card.appendChild(open);
+
+    card.addEventListener('click', () => openNoteSearchResult(r));
+    box.appendChild(card);
+  }
+}
+
+async function openNoteSearchResult(result) {
+  closeNoteSearch();
+  const sel = document.getElementById('fileSelect');
+  if (sel.value !== result.filename) {
+    sel.value = result.filename;
+    await loadFile(result.filename);
+  }
+  document.getElementById('searchBox').value = '';
+  selectedEntryIndex = result.groupIndex;
+
+  if (result.kind === 'chunk' && result.chunk) {
+    activeRoles.add(result.chunk.role);
+    activeSections.add(result.chunk.section);
+    const roleCb = document.getElementById('role-' + result.chunk.role);
+    if (roleCb) roleCb.checked = true;
+    const secCb = document.getElementById('sec-' + result.chunk.section);
+    if (secCb) secCb.checked = true;
+  }
+
+  buildRequestList();
+  render();
+
+  requestAnimationFrame(() => {
+    const iterDiv = document.querySelector(`.iteration[data-group-index="${result.groupIndex}"]`);
+    if (!iterDiv) return;
+    const chunkDiv = result.kind === 'chunk'
+      ? iterDiv.querySelector(`.chunk[data-chunk-index="${result.chunkIndex}"]`)
+      : null;
+    const target = chunkDiv || iterDiv;
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (chunkDiv) chunkDiv.querySelector('.chunk-body')?.classList.add('open');
+    target.classList.add('flash-target');
+    setTimeout(() => target.classList.remove('flash-target'), 1800);
+  });
+}
+
+function openNoteSearch() {
+  document.getElementById('noteSearchOverlay').classList.remove('hidden');
+  const input = document.getElementById('noteSearchInput');
+  input.value = '';
+  document.getElementById('noteSearchResults').innerHTML = '';
+  document.getElementById('noteSearchStatus').textContent = 'Type to search note content across every session.';
+  input.focus();
+}
+
+function closeNoteSearch() {
+  document.getElementById('noteSearchOverlay').classList.add('hidden');
+}
+
+document.getElementById('noteSearchBtn').addEventListener('click', openNoteSearch);
+document.getElementById('noteSearchCloseBtn').addEventListener('click', closeNoteSearch);
+document.getElementById('noteSearchOverlay').addEventListener('click', (e) => {
+  if (e.target.id === 'noteSearchOverlay') closeNoteSearch();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !document.getElementById('noteSearchOverlay').classList.contains('hidden')) {
+    closeNoteSearch();
+  }
+});
+document.getElementById('noteSearchInput').addEventListener('input', (e) => {
+  const query = e.target.value.trim();
+  clearTimeout(noteSearchDebounce);
+  if (!query) {
+    renderNoteSearchResults([], '');
+    return;
+  }
+  document.getElementById('noteSearchStatus').textContent = 'Searching\u2026';
+  const requestId = ++noteSearchRequestId;
+  noteSearchDebounce = setTimeout(async () => {
+    try {
+      const results = await runNoteSearch(query);
+      if (requestId !== noteSearchRequestId) return; // a newer keystroke already superseded this request
+      renderNoteSearchResults(results, query);
+    } catch (err) {
+      console.error('Note search failed:', err);
+      if (requestId !== noteSearchRequestId) return;
+      document.getElementById('noteSearchStatus').textContent = 'Search failed - is the server running?';
+      document.getElementById('noteSearchResults').innerHTML = '';
+    }
+  }, 300);
+});
 
 document.getElementById('searchBox').addEventListener('input', render);
 document.getElementById('expandAllBtn').addEventListener('click', () => {
