@@ -30,7 +30,7 @@ import numpy as np
 from ddgs import DDGS
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 
 import calendar_manager
 import duration_manager
@@ -91,6 +91,19 @@ _PROMPT_LOG_DIR = Path(PROMPT_LOG_DIR)
 _PROMPT_LOG_DIR.mkdir(exist_ok=True)
 SESSION_LOG_PATH = _PROMPT_LOG_DIR / f"session_{datetime.now():%Y%m%d_%H%M%S}.log"
 _prompt_log_lock = threading.Lock()
+
+# One annotations JSON file per log file, holding free-text notes the user
+# attaches from prompt_log_viewer.html. Keyed by group index (the log
+# entry's position after prompt/console pairing - see buildGroups() in the
+# viewer's JS) rather than iteration number, since iteration numbers aren't
+# guaranteed unique/contiguous (e.g. the orphaned-console edge case) while
+# position in the file is always stable once written.
+_annotations_lock = threading.Lock()
+
+
+def _annotations_path(filename: str) -> Path:
+    safe_name = Path(filename).name  # strips any path components - blocks traversal
+    return _PROMPT_LOG_DIR / f"{safe_name}.annotations.json"
 
 
 def _log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], tool_scores: dict | None = None) -> None:
@@ -1942,11 +1955,55 @@ async def get_prompt_log(filename: str):
                 print(f"[AGENT] Skipping malformed log line {line_num} in {filename}")
     return entries
 
+#annotation function for log center (*/web/prompt_log_viewer)
+@app.get("/prompt-logs/{filename}/annotations")
+async def get_prompt_log_annotations(filename: str):
+    """Returns the saved notes for one log file, or an empty shape if the
+    file has never been annotated."""
+    path = _annotations_path(filename)
+    if not path.is_file():
+        return {"iteration_notes": {}, "chunk_notes": {}}
+    try:
+        with _annotations_lock, open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[AGENT] Annotations read failed for {filename}: {e}")
+        return {"iteration_notes": {}, "chunk_notes": {}}
 
+
+@app.put("/prompt-logs/{filename}/annotations")
+async def put_prompt_log_annotations(filename: str, request: Request):
+    """Full-replace save of one log file's notes. Body is the whole
+    {"iteration_notes": {...}, "chunk_notes": {...}} shape - the viewer
+    always sends the complete, current set rather than a partial patch."""
+    body = await request.json()
+    if not isinstance(body, dict) or "iteration_notes" not in body or "chunk_notes" not in body:
+        raise HTTPException(status_code=400, detail="Expected {iteration_notes, chunk_notes}")
+    path = _annotations_path(filename)
+    try:
+        with _annotations_lock, open(path, "w", encoding="utf-8") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save annotations: {e}")
+    return {"saved": True}
+
+#endpoints for log center (*/web/prompt_log_viewer .html,.css,.js)
 @app.get("/prompt-log-viewer")
 async def prompt_log_viewer_page():
     html_path = Path(__file__).parent / "web" / "prompt_log_viewer.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+@app.get("/prompt_log_viewer.css")
+async def prompt_log_viewer_css():
+    css_path = Path(__file__).parent / "web" / "prompt_log_viewer.css"
+    return Response(content=css_path.read_text(encoding="utf-8"), media_type="text/css")
+
+
+@app.get("/prompt_log_viewer.js")
+async def prompt_log_viewer_js():
+    js_path = Path(__file__).parent / "web" / "prompt_log_viewer.js"
+    return Response(content=js_path.read_text(encoding="utf-8"), media_type="application/javascript")
 
 
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
