@@ -13,8 +13,20 @@
   <input type="text" id="searchBox" placeholder="Search chunk content...">
   <button id="expandAllBtn">Expand all</button>
   <button id="collapseAllBtn">Collapse all</button>
+  <button id="noteSearchBtn">Search notes&hellip;</button>
   <span id="saveStatus"></span>
 </header>
+
+<div id="noteSearchOverlay" class="note-search-overlay hidden">
+  <div class="note-search-panel">
+    <div class="note-search-head">
+      <input type="text" id="noteSearchInput" placeholder="Search note content across all sessions...">
+      <button id="noteSearchCloseBtn">Close</button>
+    </div>
+    <div class="note-search-status" id="noteSearchStatus"></div>
+    <div id="noteSearchResults" class="note-search-results"></div>
+  </div>
+</div>
 
 <div class="layout">
   <div class="sidebar">
