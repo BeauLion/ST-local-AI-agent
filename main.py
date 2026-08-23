@@ -30,7 +30,7 @@ import numpy as np
 from ddgs import DDGS
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 import calendar_manager
 import duration_manager
@@ -40,6 +40,7 @@ from console_log import alog, flush as flush_console
 from calendar_manager import CalendarError
 from duration_manager import DurationError
 from project_manager import ProjectManagerError
+from prompt_log_engine import log_prompt, log_console, router as prompt_log_router
 from config import (
     AGENT_API_KEY,
     CORS_ALLOWED_ORIGINS,
@@ -53,8 +54,6 @@ from config import (
     LLAMA_SERVER_URL,
     MAX_TOOL_ITERATIONS,
     MEMORY_IDENTITY_SLOTS,
-    PROMPT_LOG_DIR,
-    PROMPT_LOG_ENABLED,
     SAFE_FILES_DIR,
     TOOL_SELECTION_ALWAYS_INCLUDE,
     TOOL_SELECTION_ENABLED,
@@ -78,118 +77,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(prompt_log_router)
 
 
 # ---------------------------------------------------------------------------
-# Prompt-inspection logging: writes the EXACT JSON body this server sends to
-# llama-server (real, final prompt - system messages, full history, tools
-# schema, sampling params) to one file per server run. This is ground truth
-# of what the model actually saw - different from the per-section token-
-# count diagnostic further down, which only measures size, not content.
+# Prompt-inspection logging, annotations, and the /prompt-log-viewer page
+# now all live in prompt_log_engine.py - see the log_prompt/log_console
+# imports above and app.include_router(prompt_log_router) below.
 # ---------------------------------------------------------------------------
-_PROMPT_LOG_DIR = Path(PROMPT_LOG_DIR)
-_PROMPT_LOG_DIR.mkdir(exist_ok=True)
-SESSION_LOG_PATH = _PROMPT_LOG_DIR / f"session_{datetime.now():%Y%m%d_%H%M%S}.log"
-_prompt_log_lock = threading.Lock()
-
-# One annotations JSON file per log file, holding free-text notes the user
-# attaches from prompt_log_viewer.html. Keyed by group index (the log
-# entry's position after prompt/console pairing - see buildGroups() in the
-# viewer's JS) rather than iteration number, since iteration numbers aren't
-# guaranteed unique/contiguous (e.g. the orphaned-console edge case) while
-# position in the file is always stable once written.
-_annotations_lock = threading.Lock()
-
-
-def _annotations_path(filename: str) -> Path:
-    safe_name = Path(filename).name  # strips any path components - blocks traversal
-    return _PROMPT_LOG_DIR / f"{safe_name}.annotations.json"
-
-
-def _log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], tool_scores: dict | None = None) -> None:
-    """Append one JSON object (one line) to this run's session log file,
-    describing the exact request about to be POSTed to llama-server. Each
-    message is tagged with a `section` label so the log viewer page can
-    filter by chunk type, not just role. section_labels is positional -
-    section_labels[i] describes upstream_body["messages"][i]; anything
-    beyond that list's length is ordinary conversation history/tool-call
-    round-trip messages, which grow between iterations. Best-effort: a
-    write failure is printed but never blocks the actual turn."""
-    if not PROMPT_LOG_ENABLED:
-        return
-    try:
-        chunks = []
-        for i, msg in enumerate(upstream_body["messages"]):
-            section = section_labels[i] if i < len(section_labels) else "conversation"
-            content = msg.get("content")
-            if content is None and msg.get("tool_calls"):
-                content = json.dumps(msg["tool_calls"])
-            chunks.append({
-                "role": msg.get("role", "unknown"),
-                "section": section,
-                "content": content or "",
-            })
-        if upstream_body.get("tools"):
-            chunks.append({
-                "role": "tools",
-                "section": "tools_schema",
-                "content": json.dumps(upstream_body["tools"], indent=2),
-            })
-        if tool_scores:
-            included = {t["function"]["name"] for t in upstream_body.get("tools", [])}
-            chunks.append({
-                "role": "tools",
-                "section": "tool_selection_debug",
-                "content": json.dumps(
-                    {n: {"score": round(s, 3), "included": n in included}
-                     for n, s in sorted(tool_scores.items(), key=lambda kv: -kv[1])},
-                    indent=2,
-                ),
-            })
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "type": "prompt",
-            "iteration": iteration,
-            "model": upstream_body.get("model"),
-            "chunks": chunks,
-        }
-        with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[AGENT] Prompt log write failed: {e}")
-
-
-def _log_console(iteration: int, response: dict | None = None, thinking: str | None = None) -> None:
-    """Flushes everything buffered via console_log.alog() since the last
-    flush and appends it as its own JSONL entry, immediately after the
-    prompt entry it belongs to - prompt_log_viewer.html pairs them by
-    position. `response`, if given, is {"kind": ..., "text": ...} - the
-    model's actual output for this iteration. `thinking`, if given, is the
-    model's reasoning/chain-of-thought text for this iteration (only ever
-    populated when llama-server is run with --reasoning-format and the
-    loaded model actually emits one). Writes nothing if there's nothing at
-    all to record, so quiet iterations don't clutter the log."""
-    if not PROMPT_LOG_ENABLED:
-        flush_console()  # still drain it so it can't leak into a later request
-        return
-    lines = flush_console()
-    if not lines and not response and not thinking:
-        return
-    try:
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "type": "console",
-            "iteration": iteration,
-            "lines": lines,
-        }
-        if response:
-            entry["response"] = response
-        if thinking:
-            entry["thinking"] = thinking
-        with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[AGENT] Console log write failed: {e}")
 
 
 class LlamaServerError(Exception):
@@ -1918,92 +1813,10 @@ async def memory_browser_page():
 
 
 # ---------------------------------------------------------------------------
-# Prompt-log viewer HTTP API - plain REST for the /prompt-log-viewer page,
-# reading the JSONL files _log_prompt() writes to PROMPT_LOG_DIR.
+# Prompt-log viewer HTTP API (/prompt-logs*, /notes/search, and the viewer
+# page itself) now lives in prompt_log_engine.py, mounted above via
+# app.include_router(prompt_log_router).
 # ---------------------------------------------------------------------------
-
-@app.get("/prompt-logs")
-async def list_prompt_logs():
-    """Lists available session log files, most recent first."""
-    files = sorted(_PROMPT_LOG_DIR.glob("session_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [
-        {
-            "filename": f.name,
-            "size_kb": round(f.stat().st_size / 1024, 1),
-            "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
-        }
-        for f in files
-    ]
-
-
-@app.get("/prompt-logs/{filename}")
-async def get_prompt_log(filename: str):
-    """Returns one session log file's entries, parsed from JSONL."""
-    safe_name = Path(filename).name  # strips any path components - blocks traversal
-    path = _PROMPT_LOG_DIR / safe_name
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Log file not found")
-    entries = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                print(f"[AGENT] Skipping malformed log line {line_num} in {filename}")
-    return entries
-
-#annotation function for log center (*/web/prompt_log_viewer)
-@app.get("/prompt-logs/{filename}/annotations")
-async def get_prompt_log_annotations(filename: str):
-    """Returns the saved notes for one log file, or an empty shape if the
-    file has never been annotated."""
-    path = _annotations_path(filename)
-    if not path.is_file():
-        return {"iteration_notes": {}, "chunk_notes": {}}
-    try:
-        with _annotations_lock, open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[AGENT] Annotations read failed for {filename}: {e}")
-        return {"iteration_notes": {}, "chunk_notes": {}}
-
-
-@app.put("/prompt-logs/{filename}/annotations")
-async def put_prompt_log_annotations(filename: str, request: Request):
-    """Full-replace save of one log file's notes. Body is the whole
-    {"iteration_notes": {...}, "chunk_notes": {...}} shape - the viewer
-    always sends the complete, current set rather than a partial patch."""
-    body = await request.json()
-    if not isinstance(body, dict) or "iteration_notes" not in body or "chunk_notes" not in body:
-        raise HTTPException(status_code=400, detail="Expected {iteration_notes, chunk_notes}")
-    path = _annotations_path(filename)
-    try:
-        with _annotations_lock, open(path, "w", encoding="utf-8") as f:
-            json.dump(body, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save annotations: {e}")
-    return {"saved": True}
-
-#endpoints for log center (*/web/prompt_log_viewer .html,.css,.js)
-@app.get("/prompt-log-viewer")
-async def prompt_log_viewer_page():
-    html_path = Path(__file__).parent / "web" / "prompt_log_viewer.html"
-    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
-
-
-@app.get("/prompt_log_viewer.css")
-async def prompt_log_viewer_css():
-    css_path = Path(__file__).parent / "web" / "prompt_log_viewer.css"
-    return Response(content=css_path.read_text(encoding="utf-8"), media_type="text/css")
-
-
-@app.get("/prompt_log_viewer.js")
-async def prompt_log_viewer_js():
-    js_path = Path(__file__).parent / "web" / "prompt_log_viewer.js"
-    return Response(content=js_path.read_text(encoding="utf-8"), media_type="application/javascript")
 
 
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
@@ -2095,7 +1908,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
 
-            _log_prompt(upstream_body, iteration, section_labels or [], tool_scores)
+            log_prompt(upstream_body, iteration, section_labels or [], tool_scores)
             try:
                 async for chunk in _stream_chat(client, upstream_body):
                     delta = chunk["choices"][0].get("delta", {})
@@ -2136,7 +1949,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         # buffered, not yielded here — see below
             except LlamaServerError as e:
                 alog(f"[AGENT] {e}")
-                _log_console(iteration, {"kind": "error", "text": str(e)}, thinking=thinking)
+                log_console(iteration, {"kind": "error", "text": str(e)}, thinking=thinking)
                 yield ("delta", f"⚠️ {e}")
                 yield ("done", {"role": "assistant", "content": str(e)})
                 return
@@ -2149,7 +1962,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                 if unknown:
                     names = [c["function"]["name"] for c in unknown]
                     alog(f"[AGENT] Handing off {len(unknown)} client-owned tool call(s) to SillyTavern: {names}")
-                    _log_console(iteration, {"kind": "handoff", "text": json.dumps(calls, indent=2)}, thinking=thinking)
+                    log_console(iteration, {"kind": "handoff", "text": json.dumps(calls, indent=2)}, thinking=thinking)
                     yield ("handoff", message)
                     return
 
@@ -2250,7 +2063,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                                 ),
                             }
                         )
-                _log_console(iteration, {"kind": "tool_calls", "text": json.dumps(calls, indent=2)}, thinking=thinking)
+                log_console(iteration, {"kind": "tool_calls", "text": json.dumps(calls, indent=2)}, thinking=thinking)
                 continue  # loop again so the model can use the tool result
 
             # No tool call -> normally the final answer. But if the user's
@@ -2291,11 +2104,11 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         "of these tools first."
                     ),
                 })
-                _log_console(iteration, {"kind": "content_discarded", "text": content or ""}, thinking=thinking)
+                log_console(iteration, {"kind": "content_discarded", "text": content or ""}, thinking=thinking)
                 continue
 
             alog("[AGENT] Model answered directly, without calling any tool.")
-            _log_console(iteration, {"kind": "content", "text": content or ""}, thinking=thinking)
+            log_console(iteration, {"kind": "content", "text": content or ""}, thinking=thinking)
             if content:
                 yield ("delta", content)
             yield ("done", {"role": "assistant", "content": content})
@@ -2304,7 +2117,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
         # Hit MAX_TOOL_ITERATIONS without a final answer - bail out safely.
         bail_message = "(Agent stopped: too many tool calls in a row.)"
         alog(f"[AGENT] Bailed out after {MAX_TOOL_ITERATIONS} tool-call iterations without a final answer.")
-        _log_console(MAX_TOOL_ITERATIONS - 1, {"kind": "bailout", "text": bail_message}, thinking=thinking)
+        log_console(MAX_TOOL_ITERATIONS - 1, {"kind": "bailout", "text": bail_message}, thinking=thinking)
         yield ("delta", bail_message)
         yield ("done", {"role": "assistant", "content": bail_message})
 
