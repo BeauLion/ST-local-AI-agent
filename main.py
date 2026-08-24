@@ -56,6 +56,7 @@ from config import (
     MEMORY_IDENTITY_SLOTS,
     SAFE_FILES_DIR,
     TOOL_SELECTION_ALWAYS_INCLUDE,
+    TOOL_SELECTION_CONTEXT_CHAR_LIMIT,
     TOOL_SELECTION_ENABLED,
     TOOL_SELECTION_MIN_SCORE,
     TOOL_SELECTION_RESCUE_SCORE,
@@ -141,6 +142,20 @@ _CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_create_events_batch"
 _CALENDAR_APPLY_TOOLS = {"calendar_confirm_pending"}
 _BARE_CONFIRMATION_RE = re.compile(
     r"""^["'\s]*(yes|yeah|yep|sure|ok|okay|confirm|confirmed|go ahead|do it|correct|proceed)[.!]?["'\s]*$""",
+    re.IGNORECASE,
+)
+
+# Short closing remarks never trigger select_tools()'s context-widening
+# tier, even though they (correctly) score below TOOL_SELECTION_MIN_SCORE
+# alone same as any other ambiguous message. Without this carve-out, "thanks!"
+# right after a tool-heavy reply would fold that reply's tool-flavored
+# language into the widened query and needlessly resurrect the group for a
+# message that isn't actually asking for anything. Deliberately separate
+# from _BARE_CONFIRMATION_RE above - overlapping word list, different job
+# (that one gates calendar apply-on-confirm, not tool selection).
+_CLOSING_REMARK_RE = re.compile(
+    r"""^["'\s]*(thanks|thank you|thx|ty|cool|nice|great|perfect|sounds good|"""
+    r"""got it|no worries|nvm|never ?mind|that'?s all|all good)[.,!]?["'\s]*$""",
     re.IGNORECASE,
 )
 
@@ -1517,52 +1532,88 @@ _TOOL_EMBEDDINGS = {
 }
 
 
-def select_tools(user_text: str, force_names: set | None = None):
-    """Return (selected_tools, scores, used_rescue_tier).
+def select_tools(user_text: str, force_names: set | None = None, prior_assistant_text: str = ""):
+    """Return (selected_tools, scores, tier).
 
-    Two-tier matching: tools clearing TOOL_SELECTION_MIN_SCORE are used
-    directly. If NOTHING clears that (the normal case for plain
-    conversation), fall back to a much looser TOOL_SELECTION_RESCUE_SCORE
-    and take only the top few - this rescues genuinely ambiguous
-    tool-shaped requests without ever ballooning back out to the full
-    tool list, which plain chit-chat would otherwise trigger every time.
+    Three-tier matching:
+      1. "direct"           - tools clearing TOOL_SELECTION_MIN_SCORE
+                               against the current message alone. Unchanged
+                               from before this session.
+      2. "context_widened"  - only tried when (1) finds nothing AND the
+                               current message isn't a bare closing remark
+                               (_CLOSING_REMARK_RE). Re-scores [prior
+                               assistant reply + current message] against
+                               the same MIN_SCORE. Rescues elliptical
+                               follow-ups ("and also change the time to
+                               3pm") that carry no tool-relevant signal on
+                               their own but clearly continue a
+                               tool-relevant prior turn - without this,
+                               such messages fell all the way to
+                               core-only tools and sent the model into a
+                               tool-call loop with nothing useful to call.
+      3. "rescue"/"core_only" - existing loose-threshold top-K fallback,
+                               unchanged from before this session. Fires
+                               when even the widened query finds nothing -
+                               genuine plain chit-chat, or a closing remark
+                               that never reached tier 2 at all.
     """
     force_names = set(force_names or ())
 
     if not TOOL_SELECTION_ENABLED:
-        return TOOLS, {}, False
+        return TOOLS, {}, "disabled"
 
     text = (user_text or "").strip()
     if not text:
         selected_names = set(TOOL_SELECTION_ALWAYS_INCLUDE) | force_names
         selected_tools = [t for t in TOOLS if t["function"]["name"] in selected_names]
-        return selected_tools, {}, False
+        return selected_tools, {}, "empty"
 
     query_vec = np.array(memory.embed(text))
     scores = {name: float(query_vec @ vec) for name, vec in _TOOL_EMBEDDINGS.items()}
 
     confident = {n for n, s in scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
-    used_rescue = False
 
     if confident:
         selected_names = confident
+        tier = "direct"
     else:
-        # Nothing confidently matched - don't fall back to everything.
-        # Rescue only the handful of tools that are at least weakly
-        # related, in case this is an ambiguous real request rather than
-        # genuine chit-chat (which correctly rescues nothing at all).
-        ranked = sorted(scores.items(), key=lambda kv: -kv[1])
-        selected_names = {
-            n for n, s in ranked[:TOOL_SELECTION_RESCUE_TOP_K]
-            if s >= TOOL_SELECTION_RESCUE_SCORE
-        }
-        used_rescue = True
+        widened = set()
+        prior_text = (prior_assistant_text or "").strip()
+        if prior_text and not _CLOSING_REMARK_RE.match(text):
+            # Tail, not head - the embedder's own truncation on a long
+            # string keeps the start, but the part of a prior reply most
+            # relevant to a follow-up is usually its end (e.g. a trailing
+            # clarifying question). See config.py's comment on this constant.
+            prior_tail = prior_text[-TOOL_SELECTION_CONTEXT_CHAR_LIMIT:]
+            combined_vec = np.array(memory.embed(f"{prior_tail} {text}"))
+            combined_scores = {name: float(combined_vec @ vec) for name, vec in _TOOL_EMBEDDINGS.items()}
+            widened = {n for n, s in combined_scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
+            if widened:
+                # Debug log reflects the query that actually decided this,
+                # not the (lower, inconclusive) single-message scores.
+                scores = combined_scores
+
+        if widened:
+            selected_names = widened
+            tier = "context_widened"
+        else:
+            # Nothing confidently matched, even widened - don't fall back
+            # to everything. Rescue only the handful of tools that are at
+            # least weakly related, in case this is an ambiguous real
+            # request rather than genuine chit-chat (which correctly
+            # rescues nothing at all).
+            ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+            selected_names = {
+                n for n, s in ranked[:TOOL_SELECTION_RESCUE_TOP_K]
+                if s >= TOOL_SELECTION_RESCUE_SCORE
+            }
+            tier = "rescue" if selected_names else "core_only"
 
     selected_names |= set(TOOL_SELECTION_ALWAYS_INCLUDE)
     selected_names |= force_names
 
     selected_tools = [t for t in TOOLS if t["function"]["name"] in selected_names]
-    return selected_tools, scores, used_rescue
+    return selected_tools, scores, tier
 
 
 def build_tool_instruction(selected_tools: list, client_tool_names: set) -> str:
@@ -1870,7 +1921,7 @@ async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
         return None
 
 
-async def agent_loop(upstream_body: dict, section_labels: list[str] | None = None, tool_scores: dict | None = None):
+async def agent_loop(upstream_body: dict, section_labels: list[str] | None = None, tool_scores: dict | None = None, tool_tier: str | None = None):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
     way. Yields:
@@ -1908,7 +1959,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
 
-            log_prompt(upstream_body, iteration, section_labels or [], tool_scores)
+            log_prompt(upstream_body, iteration, section_labels or [], tool_scores, tool_tier)
             try:
                 async for chunk in _stream_chat(client, upstream_body):
                     delta = chunk["choices"][0].get("delta", {})
@@ -2156,11 +2207,22 @@ async def chat_completions(request: Request):
         (m.get("content") for m in reversed(body.get("messages", [])) if m.get("role") == "user"),
         "",
     )
+    # SillyTavern resends the full transcript as plain user/assistant text
+    # every turn (tool_calls/tool-role messages never leave agent_loop, see
+    # its docstring) - so the immediately preceding assistant reply is just
+    # the most recent "assistant" entry in that same list. Feeds select_tools()'s
+    # context-widening tier; see its docstring for why.
+    prior_assistant_text = next(
+        (m.get("content") for m in reversed(body.get("messages", [])) if m.get("role") == "assistant"),
+        "",
+    )
     force_tool_names = set()
     if calendar_manager.has_pending_change():
         force_tool_names = {name for name, group in TOOL_GROUPS.items() if group == "calendar"}
 
-    selected_tools, tool_scores, _fell_back = select_tools(str(last_user_text or ""), force_tool_names)
+    selected_tools, tool_scores, tool_tier = select_tools(
+        str(last_user_text or ""), force_tool_names, str(prior_assistant_text or "")
+    )
     upstream_body["tools"] = selected_tools + client_tools
     upstream_body["tool_choice"] = "auto"
 
@@ -2332,7 +2394,7 @@ async def chat_completions(request: Request):
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
         finish_reason = "stop"
-        async for kind, payload in agent_loop(upstream_body, message_section_labels, tool_scores):
+        async for kind, payload in agent_loop(upstream_body, message_section_labels, tool_scores, tool_tier):
             if kind in ("done", "handoff"):
                 final_message = payload
                 finish_reason = "tool_calls" if kind == "handoff" else "stop"
@@ -2359,7 +2421,7 @@ async def chat_completions(request: Request):
         return f"data: {json.dumps(payload)}\n\n".encode()
 
     async def event_stream():
-        async for kind, payload in agent_loop(upstream_body, message_section_labels, tool_scores):
+        async for kind, payload in agent_loop(upstream_body, message_section_labels, tool_scores, tool_tier):
             if kind == "delta":
                 yield sse({"index": 0, "delta": {"content": payload}, "finish_reason": None})
                 continue

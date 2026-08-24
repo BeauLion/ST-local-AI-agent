@@ -65,7 +65,7 @@ LLAMA_USE_JINJA = True         # --jinja: required for structured tool-call outp
 #LLAMA_REASONING_FORMAT = "deepseek"
 LLAMA_MD = "./llama.cpp/mtp-gemma-4-12B-it.gguf"
 LLAMA_SPEC_TYPE = "draft-mtp"
-
+#LLAMA_MMPROJ = "./llama.cpp/mmproj-Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf"
 
 def build_llama_server_command() -> list[str]:
     """
@@ -78,6 +78,7 @@ def build_llama_server_command() -> list[str]:
         "-hf", LLAMA_MODEL_REPO,
         "-md", LLAMA_MD,
         "--spec-type", LLAMA_SPEC_TYPE,
+        #"--mmproj", LLAMA_MMPROJ,
         "-ngl", str(LLAMA_NGL),
         "-c", str(LLAMA_CONTEXT),
         "--temp", str(LLAMA_TEMP),
@@ -198,6 +199,19 @@ TOOL_SELECTION_RESCUE_TOP_K = 3
 # needed across unrelated requests, and their absence is confusing to a
 # user who expects e.g. "what's 12*7" to always work.
 TOOL_SELECTION_ALWAYS_INCLUDE = ("get_current_time", "calculate", "run_python")
+
+# Context-widening tier (select_tools() in main.py) - only tried when the
+# current user message alone clears neither TOOL_SELECTION_MIN_SCORE nor
+# is a bare closing remark ("thanks!", "cool"). Re-scores [prior assistant
+# reply + current message] at the same MIN_SCORE before falling through to
+# the loose rescue tier below - rescues elliptical follow-ups like "and
+# also change the time to 3pm" that carry no tool signal on their own but
+# clearly continue a tool-relevant prior turn. Prior assistant text is
+# truncated to its LAST N characters (not the first N) before embedding,
+# since the embedding model's own truncation keeps the start of a long
+# string - and the most relevant part of a prior reply for a follow-up is
+# usually its tail (e.g. a trailing clarifying question), not its opening.
+TOOL_SELECTION_CONTEXT_CHAR_LIMIT = 400
 
 
 # ─────────────────────────────────────────────────────────────

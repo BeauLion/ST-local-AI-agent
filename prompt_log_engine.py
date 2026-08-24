@@ -62,7 +62,7 @@ def _annotations_path(filename: str) -> Path:
     return _PROMPT_LOG_DIR / f"{safe_name}.annotations.json"
 
 
-def log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], tool_scores: dict | None = None) -> None:
+def log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], tool_scores: dict | None = None, tool_tier: str | None = None) -> None:
     """Append one JSON object (one line) to this run's session log file,
     describing the exact request about to be POSTed to llama-server. Each
     message is tagged with a `section` label so the log viewer page can
@@ -93,7 +93,7 @@ def log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], t
             })
         if tool_scores:
             included = {t["function"]["name"] for t in upstream_body.get("tools", [])}
-            chunks.append({
+            debug_chunk = {
                 "role": "tools",
                 "section": "tool_selection_debug",
                 "content": json.dumps(
@@ -101,7 +101,15 @@ def log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], t
                      for n, s in sorted(tool_scores.items(), key=lambda kv: -kv[1])},
                     indent=2,
                 ),
-            })
+            }
+            # Additive only - existing "content" shape is untouched, so the
+            # current log viewer keeps working even if it doesn't render
+            # this field. Shows which of select_tools()'s tiers fired:
+            # "direct" / "context_widened" / "rescue" / "core_only" /
+            # "disabled" / "empty" - see main.py's select_tools() docstring.
+            if tool_tier:
+                debug_chunk["tier"] = tool_tier
+            chunks.append(debug_chunk)
         entry = {
             "timestamp": datetime.now().isoformat(),
             "type": "prompt",
