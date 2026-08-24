@@ -184,6 +184,20 @@ main { flex: 1; padding: 18px 22px; max-width: 980px; }
 .badge.role-console { background: #103a36; color: var(--c-console); }
 .badge.role-response { background: #2d3410; color: var(--c-response); }
 .badge.role-thinking { background: #241a3a; color: var(--c-thinking); }
+
+/* select_tools()'s tier ("direct"/"context_widened"/"rescue"/"core_only"/
+   "disabled"/"empty" - see main.py) shown next to the tool_selection_debug
+   chunk, and rolled up onto the iteration-head bar so it's visible without
+   expanding anything. Reuses the existing role-color palette rather than
+   introducing a new one: green = confident direct match, purple = the
+   context-widening tier, amber = the loose rescue tier, dim = nothing
+   selected (core-only/empty/disabled). */
+.badge.tier-direct { background: #16302233; color: var(--c-user); }
+.badge.tier-context_widened { background: #241a3a; color: var(--c-thinking); }
+.badge.tier-rescue { background: #3a2c10; color: var(--c-assistant); }
+.badge.tier-core_only,
+.badge.tier-empty,
+.badge.tier-disabled { background: #24272e; color: var(--text-dim); }
 .section-name {
   font-family: var(--mono);
   font-size: 12px;

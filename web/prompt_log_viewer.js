@@ -89,6 +89,27 @@ function groupRef(group) {
   return group.prompt || group.console;
 }
 
+// Pulls select_tools()'s tier label ("direct"/"context_widened"/"rescue"/
+// "core_only"/"disabled"/"empty" - see main.py) straight off the raw
+// tool_selection_debug chunk written by prompt_log_engine.py's
+// log_prompt(). Deliberately reads group.prompt.chunks directly rather
+// than going through groupChunks()'s role/section-filtered view, so the
+// iteration-head badge stays visible even if the "tools" role or that
+// section happens to be filtered out right now. Older log entries (from
+// before this field existed) have no "tier" key on the chunk - returns
+// null for those, same as if tool selection had never run.
+function groupToolTier(group) {
+  const chunks = group.prompt?.chunks;
+  if (!chunks) return null;
+  const debugChunk = chunks.find(c => c.section === 'tool_selection_debug');
+  return debugChunk?.tier || null;
+}
+
+function tierBadge(tier) {
+  if (!tier) return '';
+  return `<span class="badge tier-${tier}" title="tool selection tier">${tier.replace(/_/g, ' ')}</span>`;
+}
+
 // ---------------------------------------------------------------------
 // Annotations: load/save against the backend, plus the small inline
 // widget (pinned note / "+ note" button / textarea) shared by both
@@ -356,6 +377,7 @@ function render() {
       <div class="iteration-head">
         <span>${ref.timestamp}</span>
         <span>iteration ${ref.iteration} &middot; model: ${group.prompt?.model || '?'}</span>
+        ${tierBadge(groupToolTier(group))}
       </div>`;
     iterDiv.querySelector('.iteration-head').appendChild(
       createNoteWidget(annotations.iteration_notes, String(groupIndex), 'Note about this iteration\u2026')
@@ -374,6 +396,7 @@ function render() {
         <div class="chunk-head">
           <span class="badge ${roleClass}">${c.role}</span>
           <span class="section-name">${c.section}</span>
+          ${tierBadge(c.tier)}
           <span class="char-count">${c.content.length.toLocaleString()} chars</span>
         </div>
         <div class="chunk-body"><pre>${highlight(c.content, query)}</pre></div>`;
