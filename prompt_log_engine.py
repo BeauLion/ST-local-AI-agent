@@ -26,6 +26,7 @@ used to call the underscore-prefixed versions directly.
 
 import json
 import threading
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -55,6 +56,30 @@ _prompt_log_lock = threading.Lock()
 # (e.g. the orphaned-console edge case) while position in the file is
 # always stable once written.
 _annotations_lock = threading.Lock()
+
+
+def _get_git_commit() -> str | None:
+    """Best-effort short commit hash for the currently checked-out code.
+    Returns None if git isn't available or this isn't a repo (e.g. a
+    zipped copy) - callers must handle that, never raise."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+# Computed once per process, same lifetime as SESSION_LOG_PATH - the
+# commit a session ran under doesn't change mid-run.
+GIT_COMMIT = _get_git_commit()
 
 
 def _annotations_path(filename: str) -> Path:
@@ -115,6 +140,7 @@ def log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], t
             "type": "prompt",
             "iteration": iteration,
             "model": upstream_body.get("model"),
+            "commit": GIT_COMMIT,
             "chunks": chunks,
         }
         with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
