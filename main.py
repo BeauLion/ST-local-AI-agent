@@ -1532,6 +1532,20 @@ _TOOL_EMBEDDINGS = {
 }
 
 
+def _expand_to_groups(names: set[str]) -> set[str]:
+    """Given tool names that individually cleared a confidence threshold,
+    expand to every tool sharing a TOOL_GROUPS bucket with any of them.
+    ...
+    Deliberately NOT applied to the rescue tier (see select_tools) - rescue
+    exists for weak/ambiguous signals and stays narrow on purpose, or it
+    would reintroduce the "chit-chat drags in a whole tool group" problem
+    the tiered design exists to prevent.
+    """
+    groups_hit = {TOOL_GROUPS[n] for n in names if n in TOOL_GROUPS}
+    if not groups_hit:
+        return set(names)
+    return set(names) | {n for n, g in TOOL_GROUPS.items() if g in groups_hit}
+
 def select_tools(user_text: str, force_names: set | None = None, prior_assistant_text: str = ""):
     """Return (selected_tools, scores, tier).
 
@@ -1574,7 +1588,7 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
     confident = {n for n, s in scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
 
     if confident:
-        selected_names = confident
+        selected_names = _expand_to_groups(confident)   # was: selected_names = confident
         tier = "direct"
     else:
         widened = set()
@@ -1594,7 +1608,7 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
                 scores = combined_scores
 
         if widened:
-            selected_names = widened
+            selected_names = _expand_to_groups(widened)  # was: selected_names = widened
             tier = "context_widened"
         else:
             # Nothing confidently matched, even widened - don't fall back
