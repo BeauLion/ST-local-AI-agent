@@ -652,7 +652,9 @@ def project_manager_create_task(args: dict) -> str:
     try:
         state = project_manager._load()
         project = project_manager.resolve_project(state, args.get("project"))
-        task = project_manager.create_task(project["id"], args.get("title", ""))
+        task = project_manager.create_task(
+            project["id"], args.get("title", ""), notes=args.get("notes", "")
+        )
         return f"Created task {task['short_id']}: {task['title']}"
     except ProjectManagerError as e:
         return f"Error: {e}"
@@ -1164,6 +1166,7 @@ TOOLS = [
                 "properties": {
                     "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "title": {"type": "string", "description": "Short, concrete, verb-led task title."},
+                    "notes": {"type": "string", "description": "Optional. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task, put recognized tag lines at the very top, one per line: 'dur: 45m' (also '1h', '1h30m', '90'), 'effort: low'/'medium'/'high', 'when: morning'/'afternoon'/'evening' (optionally + 'weekday'/'weekend'). Any text after the tag lines is kept as freeform notes."},
                 },
                 "required": ["title"],
             },
