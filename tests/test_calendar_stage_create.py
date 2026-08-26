@@ -224,30 +224,76 @@ def test_batch_staged_description_lists_events_in_time_order_not_input_order(fak
 # stage_create_events_batch - duplicate guard and partial-failure behavior
 # ---------------------------------------------------------------------------
 
-def test_batch_treats_an_exact_duplicate_of_an_existing_event_as_a_conflict(fake_calendars):
-    """DISCOVERED ASYMMETRY (found by writing this test, not a pre-known
-    fact): stage_create_event's duplicate guard runs at CONFIRM time,
-    inside apply_fn (_find_matching_event), and quietly skips an exact
-    retry-duplicate. stage_create_events_batch's conflict check instead
-    runs at STAGE time via _get_busy_intervals, which has no concept of
-    'this proposed event IS the thing that already exists' - it only
-    sees a time-slot collision. So re-proposing an already-existing
-    event inside a batch is rejected as a conflict and blocks staging
-    the ENTIRE batch (including unrelated events in it), rather than
-    being silently skipped the way the single-event path would handle
-    the same retry scenario. Documenting current behavior here, not
-    asserting it's correct - worth a decision on whether batch should
-    match single-event behavior."""
+def test_batch_skips_an_exact_duplicate_of_an_existing_event_instead_of_conflicting(fake_calendars):
+    """RESOLVED ASYMMETRY (was previously documented as a conflict - see
+    handover-32 and the decision recorded there): stage_create_event's
+    duplicate guard runs at CONFIRM time, inside apply_fn
+    (_find_matching_event), and quietly skips an exact retry-duplicate.
+    stage_create_events_batch's staging-time check now mirrors that: an
+    exact duplicate (same title, same start) is filtered out via
+    _find_matching_event BEFORE the overlap checks run, so it can no
+    longer collide with itself and block the rest of the batch. The
+    unrelated event in this batch (Dentist) must still get staged and
+    created; the duplicate (Standup) must be reported, not silently
+    dropped."""
     fake_calendars[0].seed_event("Standup", datetime(2026, 9, 1, 9, 0), datetime(2026, 9, 1, 9, 30))
 
     events = [
         {"title": "Standup", "start": "2026-09-01 09:00", "end": "2026-09-01 09:30"},
         {"title": "Dentist", "start": "2026-09-01 11:00", "end": "2026-09-01 11:30"},
     ]
-    with pytest.raises(CalendarError, match="conflicts with an existing event 'Standup'"):
-        cm.stage_create_events_batch(events=events)
+    result = cm.stage_create_events_batch(events=events)
 
-    assert len(fake_calendars[0].events) == 1  # nothing staged or created - not even Dentist
+    assert "already exist" in result
+    assert "Standup" in result  # named as skipped, not silently dropped
+    assert "Dentist" in result  # still going to be created
+
+    cm.confirm_pending()
+
+    titles = [str(e.icalendar_component.get("summary")) for e in fake_calendars[0].events]
+    assert titles.count("Standup") == 1  # not duplicated
+    assert "Dentist" in titles           # unrelated event still created
+
+
+def test_batch_all_duplicates_skips_staging_entirely(fake_calendars):
+    """If EVERY proposed event turns out to be an exact duplicate, there's
+    nothing left to create - stage_create_events_batch should say so
+    directly and not leave a pending change with nothing to confirm."""
+    fake_calendars[0].seed_event("Standup", datetime(2026, 9, 1, 9, 0), datetime(2026, 9, 1, 9, 30))
+
+    events = [{"title": "Standup", "start": "2026-09-01 09:00", "end": "2026-09-01 09:30"}]
+    result = cm.stage_create_events_batch(events=events)
+
+    assert "already exist" in result
+    assert "Standup" in result
+    assert cm.has_pending_change() is False
+    assert len(fake_calendars[0].events) == 1  # still just the original
+
+
+def test_batch_duplicate_does_not_falsely_conflict_with_itself(fake_calendars):
+    """A skipped duplicate is excluded from the proposed-vs-proposed
+    overlap check so it can't collide with ITSELF (the original bug this
+    quirk fix addresses). It's still a real, pre-existing event on the
+    calendar though, so a genuinely different proposed event landing in
+    that same slot is a real double-booking and must still be rejected -
+    that part of the conflict check is unchanged."""
+    fake_calendars[0].seed_event("Standup", datetime(2026, 9, 1, 9, 0), datetime(2026, 9, 1, 9, 30))
+
+    events = [
+        {"title": "Standup", "start": "2026-09-01 09:00", "end": "2026-09-01 09:30"},  # duplicate, skipped
+        {"title": "Dentist", "start": "2026-09-01 11:00", "end": "2026-09-01 11:30"},  # unrelated, no overlap
+    ]
+    # No error raised - the duplicate no longer "conflicts with itself".
+    result = cm.stage_create_events_batch(events=events)
+    assert "already exist" in result
+
+    # A genuinely different event proposed for the SAME slot as the
+    # duplicate is still a real conflict against the calendar - the
+    # duplicate being skipped doesn't free up that time slot.
+    cm.cancel_pending()
+    clashing_events = [{"title": "Something Else", "start": "2026-09-01 09:00", "end": "2026-09-01 09:30"}]
+    with pytest.raises(CalendarError, match="conflicts with an existing event 'Standup'"):
+        cm.stage_create_events_batch(events=clashing_events)
 
 
 def test_batch_partial_failure_reports_progress_and_is_safe_to_retry(fake_calendars, monkeypatch):

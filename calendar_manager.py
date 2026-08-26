@@ -952,7 +952,9 @@ class _CreateEventsBatchInput(BaseModel):
     calendar_name: str | None = None
 
     calendar: object = None
-    prepared: list = None  # list[dict] of {title, start_dt, end_dt, location, description}
+    prepared: list = None  # list[dict] of {title, start_dt, end_dt, location, description} - will actually be created
+    skipped: list = None   # list[dict] of {title, start_dt, end_dt} - exact duplicates of events that already exist,
+                            # excluded from `prepared` and never checked for conflicts (see decision note below)
 
     @field_validator("events", mode="before")
     @classmethod
@@ -971,48 +973,75 @@ class _CreateEventsBatchInput(BaseModel):
     def _resolve_and_prepare(self) -> "_CreateEventsBatchInput":
         self.calendar = _resolve_calendar(self.calendar_name)  # validated up front, same as stage_create_event
 
-        prepared = []
+        all_events = []
         for i, raw_event in enumerate(self.events):
             try:
                 item = _BatchEventItem(**raw_event)
             except CalendarError as e:
                 raise CalendarError(f"Event {i + 1}{e}")
-            prepared.append({
+            all_events.append({
                 "title": item.title, "start_dt": item.start_dt, "end_dt": item.end_dt,
                 "location": item.location, "description": item.description,
             })
 
-        # No two proposed events may overlap each other.
-        ordered = sorted(prepared, key=lambda p: p["start_dt"])
-        for a, b in zip(ordered, ordered[1:]):
-            if a["end_dt"] > b["start_dt"]:
-                raise CalendarError(
-                    f"Proposed events overlap: '{a['title']}' ({a['start_dt'].strftime('%H:%M')}-"
-                    f"{a['end_dt'].strftime('%H:%M')}) and '{b['title']}' "
-                    f"({b['start_dt'].strftime('%H:%M')}-{b['end_dt'].strftime('%H:%M')}). "
-                    f"Adjust the times so no two proposed events overlap, then retry."
-                )
+        # Exact-duplicate check runs FIRST, against the target calendar
+        # only, using the same title+start-window match as
+        # _find_matching_event (the guard stage_create_event's apply_fn
+        # already relies on) - not a fresh definition of "duplicate".
+        # DECISION (see handover): an event that's an exact duplicate of
+        # something already on the calendar is skipped here rather than
+        # treated as a conflict, so a batch re-proposed after a small
+        # edit (e.g. "move the 2pm one") doesn't get blocked entirely by
+        # the one unchanged event. It's excluded from the PROPOSED-VS-
+        # PROPOSED check below, so it can no longer be reported as
+        # "conflicting" with itself. It is NOT exempted from the
+        # proposed-vs-EXISTING-calendar busy check further down - the
+        # duplicate is still a real event sitting on the real calendar
+        # (it's being skipped, not deleted), so a genuinely different
+        # proposed event landing in that same slot is still a real
+        # double-booking and must still be rejected. Skipped events are
+        # reported back (not silently dropped) so the confirmation
+        # summary stays honest about what changed.
+        prepared, skipped = [], []
+        for p in all_events:
+            if _find_matching_event(self.calendar, p["title"], p["start_dt"]) is not None:
+                skipped.append(p)
+            else:
+                prepared.append(p)
 
-        # None of the proposed events may collide with what's already on
-        # the calendar - checked across every calendar on the account,
-        # not just the target one for this batch.
-        window_start = min(p["start_dt"] for p in prepared).replace(tzinfo=None)
-        window_end = max(p["end_dt"] for p in prepared).replace(tzinfo=None)
-        busy = _get_busy_intervals(window_start, window_end)  # fetched ONCE for the whole
-                                                                # batch, not once per event -
-                                                                # the earlier per-event fetch
-                                                                # multiplied CalDAV round-trips
-                                                                # (and timeout risk) by batch size
-        for p in prepared:
-            for busy_start, busy_end, busy_title in busy:
-                if _overlaps(p["start_dt"], p["end_dt"], busy_start, busy_end):
+        if prepared:
+            # No two proposed (non-duplicate) events may overlap each other.
+            ordered = sorted(prepared, key=lambda p: p["start_dt"])
+            for a, b in zip(ordered, ordered[1:]):
+                if a["end_dt"] > b["start_dt"]:
                     raise CalendarError(
-                        f"'{p['title']}' ({p['start_dt'].strftime('%a %H:%M')}-{p['end_dt'].strftime('%H:%M')}) "
-                        f"conflicts with an existing event '{busy_title}' ({busy_start.strftime('%H:%M')}-"
-                        f"{busy_end.strftime('%H:%M')}). Adjust the proposed schedule around it, then retry."
+                        f"Proposed events overlap: '{a['title']}' ({a['start_dt'].strftime('%H:%M')}-"
+                        f"{a['end_dt'].strftime('%H:%M')}) and '{b['title']}' "
+                        f"({b['start_dt'].strftime('%H:%M')}-{b['end_dt'].strftime('%H:%M')}). "
+                        f"Adjust the times so no two proposed events overlap, then retry."
                     )
 
+            # None of the remaining proposed events may collide with what's
+            # already on the calendar - checked across every calendar on
+            # the account, not just the target one for this batch.
+            window_start = min(p["start_dt"] for p in prepared).replace(tzinfo=None)
+            window_end = max(p["end_dt"] for p in prepared).replace(tzinfo=None)
+            busy = _get_busy_intervals(window_start, window_end)  # fetched ONCE for the whole
+                                                                    # batch, not once per event -
+                                                                    # the earlier per-event fetch
+                                                                    # multiplied CalDAV round-trips
+                                                                    # (and timeout risk) by batch size
+            for p in prepared:
+                for busy_start, busy_end, busy_title in busy:
+                    if _overlaps(p["start_dt"], p["end_dt"], busy_start, busy_end):
+                        raise CalendarError(
+                            f"'{p['title']}' ({p['start_dt'].strftime('%a %H:%M')}-{p['end_dt'].strftime('%H:%M')}) "
+                            f"conflicts with an existing event '{busy_title}' ({busy_start.strftime('%H:%M')}-"
+                            f"{busy_end.strftime('%H:%M')}). Adjust the proposed schedule around it, then retry."
+                        )
+
         self.prepared = prepared
+        self.skipped = skipped
         return self
 
 
@@ -1021,9 +1050,31 @@ def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
     pending change - e.g. a proposed morning schedule. Validates that no
     two proposed events overlap each other, and that none of them
     overlap anything already on the calendar, before staging anything.
-    A single calendar_confirm_pending call then creates all of them."""
+    A single calendar_confirm_pending call then creates all of them.
+
+    Events that exactly match something already on the calendar (same
+    title, same start time) are skipped rather than blocking the whole
+    batch - see _CreateEventsBatchInput._resolve_and_prepare for why.
+    They're still named explicitly in the returned text, both here (if
+    nothing else needs staging) and in the staged description below."""
     data = _CreateEventsBatchInput(events=events, calendar_name=calendar_name)
-    cal, prepared = data.calendar, data.prepared
+    cal, prepared, skipped = data.calendar, data.prepared, data.skipped
+
+    def _skipped_lines(items):
+        return [
+            f"- {p['title']}: {p['start_dt'].strftime('%a %Y-%m-%d %H:%M')}-{p['end_dt'].strftime('%H:%M')} "
+            f"(already exists - not duplicated)"
+            for p in sorted(items, key=lambda p: p["start_dt"])
+        ]
+
+    if not prepared:
+        # Every proposed event was an exact duplicate - nothing left to
+        # create, so there's nothing to stage/confirm either.
+        lines = _skipped_lines(skipped)
+        return (
+            f"All {len(skipped)} event(s) already exist on '{cal.name or '(unnamed)'}' - "
+            f"nothing new to create:\n" + "\n".join(lines)
+        )
 
     def apply_fn() -> str:
         results = []
@@ -1054,6 +1105,11 @@ def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
         for p in sorted(prepared, key=lambda p: p["start_dt"])  # display in time order, same as the original's "ordered"
     ]
     desc = f"CREATE {len(prepared)} events in calendar '{cal.name or '(unnamed)'}':\n" + "\n".join(lines)
+    if skipped:
+        desc += (
+            f"\n{len(skipped)} event(s) already exist and will be skipped:\n"
+            + "\n".join(_skipped_lines(skipped))
+        )
     return _stage(desc, apply_fn)
 
 
@@ -1185,14 +1241,29 @@ class _EditEventInput(BaseModel):
     @field_validator("title")
     @classmethod
     def _strip_title(cls, v):
-        # Truthy check, matching the original exactly: an all-emoji title
-        # strips down to "", which is falsy, and both here and in
-        # stage_edit_event's changes-list logic that's treated as "no
-        # title change requested" - unlike stage_create_event, this does
-        # NOT raise its own "emoji only" error. Preserved as-is (existing
-        # behavior, not something this refactor should silently change),
-        # though possibly worth a follow-up decision later.
-        return _strip_unsafe_text(v) if v else v
+        # FIXED (previously a silent no-op - see the old comment this
+        # replaced, and handover-32): an all-emoji title strips down to
+        # "" via _strip_unsafe_text. The original truthy check treated
+        # that the same as "the caller didn't mention title at all,"
+        # silently dropping the requested change with no feedback -
+        # unlike stage_create_event, which has always raised its own
+        # dedicated error for this exact case. DECISION: match create's
+        # behavior here too, since there's no legitimate "clear the
+        # title" use case to protect (unlike location/description below,
+        # where an explicit "" IS a meaningful clear-this-field request).
+        # None still means "not mentioned, leave title alone" and is left
+        # untouched; anything else that strips down to empty is now a
+        # hard error instead of a silent drop.
+        if v is None:
+            return v
+        cleaned = _strip_unsafe_text(v)
+        if not cleaned:
+            raise CalendarError(
+                "An event title is required (the title given was emoji/symbols "
+                "only, which had to be removed - see calendar_manager.py's "
+                "_strip_unsafe_text for why)."
+            )
+        return cleaned
 
     @field_validator("location", "description")
     @classmethod

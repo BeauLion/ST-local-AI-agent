@@ -59,6 +59,40 @@ def test_edit_rejects_unparseable_date_before_staging(fake_calendars):
     assert cm.has_pending_change() is False
 
 
+def test_edit_with_all_emoji_title_raises_instead_of_silently_dropping_it(fake_calendars):
+    """RESOLVED INCONSISTENCY (was previously a silent no-op - see
+    handover-32 and the decision recorded there): an all-emoji title
+    strips down to "" via _strip_unsafe_text. stage_create_event has
+    always raised its own dedicated error for this case; stage_edit_event
+    used to use a truthy check and silently treat it as "no title change
+    requested," giving no feedback that the request was dropped.
+    DECISION: match create's behavior - raise the same error instead."""
+    ev = fake_calendars[0].seed_event("Standup", datetime(2026, 9, 1, 9, 0))
+    real_uid = str(ev.icalendar_component.get("uid"))
+
+    with pytest.raises(CalendarError, match="emoji/symbols only"):
+        cm.stage_edit_event(event_uid=real_uid, title="🎉🎉")
+
+    assert cm.has_pending_change() is False  # rejected before anything was staged
+    assert str(ev.icalendar_component.get("summary")) == "Standup"  # untouched
+
+
+def test_edit_with_none_title_still_means_no_title_change(fake_calendars):
+    """Sanity check alongside the fix above: title=None (the default,
+    meaning 'the caller didn't mention title at all') must still be
+    left alone, not treated as an error - only a title that STRIPS DOWN
+    to empty is now rejected."""
+    ev = fake_calendars[0].seed_event("Standup", datetime(2026, 9, 1, 9, 0), location="Office")
+    real_uid = str(ev.icalendar_component.get("uid"))
+
+    cm.stage_edit_event(event_uid=real_uid, location="New Office")  # title not mentioned
+    cm.confirm_pending()
+
+    comp = ev.icalendar_component
+    assert str(comp.get("summary")) == "Standup"  # unchanged
+    assert str(comp.get("location")) == "New Office"
+
+
 # ---------------------------------------------------------------------------
 # Direct UID match - the simple, non-fallback path
 # ---------------------------------------------------------------------------
