@@ -41,6 +41,9 @@ from config import (
     MAX_TASKS_IN_CONTEXT,
     PROJECT_DATA_DIR,
     PROJECT_STATUSES,
+    TASK_NOTE_EFFORT_ALIASES,
+    TASK_NOTE_WHEN_MODIFIERS,
+    TASK_NOTE_WHEN_TIMES,
     TASK_PRIORITIES,
     TASK_STATUSES,
 )
@@ -123,6 +126,131 @@ def _allocate_project_code(state: dict, name: str) -> str:
         if candidate not in used:
             return candidate
     raise ProjectManagerError("Could not allocate a unique project code.")
+
+
+# --------------------------- note tags ---------------------------
+# Lightweight "key: value" tag syntax recognized only at the very top of a
+# task's notes (front-matter style). Lets frequently-used task properties
+# (duration estimate, effort, preferred time window) show up automatically
+# in build_context_text() without a separate lookup - see brainstorm notes
+# in the handover for this session. Any note with no recognized tag lines
+# at the top (i.e. every note written before this feature existed) simply
+# comes back as tags={} and prose==notes, unchanged.
+
+_TAG_LINE_RE = re.compile(r"^(\w+)\s*:\s*(.+)$")
+
+
+def _parse_when_tag(value: str):
+    words = value.lower().split()
+    if not words or len(words) > 2:
+        return None
+    time_word = modifier_word = None
+    for word in words:
+        if word in TASK_NOTE_WHEN_TIMES and time_word is None:
+            time_word = word
+        elif word in TASK_NOTE_WHEN_MODIFIERS and modifier_word is None:
+            modifier_word = word
+        else:
+            return None
+    if time_word is None:
+        return None
+    return f"{time_word} {modifier_word}" if modifier_word else time_word
+
+
+def _parse_note_tags(notes: str) -> tuple:
+    """Returns (tags_dict, prose_str). Parses recognized 'key: value' lines
+    starting at line 1; stops at the first line that isn't a recognized,
+    validly-formatted tag - that line and everything after it is the
+    unmodified prose. Never raises - an invalid-looking tag line just ends
+    the tag block early and becomes part of the prose instead."""
+    if not notes:
+        return {}, ""
+    lines = notes.split("\n")
+    tags = {}
+    consumed = 0
+    for line in lines:
+        match = _TAG_LINE_RE.match(line.strip())
+        if not match:
+            break
+        key, value = match.group(1).lower(), match.group(2).strip()
+        if key == "dur":
+            minutes = duration_manager.parse_duration_minutes(value)
+            if minutes is None:
+                break
+            tags["dur"] = minutes
+        elif key == "effort":
+            level = TASK_NOTE_EFFORT_ALIASES.get(value.lower())
+            if level is None:
+                break
+            tags["effort"] = level
+        elif key == "when":
+            when = _parse_when_tag(value)
+            if when is None:
+                break
+            tags["when"] = when
+        else:
+            break
+        consumed += 1
+    prose = "\n".join(lines[consumed:]).strip()
+    return tags, prose
+
+
+def _format_duration_tag(minutes: float) -> str:
+    total = round(minutes)
+    hours, mins = divmod(total, 60)
+    if hours and mins:
+        return f"{hours}h{mins}m"
+    if hours:
+        return f"{hours}h"
+    return f"{mins}m"
+
+
+def _format_tags_block(tags: dict) -> str:
+    """Reconstructs the canonical top-of-note tag lines, in a fixed order,
+    for writing back to storage (used when merging tags on append)."""
+    lines = []
+    if "dur" in tags:
+        lines.append(f"dur: {_format_duration_tag(tags['dur'])}")
+    if "effort" in tags:
+        lines.append(f"effort: {tags['effort']}")
+    if "when" in tags:
+        lines.append(f"when: {tags['when']}")
+    return "\n".join(lines)
+
+
+def _format_tags_inline(tags: dict) -> str:
+    """Compact '~45m · medium effort · afternoon weekend' style summary for
+    the project context block."""
+    parts = []
+    if "dur" in tags:
+        parts.append(f"~{_format_duration_tag(tags['dur'])}")
+    if "effort" in tags:
+        parts.append(f"{tags['effort']} effort")
+    if "when" in tags:
+        parts.append(tags["when"])
+    return " \u00b7 ".join(parts)
+
+
+def _compute_next_notes(current: str, mode: str, text: str) -> str:
+    """Shared by update_task_notes() and the batch-update path so both
+    apply identical tag-merge semantics. For 'append', tags are parsed out
+    of both the existing notes and the new text and merged (new values
+    win), then rewritten as a single tag block on top with all prose
+    (old then new) joined below - so adding one new tag later doesn't get
+    stranded below unrelated prose where it would never be recognized
+    again. When neither side has any tags, this reduces to the original
+    plain string-join behavior."""
+    if mode == "clear":
+        return ""
+    if mode == "replace":
+        return str(text or "")
+
+    old_tags, old_prose = _parse_note_tags(current)
+    new_tags, new_prose = _parse_note_tags(text)
+    merged_tags = {**old_tags, **new_tags}
+    combined_prose = "\n".join(filter(None, [old_prose, _normalize_text(new_prose)]))
+    tag_block = _format_tags_block(merged_tags)
+    return "\n".join(filter(None, [tag_block, combined_prose]))
 
 
 def _format_task_short_id(project: dict, number: int) -> str:
@@ -357,7 +485,7 @@ def create_task(project_id: str, title: str, *, priority="normal", notes="") -> 
 
 
 def _apply_task_status(task: dict, status: str, project_id: str):
-    if task["status"] == "active" and status not in ("active", "done"):
+    if task["status"] == "active" and status != "active":
         duration_manager.on_task_inactive(task["id"])
 
     task["status"] = status
@@ -432,12 +560,7 @@ def update_task_notes(project_id: str, task_id: str, mode: str, text: str = "") 
             raise ProjectManagerError("Task not found.")
         task = project["tasks"][task_id]
         current = task.get("notes", "")
-        if mode == "clear":
-            next_notes = ""
-        elif mode == "append":
-            next_notes = "\n".join(filter(None, [current, _normalize_text(text)]))
-        else:
-            next_notes = str(text or "")
+        next_notes = _compute_next_notes(current, mode, text)
         task["notes"] = next_notes[:MAX_TASK_NOTE_LENGTH]
         task["updated_at"] = _now()
         project["updated_at"] = _now()
@@ -532,12 +655,7 @@ def _validate_batch_operations(project: dict, operations: list) -> list:
                 actionable.append(op)
                 continue
             current = task.get("notes", "")
-            if op["mode"] == "clear":
-                next_notes = ""
-            elif op["mode"] == "append":
-                next_notes = "\n".join(filter(None, [current, _normalize_text(op["text"])]))
-            else:
-                next_notes = op["text"]
+            next_notes = _compute_next_notes(current, op["mode"], op["text"])
             if next_notes != current:
                 actionable.append(op)
         else:
@@ -609,12 +727,7 @@ def _apply_operation_to_project(project: dict, operation: dict):
 
     if operation["type"] == "update_task_notes":
         current = task.get("notes", "")
-        if operation["mode"] == "clear":
-            next_notes = ""
-        elif operation["mode"] == "append":
-            next_notes = "\n".join(filter(None, [current, _normalize_text(operation["text"])]))
-        else:
-            next_notes = operation["text"]
+        next_notes = _compute_next_notes(current, operation["mode"], operation["text"])
         if next_notes == current:
             raise ProjectManagerError(f"Notes for \u201c{task['title']}\u201d already match the requested result.")
         task["notes"] = next_notes[:MAX_TASK_NOTE_LENGTH]
@@ -722,7 +835,11 @@ def build_context_text(state: dict) -> str:
     ]
     if selected:
         lines.append("Tasks:")
-        lines.extend(f"- {symbols[t['status']]} {t['short_id']} {t['title']}" for t in selected)
+        for t in selected:
+            tags, _ = _parse_note_tags(t.get("notes", ""))
+            tag_str = _format_tags_inline(tags)
+            suffix = f"  [{tag_str}]" if tag_str else ""
+            lines.append(f"- {symbols[t['status']]} {t['short_id']} {t['title']}{suffix}")
     else:
         lines.append("Tasks: none")
 
@@ -734,6 +851,8 @@ def build_context_text(state: dict) -> str:
         "project_manager_set_all_tasks_status exactly once; do not enumerate tasks first. "
         "Completing all tasks does not complete the project - only change project status when the "
         "user explicitly requests that project-level change. Keep planning responses concise and "
-        "prioritize one next action."
+        "prioritize one next action. Bracketed tags after a task (e.g. '~45m \u00b7 medium effort \u00b7 "
+        "afternoon weekend') are user-set duration/effort/timing properties parsed from that task's "
+        "notes - factor them into prioritization and scheduling suggestions."
     )
     return "\n".join(lines)

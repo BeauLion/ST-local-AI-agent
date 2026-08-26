@@ -31,6 +31,9 @@ agent_files/*
 prompt_logs/*
 !prompt_logs/.gitkeep
 
+bugs/*
+!bugs/.gitkeep
+
 # Environment variables / secrets, if you ever add an .env file later
 .env
 

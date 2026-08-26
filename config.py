@@ -62,10 +62,10 @@ LLAMA_TOP_K = 20
 LLAMA_MIN_P = 0.0   # new constant - see command builder change below
 LLAMA_FLASH_ATTENTION = 'on'   # -fa: flash attention, speed optimization [on|off|auto]
 LLAMA_USE_JINJA = True         # --jinja: required for structured tool-call output
-LLAMA_REASONING_FORMAT = "deepseek"
+#LLAMA_REASONING_FORMAT = "deepseek"
 LLAMA_MD = "./llama.cpp/mtp-gemma-4-12B-it.gguf"
 LLAMA_SPEC_TYPE = "draft-mtp"
-
+#LLAMA_MMPROJ = "./llama.cpp/mmproj-Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf"
 
 def build_llama_server_command() -> list[str]:
     """
@@ -78,6 +78,7 @@ def build_llama_server_command() -> list[str]:
         "-hf", LLAMA_MODEL_REPO,
         "-md", LLAMA_MD,
         "--spec-type", LLAMA_SPEC_TYPE,
+        #"--mmproj", LLAMA_MMPROJ,
         "-ngl", str(LLAMA_NGL),
         "-c", str(LLAMA_CONTEXT),
         "--temp", str(LLAMA_TEMP),
@@ -165,6 +166,55 @@ MEMORY_DEDUPE_SIMILARITY_THRESHOLD = 0.65
 
 
 # ─────────────────────────────────────────────────────────────
+# Dynamic tool selection (main.py's select_tools) — sends only the tool
+# groups relevant to the user's last message instead of this server's full
+# ~28-tool schema on every request, to cut prompt tokens. Scored the same
+# way as memory recall: embed the query, cosine-similarity against a short
+# description of each tool group (see TOOL_GROUP_DESCRIPTIONS in main.py).
+# ─────────────────────────────────────────────────────────────
+
+# Master switch - False sends every tool on every request (the old
+# behavior), useful for A/B-ing prompt size against answer quality.
+TOOL_SELECTION_ENABLED = True
+
+# Minimum cosine-similarity score for a tool group to be included. Same
+# scale/reasoning as MEMORY_SIMILARITY_THRESHOLD above - needs live tuning;
+# the tool_selection_debug block _log_prompt() writes when PROMPT_LOG_ENABLED
+# is on (see main.py) shows every group's actual score, which is the
+# intended way to tune this from real traffic instead of guessing blind.
+TOOL_SELECTION_MIN_SCORE = 0.2
+
+# Secondary, much looser threshold used ONLY when nothing clears
+# TOOL_SELECTION_MIN_SCORE - rescues genuinely ambiguous tool requests
+# (e.g. oddly-phrased ones) without dragging in the full 34-tool list the
+# way an unconditional fallback would. Plain conversation, where nothing
+# clears even this, correctly gets just the core always-include set.
+TOOL_SELECTION_RESCUE_SCORE = 0.18
+
+# Cap on how many tools the rescue tier can add, so a weak/ambiguous match
+# still stays small rather than ballooning back toward "everything".
+TOOL_SELECTION_RESCUE_TOP_K = 3
+
+# Individual tool names always sent regardless of score - cheap, frequently
+# needed across unrelated requests, and their absence is confusing to a
+# user who expects e.g. "what's 12*7" to always work.
+TOOL_SELECTION_ALWAYS_INCLUDE = ("get_current_time", "calculate", "run_python")
+
+# Context-widening tier (select_tools() in main.py) - only tried when the
+# current user message alone clears neither TOOL_SELECTION_MIN_SCORE nor
+# is a bare closing remark ("thanks!", "cool"). Re-scores [prior assistant
+# reply + current message] at the same MIN_SCORE before falling through to
+# the loose rescue tier below - rescues elliptical follow-ups like "and
+# also change the time to 3pm" that carry no tool signal on their own but
+# clearly continue a tool-relevant prior turn. Prior assistant text is
+# truncated to its LAST N characters (not the first N) before embedding,
+# since the embedding model's own truncation keeps the start of a long
+# string - and the most relevant part of a prior reply for a follow-up is
+# usually its tail (e.g. a trailing clarifying question), not its opening.
+TOOL_SELECTION_CONTEXT_CHAR_LIMIT = 400
+
+
+# ─────────────────────────────────────────────────────────────
 # write_file tool
 # ─────────────────────────────────────────────────────────────
 
@@ -197,6 +247,21 @@ PROJECT_STATUSES = ("active", "paused", "completed")
 TASK_STATUSES = ("pending", "active", "blocked", "done", "cancelled")
 TASK_PRIORITIES = ("low", "normal", "high")
 
+# Lightweight "key: value" tag syntax recognized only at the very top of a
+# task's notes (front-matter style - stops at the first unrecognized line)
+# and rendered compactly next to the task in the project context block.
+# See project_manager.py's _parse_note_tags()/_format_tags_inline().
+# Recognized keys: "dur" (reuses duration_manager.parse_duration_minutes),
+# "effort" (below), and "when" (TASK_NOTE_WHEN_TIMES, optionally followed
+# by a TASK_NOTE_WHEN_MODIFIERS word, e.g. "when: afternoon weekend").
+TASK_NOTE_EFFORT_ALIASES = {
+    "low": "low", "lo": "low",
+    "medium": "medium", "med": "medium", "normal": "medium",
+    "high": "high", "hi": "high",
+}
+TASK_NOTE_WHEN_TIMES = ("morning", "afternoon", "evening")
+TASK_NOTE_WHEN_MODIFIERS = ("weekday", "weekend")
+
 # localhost is always allowed below. Anything else (Tailscale IPs, LAN IPs,
 # etc.) goes in .env as EXTRA_CORS_ORIGINS - a comma-separated list - so
 # real IPs never end up committed to the repo. See .env.example for the
@@ -224,7 +289,7 @@ CALENDAR_TIMEZONE = "Europe/Amsterdam"
 # Per-request timeout (seconds) for all CalDAV calls to iCloud. Previously
 # unset, which let a single stalled request hang on whatever the caldav
 # library's internal default is (~120s) with no way to recover from it.
-CALDAV_TIMEOUT_SECONDS = 60
+CALDAV_TIMEOUT_SECONDS = 45
 
 # Extra attempts (beyond the first) confirm_pending() makes if writing a
 # staged change to iCloud fails, with a short delay between attempts.

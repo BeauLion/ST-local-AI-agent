@@ -250,8 +250,24 @@ def _resolve_calendar(name: str = None):
 def _parse_datetime(value: str) -> datetime:
     """Accepts 'YYYY-MM-DD HH:MM', 'YYYY-MM-DDTHH:MM', or a bare
     'YYYY-MM-DD' (treated as midnight). Naive local time throughout - this
-    is a single-user local setup, not built for cross-timezone scheduling."""
+    is a single-user local setup, not built for cross-timezone scheduling.
+
+    Models occasionally send extra precision anyway (seconds, and/or a
+    UTC offset like '+02:00'). Rather than hard-failing on those - which
+    used to poison a staged edit forever, since the bad string was baked
+    into the confirm closure - try datetime.fromisoformat() first. It
+    accepts seconds and offsets. An offset-aware result is converted into
+    CALENDAR_TIMEZONE and stripped back to naive, matching what the rest
+    of this module expects."""
     value = (value or "").strip()
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        dt = None
+    if dt is not None:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_LOCAL_TZ).replace(tzinfo=None)
+        return dt
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
         try:
             return datetime.strptime(value, fmt)
@@ -436,11 +452,10 @@ _last_results: list[dict] = []
 
 
 def list_events(start: str = None, end: str = None, calendar_name: str = None, when: str = None) -> list[dict]:
-    # Default to searching EVERY calendar on the account - a named
-    # calendar_name narrows to just one. Without this, events silently
-    # wouldn't show up if they live on any calendar other than whichever
-    # one iCloud happens to return first.
-    calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
+    # A named calendar_name is used as-is; when omitted, _resolve_calendar
+    # falls back to CALENDAR_DEFAULT_NAME (config.py), or the first
+    # calendar iCloud returns if that's unset/unmatched.
+    calendars = [_resolve_calendar(calendar_name)]
 
     if when and not (start or end):
         start_dt, end_dt = resolve_when(when)
@@ -1018,13 +1033,20 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
         description = _strip_unsafe_text(description)
     event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, event_uid.strip())
 
+    # Parse/localize now, same as stage_create_event - a bad date/time fails
+    # here, before anything is staged, instead of being baked as a raw
+    # string into apply_fn's closure where it would only surface (and keep
+    # re-surfacing) at confirm time.
+    start_dt = _localize(_parse_datetime(start)) if start else None
+    end_dt = _localize(_parse_datetime(end)) if end else None
+
     changes = []
     if title:
         changes.append(f"title -> '{title}'")
-    if start:
-        changes.append(f"start -> {start}")
-    if end:
-        changes.append(f"end -> {end}")
+    if start_dt:
+        changes.append(f"start -> {start_dt.strftime('%Y-%m-%d %H:%M')}")
+    if end_dt:
+        changes.append(f"end -> {end_dt.strftime('%Y-%m-%d %H:%M')}")
     if location is not None:
         changes.append(f"location -> '{location}'")
     if description is not None:
@@ -1041,10 +1063,10 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
             with event.edit_icalendar_component() as comp:
                 if title:
                     comp["SUMMARY"] = title
-                if start:
-                    comp["DTSTART"] = icalendar.vDDDTypes(_localize(_parse_datetime(start)))
-                if end:
-                    comp["DTEND"] = icalendar.vDDDTypes(_localize(_parse_datetime(end)))
+                if start_dt:
+                    comp["DTSTART"] = icalendar.vDDDTypes(start_dt)
+                if end_dt:
+                    comp["DTEND"] = icalendar.vDDDTypes(end_dt)
                 if location is not None:
                     comp["LOCATION"] = location
                 if description is not None:

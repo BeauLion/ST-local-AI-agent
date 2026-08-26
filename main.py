@@ -26,6 +26,7 @@ from pathlib import Path
 import docker
 
 import httpx
+import numpy as np
 from ddgs import DDGS
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,9 +36,11 @@ import calendar_manager
 import duration_manager
 import memory
 import project_manager
+from console_log import alog, flush as flush_console
 from calendar_manager import CalendarError
 from duration_manager import DurationError
 from project_manager import ProjectManagerError
+from prompt_log_engine import log_prompt, log_console, router as prompt_log_router
 from config import (
     AGENT_API_KEY,
     CORS_ALLOWED_ORIGINS,
@@ -51,9 +54,13 @@ from config import (
     LLAMA_SERVER_URL,
     MAX_TOOL_ITERATIONS,
     MEMORY_IDENTITY_SLOTS,
-    PROMPT_LOG_DIR,
-    PROMPT_LOG_ENABLED,
     SAFE_FILES_DIR,
+    TOOL_SELECTION_ALWAYS_INCLUDE,
+    TOOL_SELECTION_CONTEXT_CHAR_LIMIT,
+    TOOL_SELECTION_ENABLED,
+    TOOL_SELECTION_MIN_SCORE,
+    TOOL_SELECTION_RESCUE_SCORE,
+    TOOL_SELECTION_RESCUE_TOP_K,
     WRITE_FILE_ALLOWED_EXTENSIONS,
     WRITE_FILE_MAX_CHARS,
 )
@@ -71,60 +78,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(prompt_log_router)
 
 
 # ---------------------------------------------------------------------------
-# Prompt-inspection logging: writes the EXACT JSON body this server sends to
-# llama-server (real, final prompt - system messages, full history, tools
-# schema, sampling params) to one file per server run. This is ground truth
-# of what the model actually saw - different from the per-section token-
-# count diagnostic further down, which only measures size, not content.
+# Prompt-inspection logging, annotations, and the /prompt-log-viewer page
+# now all live in prompt_log_engine.py - see the log_prompt/log_console
+# imports above and app.include_router(prompt_log_router) below.
 # ---------------------------------------------------------------------------
-_PROMPT_LOG_DIR = Path(PROMPT_LOG_DIR)
-_PROMPT_LOG_DIR.mkdir(exist_ok=True)
-SESSION_LOG_PATH = _PROMPT_LOG_DIR / f"session_{datetime.now():%Y%m%d_%H%M%S}.log"
-_prompt_log_lock = threading.Lock()
-
-
-def _log_prompt(upstream_body: dict, iteration: int, section_labels: list[str]) -> None:
-    """Append one JSON object (one line) to this run's session log file,
-    describing the exact request about to be POSTed to llama-server. Each
-    message is tagged with a `section` label so the log viewer page can
-    filter by chunk type, not just role. section_labels is positional -
-    section_labels[i] describes upstream_body["messages"][i]; anything
-    beyond that list's length is ordinary conversation history/tool-call
-    round-trip messages, which grow between iterations. Best-effort: a
-    write failure is printed but never blocks the actual turn."""
-    if not PROMPT_LOG_ENABLED:
-        return
-    try:
-        chunks = []
-        for i, msg in enumerate(upstream_body["messages"]):
-            section = section_labels[i] if i < len(section_labels) else "conversation"
-            content = msg.get("content")
-            if content is None and msg.get("tool_calls"):
-                content = json.dumps(msg["tool_calls"])
-            chunks.append({
-                "role": msg.get("role", "unknown"),
-                "section": section,
-                "content": content or "",
-            })
-        if upstream_body.get("tools"):
-            chunks.append({
-                "role": "tools",
-                "section": "tools_schema",
-                "content": json.dumps(upstream_body["tools"], indent=2),
-            })
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "iteration": iteration,
-            "model": upstream_body.get("model"),
-            "chunks": chunks,
-        }
-        with _prompt_log_lock, open(SESSION_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[AGENT] Prompt log write failed: {e}")
 
 
 class LlamaServerError(Exception):
@@ -181,6 +142,20 @@ _CALENDAR_STAGE_TOOLS = {"calendar_create_event", "calendar_create_events_batch"
 _CALENDAR_APPLY_TOOLS = {"calendar_confirm_pending"}
 _BARE_CONFIRMATION_RE = re.compile(
     r"""^["'\s]*(yes|yeah|yep|sure|ok|okay|confirm|confirmed|go ahead|do it|correct|proceed)[.!]?["'\s]*$""",
+    re.IGNORECASE,
+)
+
+# Short closing remarks never trigger select_tools()'s context-widening
+# tier, even though they (correctly) score below TOOL_SELECTION_MIN_SCORE
+# alone same as any other ambiguous message. Without this carve-out, "thanks!"
+# right after a tool-heavy reply would fold that reply's tool-flavored
+# language into the widened query and needlessly resurrect the group for a
+# message that isn't actually asking for anything. Deliberately separate
+# from _BARE_CONFIRMATION_RE above - overlapping word list, different job
+# (that one gates calendar apply-on-confirm, not tool selection).
+_CLOSING_REMARK_RE = re.compile(
+    r"""^["'\s]*(thanks|thank you|thx|ty|cool|nice|great|perfect|sounds good|"""
+    r"""got it|no worries|nvm|never ?mind|that'?s all|all good)[.,!]?["'\s]*$""",
     re.IGNORECASE,
 )
 
@@ -677,7 +652,9 @@ def project_manager_create_task(args: dict) -> str:
     try:
         state = project_manager._load()
         project = project_manager.resolve_project(state, args.get("project"))
-        task = project_manager.create_task(project["id"], args.get("title", ""))
+        task = project_manager.create_task(
+            project["id"], args.get("title", ""), notes=args.get("notes", "")
+        )
         return f"Created task {task['short_id']}: {task['title']}"
     except ProjectManagerError as e:
         return f"Error: {e}"
@@ -837,7 +814,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save a new, durable fact about the user for recall in future conversations (e.g. their preferences, ongoing projects). Do not save trivial small talk. If this fact corrects or replaces something already remembered, use update_memory instead - don't call save_memory for a fact that already exists in a different form. If the fact is their identity (name and/or pronouns - combined into a single slot), occupation, or location, pass the matching `slot` instead of leaving it plain - this makes it always visible to you in every future conversation, not just when it's semantically relevant, and safely overwrites any previous value for that slot instead of creating a duplicate. When saving to the `identity` slot, always include BOTH the name and pronouns in the text even if only one changed - it's a single field, so a partial update silently drops whichever part you leave out.",
+            "description": "Save a new, durable fact about the user (preferences, ongoing projects, etc.) for future recall. Skip trivial small talk. If this corrects/replaces an existing memory, use update_memory instead. For identity (name+pronouns, one combined slot), occupation, or location, pass `slot` - makes it always-visible every turn instead of only when relevant, and overwrites that slot instead of duplicating. For the `identity` slot, always include BOTH name and pronouns even if only one changed - it's one field, so a partial update silently drops whichever part you omit.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1021,13 +998,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_list_events",
-            "description": "List events across ALL of the user's iCloud calendars in a date range (or just one calendar if calendar_name is given). Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately.",
+            "description": "List events of the default calendar in a date range (or a specific calendar if calendar_name is given). Use for questions like 'what's on my calendar' or 'what do I have this week'. Defaults to the next 14 days if no range is given. Read-only, executes immediately.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the same date for both start and end - that returns the whole day."},
-                    "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start. Same value as start is valid and means 'just that one day'."},
-                    "calendar_name": {"type": "string", "description": "Only needed if the user has multiple iCloud calendars and named one. Omit otherwise."},
+                    "start": {"type": "string", "description": "Start of range, 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Defaults to now. For a single specific day, pass the corresponding date for start and the date for the next day for end - that returns the whole day."},
+                    "end": {"type": "string", "description": "End of range, same format. Defaults to 14 days after start."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": [],
             },
@@ -1044,7 +1021,7 @@ TOOLS = [
                     "query": {"type": "string", "description": "Keyword to search for."},
                     "start": {"type": "string", "description": "Optional start of search range, 'YYYY-MM-DD'. Defaults to 7 days ago."},
                     "end": {"type": "string", "description": "Optional end of search range, 'YYYY-MM-DD'. Defaults to 90 days ahead."},
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["query"],
             },
@@ -1054,7 +1031,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_create_event",
-            "description": "Propose creating a new REAL event on the user's iCloud calendar (an actual appointment, meeting, or plan - not an in-character/roleplay scheduled action). This does NOT create it yet - it only stages the change and returns a description of exactly what would be created. You must relay that description to the user and get an explicit confirmation before calling calendar_confirm_pending.",
+            "description": "Stage creating a new REAL event on the user's iCloud calendar (an actual appointment, meeting, or plan - not an in-character/roleplay scheduled action). See the calendar write convention in your system context for the confirm step.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1063,7 +1040,7 @@ TOOLS = [
                     "end": {"type": "string", "description": "End time, same format. Defaults to 1 hour after start."},
                     "location": {"type": "string", "description": "Optional location."},
                     "description": {"type": "string", "description": "Optional notes/description."},
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["title", "start"],
             },
@@ -1074,17 +1051,12 @@ TOOLS = [
         "function": {
             "name": "calendar_create_events_batch",
             "description": (
-                "Stage MULTIPLE new calendar events at once as a SINGLE pending change - e.g. "
-                "a proposed schedule of task blocks for the morning. Use this instead of calling "
-                "calendar_create_event repeatedly whenever proposing more than one event together; "
-                "calendar_confirm_pending then creates all of them in one go. Before calling this, "
-                "check what's already on the calendar for the relevant time range "
-                "(calendar_list_events) so the times you propose don't conflict - this tool "
-                "validates that anyway and rejects the whole batch with a clear reason if any "
-                "proposed event overlaps another proposed event or an existing calendar event, so "
-                "you can adjust and retry. After staging, tell the user the full proposed schedule "
-                "and wait for their explicit confirmation in a separate message before calling "
-                "calendar_confirm_pending - never call it in the same response as this tool."
+                "Stage MULTIPLE new calendar events at once as a SINGLE pending change (e.g. a "
+                "proposed schedule of task blocks) - use instead of repeated calendar_create_event "
+                "calls; calendar_confirm_pending then creates all of them in one go. Validates "
+                "against existing events and against each other, rejecting the whole batch with a "
+                "clear reason if anything overlaps, so you can adjust and retry. See the calendar "
+                "write convention in your system context for the confirm step."
             ),
             "parameters": {
                 "type": "object",
@@ -1103,7 +1075,7 @@ TOOLS = [
                             "required": ["title", "start"],
                         },
                     },
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit to use the default calendar."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["events"],
             },
@@ -1113,7 +1085,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_edit_event",
-            "description": "Propose editing an existing iCloud calendar event by its UID (get this from calendar_list_events or calendar_search_events first - never guess a UID). This does NOT apply the edit yet - it only stages the change and returns a description of exactly what would change. Relay that to the user and get explicit confirmation before calling calendar_confirm_pending.",
+            "description": "Stage editing an existing iCloud calendar event by its UID (from calendar_list_events/calendar_search_events - never guess a UID). See the calendar write convention in your system context for the confirm step.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1123,7 +1095,7 @@ TOOLS = [
                     "end": {"type": "string", "description": "New end time, if changing it."},
                     "location": {"type": "string", "description": "New location, if changing it."},
                     "description": {"type": "string", "description": "New description/notes, if changing it."},
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["event_uid"],
             },
@@ -1133,12 +1105,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "calendar_delete_event",
-            "description": "Propose permanently deleting an existing iCloud calendar event by its UID (get this from calendar_list_events or calendar_search_events first - never guess a UID). This does NOT delete it yet - it only stages the change. Relay the description to the user and get explicit confirmation before calling calendar_confirm_pending.",
+            "description": "Stage permanently deleting an existing iCloud calendar event by its UID (from calendar_list_events/calendar_search_events - never guess a UID). See the calendar write convention in your system context for the confirm step.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "event_uid": {"type": "string", "description": "Exact UID of the event to delete, from a prior list/search result."},
-                    "calendar_name": {"type": "string", "description": "Only needed for a specific named calendar. Omit otherwise."},
+                    "calendar_name": {"type": "string", "description": "Optional: a specific named calendar."},
                 },
                 "required": ["event_uid"],
             },
@@ -1192,8 +1164,9 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "title": {"type": "string", "description": "Short, concrete, verb-led task title."},
+                    "notes": {"type": "string", "description": "Optional. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task, put recognized tag lines at the very top, one per line: 'dur: 45m' (also '1h', '1h30m', '90'), 'effort: low'/'medium'/'high', 'when: morning'/'afternoon'/'evening' (optionally + 'weekday'/'weekend'). Any text after the tag lines is kept as freeform notes."},
                 },
                 "required": ["title"],
             },
@@ -1207,7 +1180,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
                     "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                 },
@@ -1219,11 +1192,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "project_manager_update_task_notes",
-            "description": "Replace, append to, or clear the notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten.",
+            "description": "Replace, append to, or clear the notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task (not just when asked), put recognized tag lines at the very top of the text, one per line: 'dur: 45m' (also accepts '1h', '1h30m', '90'), 'effort: low' / 'effort: medium' / 'effort: high', and 'when: morning' / 'afternoon' / 'evening', optionally followed by 'weekday' or 'weekend' (e.g. 'when: afternoon weekend'). Any text after the tag lines is kept as freeform notes. Appending new tag lines only updates those specific tags and leaves the rest of the note (including other existing tags) intact - no need to replace the whole note to change one tag.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
                     "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
                     "text": {"type": "string", "description": "Note text. Required for replace and append; omit for clear."},
@@ -1240,7 +1213,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit when the focused project is intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                 },
                 "required": ["status"],
@@ -1255,7 +1228,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "description": "Existing project ID, short code, or exact project name. Omit only when the focused project is clearly intended."},
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "operations": {
                         "type": "array", "minItems": 1, "maxItems": 25,
                         "items": {
@@ -1264,11 +1237,11 @@ TOOLS = [
                                 "type": {"type": "string", "enum": ["create_task", "update_task_status", "update_task_notes"]},
                                 "title": {"type": "string", "description": "For create_task."},
                                 "priority": {"type": "string", "enum": ["low", "normal", "high"]},
-                                "notes": {"type": "string"},
+                                "notes": {"type": "string", "description": "For create_task. Optional tag lines at the top ('dur: 45m', 'effort: medium', 'when: afternoon weekend') show up automatically next to the task - see project_manager_update_task_notes for the exact syntax."},
                                 "task": {"type": "string", "description": "For status or note updates: task ID, short ID, or unambiguous title."},
                                 "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                                 "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
-                                "text": {"type": "string"},
+                                "text": {"type": "string", "description": "For update_task_notes. Same 'dur:'/'effort:'/'when:' tag syntax as project_manager_update_task_notes applies here."},
                             },
                             "required": ["type"],
                         },
@@ -1378,6 +1351,313 @@ TOOL_FUNCTIONS = {
     "duration_correct_entry": duration_correct_entry,
     "duration_confirm_new_category": duration_confirm_new_category,
 }
+
+# ---------------------------------------------------------------------------
+# Dynamic tool selection: instead of sending all tool schemas + all usage
+# instructions on every request, embed each tool once at startup and score
+# it against the user's latest message per request. Only tools that clear
+# TOOL_SELECTION_MIN_SCORE (plus a small always-on core set, plus anything
+# force-included for state reasons, e.g. a pending calendar change) get
+# sent. Falls back to sending everything if too few tools match - this can
+# only ever make a request SMALLER when confident, never break a request
+# that would have worked before this feature existed.
+# ---------------------------------------------------------------------------
+
+TOOL_GROUPS = {
+    "get_current_time": "utility", "calculate": "utility", "web_search": "utility",
+    "get_weather": "utility", "run_python": "utility",
+    "list_files": "files", "read_file": "files", "write_file": "files",
+    "edit_file": "files", "delete_file": "files", "search_documents": "files",
+    "save_memory": "memory", "update_memory": "memory", "delete_memory": "memory",
+    "list_memories": "memory", "pin_memory": "memory", "unpin_memory": "memory",
+    "calendar_list_calendars": "calendar", "calendar_list_events": "calendar",
+    "calendar_search_events": "calendar", "calendar_create_event": "calendar",
+    "calendar_create_events_batch": "calendar", "calendar_edit_event": "calendar",
+    "calendar_delete_event": "calendar", "calendar_confirm_pending": "calendar",
+    "calendar_cancel_pending": "calendar", "calendar_check_availability": "calendar",
+    "project_manager_get_overview": "project", "project_manager_create_task": "project",
+    "project_manager_update_task_status": "project", "project_manager_update_task_notes": "project",
+    "project_manager_set_all_tasks_status": "project", "project_manager_batch_update": "project",
+    "duration_get_estimate": "duration", "duration_correct_entry": "duration",
+    "duration_confirm_new_category": "duration",
+}
+# Stable order so the assembled instruction text reads the same way (and
+# hits the same prompt-cache prefix) whenever the same group set is chosen.
+_GROUP_ORDER = ["utility", "files", "memory", "calendar", "project", "duration"]
+
+GROUP_INSTRUCTIONS = {
+    "utility": (
+        "For weather/temperature questions, always use get_weather, never "
+        "web_search. Use calculate for simple arithmetic, or run_python for "
+        "anything needing actual code logic."
+    ),
+    "files": (
+        "Use search_documents (not read_file) when looking for specific "
+        "information inside long or multiple documents. Use write_file when "
+        "the user asks you to create, save, write out, or update a .txt or "
+        ".md file - use mode 'overwrite' to replace a file's contents (or "
+        "create a new one) and mode 'append' to add to the end of an "
+        "existing file without erasing it. Use edit_file for a small "
+        "targeted change inside an existing file instead of rewriting the "
+        "whole thing with write_file. Only call delete_file when the user "
+        "clearly and explicitly asks to delete a specific named file - "
+        "never as a side effect of another request, and never guess the "
+        "filename if it's ambiguous; ask the user to confirm instead."
+    ),
+    "memory": (
+        "Call save_memory when the user shares a durable fact about "
+        "themselves worth remembering - not for small talk. If the fact is "
+        "their identity (name and/or pronouns - combined into one slot), "
+        "occupation, or location, always pass the matching `slot` argument "
+        "rather than leaving it plain - this makes it always visible to you "
+        "in every conversation, not just when it happens to match what's "
+        "being discussed, and safely overwrites the old value instead of "
+        "creating a duplicate if that slot is already filled. If the user "
+        "corrects or changes a fact you already remember about them (e.g. a "
+        "job, name, or preference that's now different) and it's NOT one of "
+        "the three slots, call update_memory with that memory's id and the "
+        "corrected text - do NOT call save_memory again, since that would "
+        "leave both the old and new fact stored side by side and confuse "
+        "future recall. The id is usually already visible in the '[id: "
+        "...]' tag next to a fact shown to you in the 'Core facts you "
+        "always know about this user' or 'Relevant things you remember "
+        "about this user' context; only call list_memories or "
+        "search_memories to look one up if it isn't already visible. Never "
+        "guess an id. Call delete_memory (with an id, same rule) only when "
+        "the user explicitly asks you to forget something, with no "
+        "replacement fact - this also works on a slotted memory, which just "
+        "empties that slot. If a save_memory result includes a note that "
+        "the new fact looks similar to an existing memory, check whether "
+        "it's really the same fact restated - if so, use update_memory or "
+        "delete_memory to reconcile them instead of leaving both. Use "
+        "pin_memory on a freeform memory (one saved without a slot) when a "
+        "fact is worth always knowing but doesn't fit the three fixed slots "
+        "(e.g. a standing dietary restriction or strong preference) - "
+        "pinned memories, like slots, are always shown to you rather than "
+        "only when relevant. Use unpin_memory to undo that; it has no "
+        "effect on slotted memories, which are always shown by design - use "
+        "delete_memory on those instead."
+    ),
+    "calendar": (
+        "Use calendar_list_events or calendar_search_events freely to read "
+        "the user's iCloud calendar - these are read-only, need no "
+        "confirmation, and search across all of the user's calendars by "
+        "default. If the user asks what calendars they have, or expected "
+        "events aren't showing up, call calendar_list_calendars to see the "
+        "actual calendar names. "
+        "CRITICAL: a system message near the top of this conversation, "
+        "labeled [CURRENT DATE/TIME], gives you today's real date and time "
+        "on every single request - use it to compute any relative date "
+        "phrase ('this week', 'today', 'tomorrow', 'next month', etc.) for "
+        "calendar_list_events, calendar_search_events, calendar_create_event, "
+        "and calendar_edit_event. You do NOT need to call get_current_time "
+        "for this - the date is already provided fresh every turn. NEVER "
+        "guess or assume a date/year from memory or training data for a "
+        "calendar call - a wrong year will silently return the wrong "
+        "(usually empty) results instead of erroring, so this mistake is "
+        "easy to make and easy to miss. If you don't need a specific range, "
+        "you may also omit start/end entirely and let the tool default to "
+        "today onward. "
+        "calendar_create_event, calendar_edit_event, and "
+        "calendar_delete_event NEVER change the real calendar by themselves "
+        "- they only stage a proposed change and return a description of "
+        "it. After calling one, tell the user exactly what will happen and "
+        "wait for their reply. Only call calendar_confirm_pending as your "
+        "very next tool call if the user's following message clearly and "
+        "explicitly confirms (e.g. 'yes', 'confirm', 'go ahead') - never "
+        "call it speculatively, preemptively, or on the same turn as "
+        "staging the change. If the user declines or wants something "
+        "different, call calendar_cancel_pending instead. Always look up an "
+        "event's UID with calendar_list_events or calendar_search_events "
+        "before editing or deleting it - never guess a UID."
+    ),
+    "project": (
+        "Use the project_manager_* tools only when the user clearly states "
+        "a concrete project/task action (create, start, block, complete, "
+        "cancel, or annotate a task) - never from hypotheticals or vague "
+        "wishes. Call project_manager_get_overview first if which project "
+        "or task is meant isn't already clear from the persistent project "
+        "state below. When one message contains several concrete changes "
+        "for the same project, use project_manager_batch_update once "
+        "instead of separate calls; for 'mark everything as done'-style "
+        "requests, use project_manager_set_all_tasks_status once instead of "
+        "enumerating tasks. Project-manager changes apply immediately - "
+        "there is no separate confirmation step, so only call these tools "
+        "when the user's intent is unambiguous."
+    ),
+    "duration": (
+        "Use duration_get_estimate whenever the user asks how long a "
+        "task/category will take - never guess a duration yourself, since "
+        "the whole point of this tool is grounding the answer in the "
+        "user's own logged history instead of a generic guess. If "
+        "confidence comes back 'insufficient' or resolved is false, say so "
+        "plainly instead of presenting a number anyway. Task completions "
+        "automatically log a rough duration anchor in the background - you "
+        "don't need to call any tool for that. But if the tool result from "
+        "marking a task done includes a duration line (e.g. '~N min logged "
+        "for ... category: ...'), always relay that line to the user in "
+        "your reply, verbatim or close to it - don't silently drop it. This "
+        "matters most when the category is 'uncategorized', since that "
+        "line is asking the user whether to create a tracked category for "
+        "it. If the user corrects a duration you just reported, or "
+        "references a past task's duration being wrong, use "
+        "duration_correct_entry. Only call duration_confirm_new_category "
+        "after the user explicitly agrees to a specific new category name "
+        "you proposed following an 'uncategorized' flag - never on your "
+        "own initiative."
+    ),
+}
+
+_TOOL_INSTRUCTION_CLOSING = (
+    "IMPORTANT for multi-step questions: if answering fully requires "
+    "several pieces of information, call tools one at a time in sequence, "
+    "using each result to decide your next step, before giving your final "
+    "answer. Do not stop after one tool call if the question isn't fully "
+    "answered yet. Never guess or invent facts, dates, statistics, or "
+    "search results that a tool could actually check for you. If a tool "
+    "returns no useful result, say so honestly instead of making something "
+    "up. If a tool result begins with 'Error:', the tool call FAILED - you "
+    "must tell the user it failed and relay the reason (e.g. 'Docker isn't "
+    "running'). Never substitute your own guessed numbers, facts, or "
+    "output in place of a failed tool's result, even if you present it as "
+    "an example or hypothetical. When you decide to call a tool, call it "
+    "directly - do not write any explanation, plan, or commentary before "
+    "or alongside the tool call. Save your explanation, if any, for your "
+    "final answer after the tool result comes back."
+)
+
+# Built once at server startup: one embedding per tool, from "name: description".
+_TOOL_EMBEDDINGS = {
+    t["function"]["name"]: np.array(
+        memory.embed(f'{t["function"]["name"]}: {t["function"].get("description", "")}')
+    )
+    for t in TOOLS
+}
+
+
+def _expand_to_groups(names: set[str]) -> set[str]:
+    """Given tool names that individually cleared a confidence threshold,
+    expand to every tool sharing a TOOL_GROUPS bucket with any of them.
+    ...
+    Deliberately NOT applied to the rescue tier (see select_tools) - rescue
+    exists for weak/ambiguous signals and stays narrow on purpose, or it
+    would reintroduce the "chit-chat drags in a whole tool group" problem
+    the tiered design exists to prevent.
+    """
+    groups_hit = {TOOL_GROUPS[n] for n in names if n in TOOL_GROUPS}
+    if not groups_hit:
+        return set(names)
+    return set(names) | {n for n, g in TOOL_GROUPS.items() if g in groups_hit}
+
+def select_tools(user_text: str, force_names: set | None = None, prior_assistant_text: str = ""):
+    """Return (selected_tools, scores, tier).
+
+    Three-tier matching:
+      1. "direct"           - tools clearing TOOL_SELECTION_MIN_SCORE
+                               against the current message alone. Unchanged
+                               from before this session.
+      2. "context_widened"  - only tried when (1) finds nothing AND the
+                               current message isn't a bare closing remark
+                               (_CLOSING_REMARK_RE). Re-scores [prior
+                               assistant reply + current message] against
+                               the same MIN_SCORE. Rescues elliptical
+                               follow-ups ("and also change the time to
+                               3pm") that carry no tool-relevant signal on
+                               their own but clearly continue a
+                               tool-relevant prior turn - without this,
+                               such messages fell all the way to
+                               core-only tools and sent the model into a
+                               tool-call loop with nothing useful to call.
+      3. "rescue"/"core_only" - existing loose-threshold top-K fallback,
+                               unchanged from before this session. Fires
+                               when even the widened query finds nothing -
+                               genuine plain chit-chat, or a closing remark
+                               that never reached tier 2 at all.
+    """
+    force_names = set(force_names or ())
+
+    if not TOOL_SELECTION_ENABLED:
+        return TOOLS, {}, "disabled"
+
+    text = (user_text or "").strip()
+    if not text:
+        selected_names = set(TOOL_SELECTION_ALWAYS_INCLUDE) | force_names
+        selected_tools = [t for t in TOOLS if t["function"]["name"] in selected_names]
+        return selected_tools, {}, "empty"
+
+    query_vec = np.array(memory.embed(text))
+    scores = {name: float(query_vec @ vec) for name, vec in _TOOL_EMBEDDINGS.items()}
+
+    confident = {n for n, s in scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
+
+    if confident:
+        selected_names = _expand_to_groups(confident)   # was: selected_names = confident
+        tier = "direct"
+    else:
+        widened = set()
+        prior_text = (prior_assistant_text or "").strip()
+        if prior_text and not _CLOSING_REMARK_RE.match(text):
+            # Tail, not head - the embedder's own truncation on a long
+            # string keeps the start, but the part of a prior reply most
+            # relevant to a follow-up is usually its end (e.g. a trailing
+            # clarifying question). See config.py's comment on this constant.
+            prior_tail = prior_text[-TOOL_SELECTION_CONTEXT_CHAR_LIMIT:]
+            combined_vec = np.array(memory.embed(f"{prior_tail} {text}"))
+            combined_scores = {name: float(combined_vec @ vec) for name, vec in _TOOL_EMBEDDINGS.items()}
+            widened = {n for n, s in combined_scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
+            if widened:
+                # Debug log reflects the query that actually decided this,
+                # not the (lower, inconclusive) single-message scores.
+                scores = combined_scores
+
+        if widened:
+            selected_names = _expand_to_groups(widened)  # was: selected_names = widened
+            tier = "context_widened"
+        else:
+            # Nothing confidently matched, even widened - don't fall back
+            # to everything. Rescue only the handful of tools that are at
+            # least weakly related, in case this is an ambiguous real
+            # request rather than genuine chit-chat (which correctly
+            # rescues nothing at all).
+            ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+            selected_names = {
+                n for n, s in ranked[:TOOL_SELECTION_RESCUE_TOP_K]
+                if s >= TOOL_SELECTION_RESCUE_SCORE
+            }
+            tier = "rescue" if selected_names else "core_only"
+
+    selected_names |= set(TOOL_SELECTION_ALWAYS_INCLUDE)
+    selected_names |= force_names
+
+    selected_tools = [t for t in TOOLS if t["function"]["name"] in selected_names]
+    return selected_tools, scores, tier
+
+
+def build_tool_instruction(selected_tools: list, client_tool_names: set) -> str:
+    """Assemble the system-message instruction text from only the groups
+    actually represented in selected_tools, instead of always including
+    every group's usage rules regardless of which tools are even present."""
+    names = [t["function"]["name"] for t in selected_tools]
+    groups_present = {TOOL_GROUPS.get(n) for n in names}
+
+    parts = [
+        f"You have tools available: {', '.join(names)}. You MUST call the "
+        "relevant tool whenever the user asks about current events, "
+        "real-time facts, dates/times, weather, exact arithmetic, or "
+        "anything you are not fully certain of from memory."
+    ]
+    for group in _GROUP_ORDER:
+        if group in groups_present:
+            parts.append(GROUP_INSTRUCTIONS[group])
+    if client_tool_names:
+        parts.append(
+            "Additional tools provided by the connected frontend are also "
+            f"available this turn: {', '.join(sorted(client_tool_names))}. "
+            "Call them normally, following their own descriptions, and "
+            "only when they clearly fit the user's request."
+        )
+    parts.append(_TOOL_INSTRUCTION_CLOSING)
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -1601,48 +1881,10 @@ async def memory_browser_page():
 
 
 # ---------------------------------------------------------------------------
-# Prompt-log viewer HTTP API - plain REST for the /prompt-log-viewer page,
-# reading the JSONL files _log_prompt() writes to PROMPT_LOG_DIR.
+# Prompt-log viewer HTTP API (/prompt-logs*, /notes/search, and the viewer
+# page itself) now lives in prompt_log_engine.py, mounted above via
+# app.include_router(prompt_log_router).
 # ---------------------------------------------------------------------------
-
-@app.get("/prompt-logs")
-async def list_prompt_logs():
-    """Lists available session log files, most recent first."""
-    files = sorted(_PROMPT_LOG_DIR.glob("session_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [
-        {
-            "filename": f.name,
-            "size_kb": round(f.stat().st_size / 1024, 1),
-            "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
-        }
-        for f in files
-    ]
-
-
-@app.get("/prompt-logs/{filename}")
-async def get_prompt_log(filename: str):
-    """Returns one session log file's entries, parsed from JSONL."""
-    safe_name = Path(filename).name  # strips any path components - blocks traversal
-    path = _PROMPT_LOG_DIR / safe_name
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Log file not found")
-    entries = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                print(f"[AGENT] Skipping malformed log line {line_num} in {filename}")
-    return entries
-
-
-@app.get("/prompt-log-viewer")
-async def prompt_log_viewer_page():
-    html_path = Path(__file__).parent / "web" / "prompt_log_viewer.html"
-    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
 async def _stream_chat(client: httpx.AsyncClient, body: dict):
@@ -1692,11 +1934,11 @@ async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
         resp.raise_for_status()
         return len(resp.json().get("tokens", []))
     except Exception as e:
-        print(f"[AGENT] Token count lookup failed: {e}")
+        alog(f"[AGENT] Token count lookup failed: {e}")
         return None
 
 
-async def agent_loop(upstream_body: dict, section_labels: list[str] | None = None):
+async def agent_loop(upstream_body: dict, section_labels: list[str] | None = None, tool_scores: dict | None = None, tool_tier: str | None = None):
     """
     Drives the tool-calling loop against llama-server, streaming the whole
     way. Yields:
@@ -1730,13 +1972,23 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
     async with httpx.AsyncClient(timeout=None, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as client:
         for iteration in range(MAX_TOOL_ITERATIONS):
             content = ""
+            thinking = ""
             tool_calls = {}
             mode = None  # becomes "content" or "tool_calls" once known
 
-            _log_prompt(upstream_body, iteration, section_labels or [])
+            log_prompt(upstream_body, iteration, section_labels or [], tool_scores, tool_tier)
             try:
                 async for chunk in _stream_chat(client, upstream_body):
                     delta = chunk["choices"][0].get("delta", {})
+
+                    # Only populated when llama-server is run with
+                    # --reasoning-format (see config.py) AND the loaded
+                    # model actually produces a reasoning block. Doesn't
+                    # affect `mode` - a reasoning model still ends up in
+                    # "content" or "tool_calls" mode same as any other.
+                    delta_thinking = delta.get("reasoning_content")
+                    if delta_thinking:
+                        thinking += delta_thinking
 
                     delta_tool_calls = delta.get("tool_calls")
                     if delta_tool_calls:
@@ -1764,7 +2016,8 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         content += delta_content
                         # buffered, not yielded here — see below
             except LlamaServerError as e:
-                print(f"[AGENT] {e}")
+                alog(f"[AGENT] {e}")
+                log_console(iteration, {"kind": "error", "text": str(e)}, thinking=thinking)
                 yield ("delta", f"⚠️ {e}")
                 yield ("done", {"role": "assistant", "content": str(e)})
                 return
@@ -1776,11 +2029,12 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                 unknown = [c for c in calls if c["function"]["name"] not in TOOL_FUNCTIONS]
                 if unknown:
                     names = [c["function"]["name"] for c in unknown]
-                    print(f"[AGENT] Handing off {len(unknown)} client-owned tool call(s) to SillyTavern: {names}")
+                    alog(f"[AGENT] Handing off {len(unknown)} client-owned tool call(s) to SillyTavern: {names}")
+                    log_console(iteration, {"kind": "handoff", "text": json.dumps(calls, indent=2)}, thinking=thinking)
                     yield ("handoff", message)
                     return
 
-                print(f"[AGENT] Model requested {len(calls)} tool call(s)")
+                alog(f"[AGENT] Model requested {len(calls)} tool call(s)")
                 upstream_body["messages"].append(message)
 
                 names_in_batch = {c["function"]["name"] for c in calls}
@@ -1849,8 +2103,8 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         # Run in a thread so a slow web search doesn't freeze the server.
                         result = await asyncio.to_thread(TOOL_FUNCTIONS[name], args)
 
-                    print(f"[AGENT] {name}({args}) ->")
-                    print(f"[AGENT]   {str(result)[:400]}")
+                    alog(f"[AGENT] {name}({args}) ->")
+                    alog(f"[AGENT]   {str(result)[:400]}")
 
                     upstream_body["messages"].append(
                         {
@@ -1877,6 +2131,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                                 ),
                             }
                         )
+                log_console(iteration, {"kind": "tool_calls", "text": json.dumps(calls, indent=2)}, thinking=thinking)
                 continue  # loop again so the model can use the tool result
 
             # No tool call -> normally the final answer. But if the user's
@@ -1900,9 +2155,9 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                 and bool(_BARE_CONFIRMATION_RE.match(str(last_user_text_for_check or "").strip()))
             )
             if unresolved_confirmation:
-                print("[AGENT] Model claimed a calendar change is resolved but never called "
-                      "confirm/cancel - forcing it to actually do so instead of returning "
-                      "the false answer.")
+                alog("[AGENT] Model claimed a calendar change is resolved but never called "
+                     "confirm/cancel - forcing it to actually do so instead of returning "
+                     "the false answer.")
                 upstream_body["messages"].append({"role": "assistant", "content": content or None})
                 upstream_body["messages"].append({
                     "role": "system",
@@ -1917,9 +2172,11 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
                         "of these tools first."
                     ),
                 })
+                log_console(iteration, {"kind": "content_discarded", "text": content or ""}, thinking=thinking)
                 continue
 
-            print("[AGENT] Model answered directly, without calling any tool.")
+            alog("[AGENT] Model answered directly, without calling any tool.")
+            log_console(iteration, {"kind": "content", "text": content or ""}, thinking=thinking)
             if content:
                 yield ("delta", content)
             yield ("done", {"role": "assistant", "content": content})
@@ -1927,6 +2184,8 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
 
         # Hit MAX_TOOL_ITERATIONS without a final answer - bail out safely.
         bail_message = "(Agent stopped: too many tool calls in a row.)"
+        alog(f"[AGENT] Bailed out after {MAX_TOOL_ITERATIONS} tool-call iterations without a final answer.")
+        log_console(MAX_TOOL_ITERATIONS - 1, {"kind": "bailout", "text": bail_message}, thinking=thinking)
         yield ("delta", bail_message)
         yield ("done", {"role": "assistant", "content": bail_message})
 
@@ -1954,149 +2213,39 @@ async def chat_completions(request: Request):
     # to detect tool calls early), regardless of what the client asked for.
     upstream_body = dict(body)
     upstream_body["stream"] = True
-    upstream_body["tools"] = TOOLS + client_tools
+
+    # Dynamic tool selection: only send the tools (and matching usage
+    # instructions) relevant to what the user actually asked, instead of
+    # every tool this server owns on every request. A pending calendar
+    # change forces the whole calendar group in regardless of similarity
+    # score, since a bare "yes" confirming it won't semantically match
+    # "calendar" at all - see select_tools()/TOOL_GROUPS above.
+    last_user_text = next(
+        (m.get("content") for m in reversed(body.get("messages", [])) if m.get("role") == "user"),
+        "",
+    )
+    # SillyTavern resends the full transcript as plain user/assistant text
+    # every turn (tool_calls/tool-role messages never leave agent_loop, see
+    # its docstring) - so the immediately preceding assistant reply is just
+    # the most recent "assistant" entry in that same list. Feeds select_tools()'s
+    # context-widening tier; see its docstring for why.
+    prior_assistant_text = next(
+        (m.get("content") for m in reversed(body.get("messages", [])) if m.get("role") == "assistant"),
+        "",
+    )
+    force_tool_names = set()
+    if calendar_manager.has_pending_change():
+        force_tool_names = {name for name, group in TOOL_GROUPS.items() if group == "calendar"}
+
+    selected_tools, tool_scores, tool_tier = select_tools(
+        str(last_user_text or ""), force_tool_names, str(prior_assistant_text or "")
+    )
+    upstream_body["tools"] = selected_tools + client_tools
     upstream_body["tool_choice"] = "auto"
 
     tool_instruction = {
         "role": "system",
-        "content": (
-            "You have tools available: get_current_time, calculate, run_python, "
-            "web_search, get_weather, list_files, read_file, save_memory, update_memory, "
-            "delete_memory, pin_memory, unpin_memory, list_memories, write_file, "
-            "edit_file, delete_file, search_documents, calendar_list_calendars, "
-            "calendar_list_events, "
-            "calendar_search_events, calendar_create_event, calendar_edit_event, "
-            "calendar_delete_event, calendar_confirm_pending, calendar_cancel_pending, "
-            "project_manager_get_overview, project_manager_create_task, "
-            "project_manager_update_task_status, project_manager_update_task_notes, "
-            "project_manager_set_all_tasks_status, project_manager_batch_update, "
-            "duration_get_estimate, duration_correct_entry, duration_confirm_new_category. "
-            "You MUST call the relevant tool whenever the user "
-            "asks about current events, real-time facts, dates/times, weather, "
-            "exact arithmetic, or anything you are not fully certain of from "
-            "memory. For weather/temperature questions, always use get_weather, "
-            "never web_search. Use search_documents (not read_file) when looking "
-            "for specific information inside long or multiple documents. Use "
-            "calculate for simple arithmetic, or run_python for anything needing "
-            "actual code logic. Call save_memory when the user shares a durable "
-            "fact about themselves worth remembering - not for small talk. If the "
-            "fact is their identity (name and/or pronouns - combined into one "
-            "slot), occupation, or location, always pass the "
-            "matching `slot` argument rather than leaving it plain - this makes it "
-            "always visible to you in every conversation, not just when it happens "
-            "to match what's being discussed, and safely overwrites the old value "
-            "instead of creating a duplicate if that slot is already filled. If the "
-            "user corrects or changes a fact you already remember about them (e.g. "
-            "a job, name, or preference that's now different) and it's NOT one of "
-            "the three slots, call update_memory with that memory's id and the "
-            "corrected text - do NOT call save_memory again, since that would leave "
-            "both the old and new fact stored side by side and confuse future "
-            "recall. The id is usually already visible in the '[id: ...]' tag next "
-            "to a fact shown to you in the 'Core facts you always know about this "
-            "user' or 'Relevant things you remember about this user' context; only "
-            "call list_memories or search_memories to look one up if it isn't "
-            "already visible. Never guess an id. Call delete_memory (with an id, "
-            "same rule) only when the user explicitly asks you to forget something, "
-            "with no replacement fact - this also works on a slotted memory, which "
-            "just empties that slot. If a save_memory result includes a note that "
-            "the new fact looks similar to an existing memory, check whether it's "
-            "really the same fact restated - if so, use update_memory or "
-            "delete_memory to reconcile them instead of leaving both. Use "
-            "pin_memory on a freeform memory (one saved without a slot) when a fact "
-            "is worth always knowing but doesn't fit the three fixed slots (e.g. a "
-            "standing dietary restriction or strong preference) - pinned memories, "
-            "like slots, are always shown to you rather than only when relevant. "
-            "Use unpin_memory to undo that; it has no effect on slotted memories, "
-            "which are always shown by design - use delete_memory on those instead. "
-            "Use write_file when the user asks you to create, save, write out, or "
-            "update a .txt or .md file - use mode 'overwrite' to replace a file's "
-            "contents (or create a new one) and mode 'append' to add to the end of "
-            "an existing file without erasing it. "
-            "Use edit_file for a small targeted change inside an existing file instead "
-            "of rewriting the whole thing with write_file. Only call delete_file when "
-            "the user clearly and explicitly asks to delete a specific named file - "
-            "never as a side effect of another request, and never guess the filename "
-            "if it's ambiguous; ask the user to confirm instead. "
-            "Use calendar_list_events or calendar_search_events freely to read the "
-            "user's iCloud calendar - these are read-only, need no confirmation, and "
-            "search across all of the user's calendars by default. If the user asks "
-            "what calendars they have, or expected events aren't showing up, call "
-            "calendar_list_calendars to see the actual calendar names. "
-            "CRITICAL: a system message near the top of this conversation, labeled "
-            "[CURRENT DATE/TIME], gives you today's real date and time on every "
-            "single request - use it to compute any relative date phrase ('this "
-            "week', 'today', 'tomorrow', 'next month', etc.) for calendar_list_events, "
-            "calendar_search_events, calendar_create_event, and calendar_edit_event. "
-            "You do NOT need to call get_current_time for this - the date is already "
-            "provided fresh every turn. NEVER guess or assume a date/year from memory "
-            "or training data for a calendar call - a wrong year will silently return "
-            "the wrong (usually empty) results instead of erroring, so this mistake is "
-            "easy to make and easy to miss. If you don't need a specific range, you "
-            "may also omit start/end entirely and let the tool default to today "
-            "onward. "
-            "calendar_create_event, calendar_edit_event, and calendar_delete_event "
-            "NEVER change the real calendar by themselves - they only stage a "
-            "proposed change and return a description of it. After calling one, tell "
-            "the user exactly what will happen and wait for their reply. Only call "
-            "calendar_confirm_pending as your very next tool call if the user's "
-            "following message clearly and explicitly confirms (e.g. 'yes', "
-            "'confirm', 'go ahead') - never call it speculatively, preemptively, or "
-            "on the same turn as staging the change. If the user declines or wants "
-            "something different, call calendar_cancel_pending instead. Always look "
-            "up an event's UID with calendar_list_events or calendar_search_events "
-            "before editing or deleting it - never guess a UID. "
-            "Use the project_manager_* tools only when the user clearly states a "
-            "concrete project/task action (create, start, block, complete, cancel, "
-            "or annotate a task) - never from hypotheticals or vague wishes. Call "
-            "project_manager_get_overview first if which project or task is meant "
-            "isn't already clear from the persistent project state below. When one "
-            "message contains several concrete changes for the same project, use "
-            "project_manager_batch_update once instead of separate calls; for "
-            "'mark everything as done'-style requests, use "
-            "project_manager_set_all_tasks_status once instead of enumerating tasks. "
-            "Project-manager changes apply immediately - there is no separate "
-            "confirmation step, so only call these tools when the user's intent is "
-            "unambiguous. "
-            "Use duration_get_estimate whenever the user asks how long a task/category "
-            "will take - never guess a duration yourself, since the whole point of this "
-            "tool is grounding the answer in the user's own logged history instead of a "
-            "generic guess. If confidence comes back 'insufficient' or resolved is "
-            "false, say so plainly instead of presenting a number anyway."
-            "Task completions automatically log a rough duration anchor in the background - "
-            "you don't need to call any tool for that. But if the tool result from marking "
-            "a task done includes a duration line (e.g. '~N min logged for ... category: ...'), "
-            "always relay that line to the user in your reply, verbatim or close to it - "
-            "don't silently drop it. This matters most when the category is 'uncategorized', "
-            "since that line is asking the user whether to create a tracked category for it. "
-            "If the user corrects a duration "
-            "you just reported, or references a past task's duration being wrong, use "
-            "duration_correct_entry. Only call duration_confirm_new_category after the "
-            "user explicitly agrees to a specific new category name you proposed "
-            "following an 'uncategorized' flag - never on your own initiative. "
-            + (
-                f"Additional tools provided by the connected frontend are also "
-                f"available this turn: {', '.join(sorted(client_tool_names))}. Call "
-                f"them normally, following their own descriptions, and only when they "
-                f"clearly fit the user's request. "
-                if client_tool_names else ""
-            ) +
-            "IMPORTANT for multi-step questions: if answering fully requires "
-            "several pieces of information, call tools one at a time in sequence, "
-            "using each result to decide your next step, before giving your final "
-            "answer. Do not stop after one tool call if the question isn't fully "
-            "answered yet. Never guess or invent facts, dates, statistics, or "
-            "search results that a tool could actually check for you. If a tool "
-            "returns no useful result, say so honestly instead of making "
-            "something up. If a tool result begins with 'Error:', the tool call "
-            "FAILED - you must tell the user it failed and relay the reason "
-            "(e.g. 'Docker isn't running'). Never substitute your own guessed "
-            "numbers, facts, or output in place of a failed tool's result, even "
-            "if you present it as an example or hypothetical."
-            "When you decide to call a tool, call it directly - "
-            "do not write any explanation, plan, or commentary before or "
-            "alongside the tool call. Save your explanation, if any, for your "
-            "final answer after the tool result comes back."
-        ),
+        "content": build_tool_instruction(selected_tools, client_tool_names),
     }
     messages_to_prepend = [tool_instruction]
     prepend_sections = [("tool_instruction", tool_instruction["content"])]
@@ -2130,7 +2279,7 @@ async def chat_completions(request: Request):
     if project_state_text:
         messages_to_prepend.append({"role": "system", "content": project_state_text})
         prepend_sections.append(("project_state", project_state_text))
-    print(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
+    alog(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
 
     # Read-only, local-file-only - see calendar_manager.get_cached_context()
     # docstring for why this never triggers a live CalDAV call.
@@ -2138,7 +2287,26 @@ async def chat_completions(request: Request):
     if calendar_context_text:
         messages_to_prepend.append({"role": "system", "content": calendar_context_text})
         prepend_sections.append(("calendar_cache", calendar_context_text))
-    print(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
+    alog(f"[AGENT] Calendar cache text sent to model:\n{calendar_context_text or '(none)'}")
+
+    # Shared explanation of the calendar staging convention (propose -> confirm/cancel),
+    # sent once here instead of being repeated near-verbatim inside four separate
+    # tool descriptions (calendar_create_event, calendar_create_events_batch,
+    # calendar_edit_event, calendar_delete_event) - same information, sent once
+    # per request instead of four times.
+    calendar_staging_text = (
+        "Calendar write convention: calendar_create_event, "
+        "calendar_create_events_batch, calendar_edit_event, and "
+        "calendar_delete_event never apply immediately - each only stages a "
+        "pending change and returns a description of exactly what would "
+        "happen. Relay that description to the user and wait for their "
+        "explicit confirmation in a SEPARATE message before calling "
+        "calendar_confirm_pending - never call calendar_confirm_pending in "
+        "the same response as a staging call. If the user declines or wants "
+        "something different, call calendar_cancel_pending instead."
+    )
+    messages_to_prepend.append({"role": "system", "content": calendar_staging_text})
+    prepend_sections.append(("calendar_staging_convention", calendar_staging_text))
 
     # Auto-recall, part 1: pinned memories (identity slots + freeform pins)
     # are always shown, every turn, regardless of what's being discussed -
@@ -2147,7 +2315,7 @@ async def chat_completions(request: Request):
     pinned = await asyncio.to_thread(memory.get_pinned_memories)
     pinned_ids = {m["id"] for m in pinned}
     if pinned:
-        print(f"[AGENT] {len(pinned)} pinned memory item(s) always shown")
+        alog(f"[AGENT] {len(pinned)} pinned memory item(s) always shown")
         pinned_text = (
             "Core facts you always know about this user (id shown so you can "
             "call update_memory/delete_memory/unpin_memory directly if one of "
@@ -2172,7 +2340,7 @@ async def chat_completions(request: Request):
         relevant = await asyncio.to_thread(memory.search_memories, last_user_msg)
         relevant = [m for m in relevant if m["id"] not in pinned_ids]
         if relevant:
-            print(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
+            alog(f"[AGENT] Recalled {len(relevant)} relevant memory item(s)")
             memory_recall_text = (
                 "Relevant things you remember about this user from past "
                 "conversations (id shown so you can call update_memory/delete_memory "
@@ -2221,7 +2389,7 @@ async def chat_completions(request: Request):
         for (name, _), count in zip(sections, counts)
     )
     known_total = sum(c for c in counts if c is not None)
-    print(
+    alog(
         f"[AGENT] System prompt section sizes (tokens): {breakdown} "
         f"| known total: {known_total} / {LLAMA_CONTEXT} context"
     )
@@ -2243,7 +2411,7 @@ async def chat_completions(request: Request):
     if not client_wants_stream:
         final_message = {"role": "assistant", "content": ""}
         finish_reason = "stop"
-        async for kind, payload in agent_loop(upstream_body, message_section_labels):
+        async for kind, payload in agent_loop(upstream_body, message_section_labels, tool_scores, tool_tier):
             if kind in ("done", "handoff"):
                 final_message = payload
                 finish_reason = "tool_calls" if kind == "handoff" else "stop"
@@ -2270,7 +2438,7 @@ async def chat_completions(request: Request):
         return f"data: {json.dumps(payload)}\n\n".encode()
 
     async def event_stream():
-        async for kind, payload in agent_loop(upstream_body, message_section_labels):
+        async for kind, payload in agent_loop(upstream_body, message_section_labels, tool_scores, tool_tier):
             if kind == "delta":
                 yield sse({"index": 0, "delta": {"content": payload}, "finish_reason": None})
                 continue
