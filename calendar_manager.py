@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo
 import caldav
 import icalendar
 from dotenv import load_dotenv
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from config import (
     CALDAV_TIMEOUT_SECONDS,
@@ -745,28 +746,73 @@ def _peek_pending():
     return _pending_change
 
 
+class _CreateEventInput(BaseModel):
+    """Validates a single-event create request. Deliberately raises
+    CalendarError directly from validators, not ValueError - Pydantic v2
+    only intercepts ValueError/AssertionError/PydanticCustomError raised
+    inside a validator; any other exception type (including our own
+    CalendarError) propagates out of the model's constructor completely
+    unchanged, message and type intact. Verified directly against
+    pydantic 2.13 before relying on it here. That means no translation
+    layer is needed between this model and the CalendarError contract
+    main.py's tool wrappers already expect."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)  # for the caldav Calendar object below
+
+    title: str
+    start: str
+    end: str | None = None
+    location: str = ""
+    description: str = ""
+    calendar_name: str | None = None
+
+    # Populated by resolve_and_parse() below, not supplied by the caller -
+    # avoids re-parsing/re-resolving a second time in stage_create_event.
+    calendar: object = None
+    start_dt: datetime = None
+    end_dt: datetime = None
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise CalendarError("An event title is required.")
+        cleaned = _strip_unsafe_text(v)
+        if not cleaned:
+            raise CalendarError(
+                "An event title is required (the title given was emoji/symbols "
+                "only, which had to be removed - see calendar_manager.py's "
+                "_strip_unsafe_text for why)."
+            )
+        return cleaned
+
+    @field_validator("location", "description")
+    @classmethod
+    def _strip_free_text(cls, v: str) -> str:
+        return _strip_unsafe_text(v)
+
+    @model_validator(mode="after")
+    def _resolve_and_parse(self) -> "_CreateEventInput":
+        # validated up front so a bad calendar name fails before staging
+        self.calendar = _resolve_calendar(self.calendar_name)
+        start_dt = _parse_datetime(self.start)
+        end_dt = _parse_datetime(self.end) if self.end else start_dt + timedelta(hours=1)
+        if end_dt <= start_dt:
+            raise CalendarError("Event end time must be after the start time.")
+        # Attach the configured local timezone now - iCloud otherwise has
+        # no timezone info to go on and events land shifted (usually UTC).
+        self.start_dt = _localize(start_dt)
+        self.end_dt = _localize(end_dt)
+        return self
+
+
 def stage_create_event(title: str, start: str, end: str = None, location: str = "",
                         description: str = "", calendar_name: str = None) -> str:
-    if not title or not title.strip():
-        raise CalendarError("An event title is required.")
-    title = _strip_unsafe_text(title)
-    location = _strip_unsafe_text(location)
-    description = _strip_unsafe_text(description)
-    if not title:
-        raise CalendarError(
-            "An event title is required (the title given was emoji/symbols "
-            "only, which had to be removed - see calendar_manager.py's "
-            "_strip_unsafe_text for why)."
-        )
-    cal = _resolve_calendar(calendar_name)  # validated up front so a bad name fails before staging
-    start_dt = _parse_datetime(start)
-    end_dt = _parse_datetime(end) if end else start_dt + timedelta(hours=1)
-    if end_dt <= start_dt:
-        raise CalendarError("Event end time must be after the start time.")
-    # Attach the configured local timezone now - iCloud otherwise has no
-    # timezone info to go on and events land shifted (usually to UTC).
-    start_dt = _localize(start_dt)
-    end_dt = _localize(end_dt)
+    data = _CreateEventInput(
+        title=title, start=start, end=end, location=location,
+        description=description, calendar_name=calendar_name,
+    )
+    cal, title, location, description = data.calendar, data.title, data.location, data.description
+    start_dt, end_dt = data.start_dt, data.end_dt
 
     def apply_fn() -> str:
         # Duplicate guard: a previous attempt may have succeeded on
@@ -838,72 +884,146 @@ def _overlaps(a_start, a_end, b_start, b_end) -> bool:
     return a_start < b_end and b_start < a_end
 
 
+class _BatchEventItem(BaseModel):
+    """One event within a stage_create_events_batch() request. Deliberately
+    raises CalendarError with the TAIL of the final message only (no
+    'Event N' prefix, since this model doesn't know its own position in
+    the list) - _CreateEventsBatchInput below catches it per-item and
+    prepends the index, e.g. tail ": a title is required." becomes
+    "Event 3: a title is required." Concatenation, not reformatting, so
+    the exact original wording is preserved character for character."""
+    title: str = ""
+    start: str | None = None
+    end: str | None = None
+    location: str = ""
+    description: str = ""
+
+    start_dt: datetime = None
+    end_dt: datetime = None
+
+    @field_validator("title", "location", "description", mode="before")
+    @classmethod
+    def _coerce_to_string(cls, v) -> str:
+        # Mirrors the original's str(ev.get(...) or "") coercion - batch
+        # events arrive as plain dicts from JSON, so a field could be
+        # None, missing, or (rarely) a non-string.
+        return str(v or "")
+
+    @field_validator("title")
+    @classmethod
+    def _title_required(cls, v: str) -> str:
+        cleaned = _strip_unsafe_text(v.strip())
+        if not cleaned:
+            raise CalendarError(": a title is required.")
+        return cleaned
+
+    @field_validator("location", "description")
+    @classmethod
+    def _strip_free_text(cls, v: str) -> str:
+        return _strip_unsafe_text(v)
+
+    @model_validator(mode="after")
+    def _parse_times(self) -> "_BatchEventItem":
+        if not self.start:
+            raise CalendarError(f" ('{self.title}'): a start time is required.")
+        start_dt = _parse_datetime(self.start)
+        end_dt = (
+            _parse_datetime(self.end) if self.end
+            else start_dt + timedelta(minutes=CALENDAR_BATCH_DEFAULT_DURATION_MINUTES)
+        )
+        if end_dt <= start_dt:
+            raise CalendarError(f" ('{self.title}'): end time must be after the start time.")
+        self.start_dt = _localize(start_dt)
+        self.end_dt = _localize(end_dt)
+        return self
+
+
+class _CreateEventsBatchInput(BaseModel):
+    """Validates a stage_create_events_batch() request end to end: batch
+    size, each event's own fields (via _BatchEventItem), proposed events
+    overlapping each other, and proposed events overlapping what's
+    already on the calendar. Everything CalendarError-raising here was a
+    bare `raise CalendarError(...)` in the original function body -
+    moved into validators verbatim, not rewritten, so the exact wording
+    a user/model sees is unchanged."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    events: list
+    calendar_name: str | None = None
+
+    calendar: object = None
+    prepared: list = None  # list[dict] of {title, start_dt, end_dt, location, description}
+
+    @field_validator("events", mode="before")
+    @classmethod
+    def _events_shape(cls, v):
+        # mode="before" so a non-list value (e.g. a string) is caught
+        # HERE with our own message, before Pydantic's own list-type
+        # coercion would otherwise reject it with a generic
+        # pydantic.ValidationError instead.
+        if not isinstance(v, list) or len(v) < 1:
+            raise CalendarError("At least one event is required.")
+        if len(v) > CALENDAR_BATCH_MAX_EVENTS:
+            raise CalendarError(f"A batch may contain at most {CALENDAR_BATCH_MAX_EVENTS} events.")
+        return v
+
+    @model_validator(mode="after")
+    def _resolve_and_prepare(self) -> "_CreateEventsBatchInput":
+        self.calendar = _resolve_calendar(self.calendar_name)  # validated up front, same as stage_create_event
+
+        prepared = []
+        for i, raw_event in enumerate(self.events):
+            try:
+                item = _BatchEventItem(**raw_event)
+            except CalendarError as e:
+                raise CalendarError(f"Event {i + 1}{e}")
+            prepared.append({
+                "title": item.title, "start_dt": item.start_dt, "end_dt": item.end_dt,
+                "location": item.location, "description": item.description,
+            })
+
+        # No two proposed events may overlap each other.
+        ordered = sorted(prepared, key=lambda p: p["start_dt"])
+        for a, b in zip(ordered, ordered[1:]):
+            if a["end_dt"] > b["start_dt"]:
+                raise CalendarError(
+                    f"Proposed events overlap: '{a['title']}' ({a['start_dt'].strftime('%H:%M')}-"
+                    f"{a['end_dt'].strftime('%H:%M')}) and '{b['title']}' "
+                    f"({b['start_dt'].strftime('%H:%M')}-{b['end_dt'].strftime('%H:%M')}). "
+                    f"Adjust the times so no two proposed events overlap, then retry."
+                )
+
+        # None of the proposed events may collide with what's already on
+        # the calendar - checked across every calendar on the account,
+        # not just the target one for this batch.
+        window_start = min(p["start_dt"] for p in prepared).replace(tzinfo=None)
+        window_end = max(p["end_dt"] for p in prepared).replace(tzinfo=None)
+        busy = _get_busy_intervals(window_start, window_end)  # fetched ONCE for the whole
+                                                                # batch, not once per event -
+                                                                # the earlier per-event fetch
+                                                                # multiplied CalDAV round-trips
+                                                                # (and timeout risk) by batch size
+        for p in prepared:
+            for busy_start, busy_end, busy_title in busy:
+                if _overlaps(p["start_dt"], p["end_dt"], busy_start, busy_end):
+                    raise CalendarError(
+                        f"'{p['title']}' ({p['start_dt'].strftime('%a %H:%M')}-{p['end_dt'].strftime('%H:%M')}) "
+                        f"conflicts with an existing event '{busy_title}' ({busy_start.strftime('%H:%M')}-"
+                        f"{busy_end.strftime('%H:%M')}). Adjust the proposed schedule around it, then retry."
+                    )
+
+        self.prepared = prepared
+        return self
+
+
 def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
     """Like stage_create_event, but for MULTIPLE events staged as one
     pending change - e.g. a proposed morning schedule. Validates that no
     two proposed events overlap each other, and that none of them
     overlap anything already on the calendar, before staging anything.
     A single calendar_confirm_pending call then creates all of them."""
-    if not isinstance(events, list) or len(events) < 1:
-        raise CalendarError("At least one event is required.")
-    if len(events) > CALENDAR_BATCH_MAX_EVENTS:
-        raise CalendarError(f"A batch may contain at most {CALENDAR_BATCH_MAX_EVENTS} events.")
-
-    cal = _resolve_calendar(calendar_name)  # validated up front, same as stage_create_event
-
-    prepared = []
-    for i, ev in enumerate(events):
-        title = _strip_unsafe_text(str(ev.get("title") or "").strip())
-        if not title:
-            raise CalendarError(f"Event {i + 1}: a title is required.")
-        start_raw = ev.get("start")
-        if not start_raw:
-            raise CalendarError(f"Event {i + 1} ('{title}'): a start time is required.")
-        start_dt = _parse_datetime(start_raw)
-        end_raw = ev.get("end")
-        end_dt = (
-            _parse_datetime(end_raw) if end_raw
-            else start_dt + timedelta(minutes=CALENDAR_BATCH_DEFAULT_DURATION_MINUTES)
-        )
-        if end_dt <= start_dt:
-            raise CalendarError(f"Event {i + 1} ('{title}'): end time must be after the start time.")
-        prepared.append({
-            "title": title,
-            "start_dt": _localize(start_dt),
-            "end_dt": _localize(end_dt),
-            "location": _strip_unsafe_text(str(ev.get("location") or "")),
-            "description": _strip_unsafe_text(str(ev.get("description") or "")),
-        })
-
-    # No two proposed events may overlap each other.
-    ordered = sorted(prepared, key=lambda p: p["start_dt"])
-    for a, b in zip(ordered, ordered[1:]):
-        if a["end_dt"] > b["start_dt"]:
-            raise CalendarError(
-                f"Proposed events overlap: '{a['title']}' ({a['start_dt'].strftime('%H:%M')}-"
-                f"{a['end_dt'].strftime('%H:%M')}) and '{b['title']}' "
-                f"({b['start_dt'].strftime('%H:%M')}-{b['end_dt'].strftime('%H:%M')}). "
-                f"Adjust the times so no two proposed events overlap, then retry."
-            )
-
-    # None of the proposed events may collide with what's already on the
-    # calendar - checked across every calendar on the account, not just
-    # the target one for this batch.
-    window_start = min(p["start_dt"] for p in prepared).replace(tzinfo=None)
-    window_end = max(p["end_dt"] for p in prepared).replace(tzinfo=None)
-    busy = _get_busy_intervals(window_start, window_end)  # fetched ONCE for the whole
-                                                            # batch, not once per event -
-                                                            # the earlier per-event fetch
-                                                            # multiplied CalDAV round-trips
-                                                            # (and timeout risk) by batch size
-    for p in prepared:
-        for busy_start, busy_end, busy_title in busy:
-            if _overlaps(p["start_dt"], p["end_dt"], busy_start, busy_end):
-                raise CalendarError(
-                    f"'{p['title']}' ({p['start_dt'].strftime('%a %H:%M')}-{p['end_dt'].strftime('%H:%M')}) "
-                    f"conflicts with an existing event '{busy_title}' ({busy_start.strftime('%H:%M')}-"
-                    f"{busy_end.strftime('%H:%M')}). Adjust the proposed schedule around it, then retry."
-                )
+    data = _CreateEventsBatchInput(events=events, calendar_name=calendar_name)
+    cal, prepared = data.calendar, data.prepared
 
     def apply_fn() -> str:
         results = []
@@ -931,7 +1051,7 @@ def stage_create_events_batch(events: list, calendar_name: str = None) -> str:
     lines = [
         f"- {p['title']}: {p['start_dt'].strftime('%a %Y-%m-%d %H:%M')}-{p['end_dt'].strftime('%H:%M')}"
         + (f" at {p['location']}" if p["location"] else "")
-        for p in ordered
+        for p in sorted(prepared, key=lambda p: p["start_dt"])  # display in time order, same as the original's "ordered"
     ]
     desc = f"CREATE {len(prepared)} events in calendar '{cal.name or '(unnamed)'}':\n" + "\n".join(lines)
     return _stage(desc, apply_fn)
@@ -1020,25 +1140,90 @@ def _find_event_with_fallback(calendar_name: str, event_uid: str):
     )
 
 
-def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: str = None,
-                      location: str = None, description: str = None, calendar_name: str = None) -> str:
-    if not event_uid or not event_uid.strip():
+def _require_event_uid(v: str) -> str:
+    """Shared by both _EditEventInput and _DeleteEventInput below - same
+    check, same message, in one place instead of duplicated."""
+    if not v or not v.strip():
         raise CalendarError("event_uid is required - use calendar_list_events or "
                              "calendar_search_events to find it first. Never guess a UID.")
-    if title:
-        title = _strip_unsafe_text(title)
-    if location is not None:
-        location = _strip_unsafe_text(location)
-    if description is not None:
-        description = _strip_unsafe_text(description)
-    event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, event_uid.strip())
+    return v.strip()
 
-    # Parse/localize now, same as stage_create_event - a bad date/time fails
-    # here, before anything is staged, instead of being baked as a raw
-    # string into apply_fn's closure where it would only surface (and keep
-    # re-surfacing) at confirm time.
-    start_dt = _localize(_parse_datetime(start)) if start else None
-    end_dt = _localize(_parse_datetime(end)) if end else None
+
+class _EditEventInput(BaseModel):
+    """Validates stage_edit_event()'s caller-supplied fields ONLY: shape
+    and formatting, nothing state-dependent. Deliberately does NOT:
+
+    1. Decide whether "no fields to change" is an error. The original
+       function only raises that AFTER _find_event_with_fallback resolves
+       the event - a fabricated uid with zero other fields should surface
+       as "could not find that uid", not "no fields to change". Moving
+       that check into this model (which runs before resolution) would
+       silently swap which error a caller sees for that exact
+       combination - a real behavior change smuggled in as a refactor.
+    2. Attempt UID/event resolution itself. _find_event_with_fallback
+       reads live calendar state and the _last_results cache - that's
+       business logic with side effects, not a fit for a validation
+       model. It stays as plain function code in stage_edit_event,
+       called with this model's already-validated fields.
+    """
+    event_uid: str
+    title: str | None = None
+    start: str | None = None
+    end: str | None = None
+    location: str | None = None
+    description: str | None = None
+    calendar_name: str | None = None
+
+    start_dt: datetime | None = None
+    end_dt: datetime | None = None
+
+    @field_validator("event_uid")
+    @classmethod
+    def _uid_required(cls, v: str) -> str:
+        return _require_event_uid(v)
+
+    @field_validator("title")
+    @classmethod
+    def _strip_title(cls, v):
+        # Truthy check, matching the original exactly: an all-emoji title
+        # strips down to "", which is falsy, and both here and in
+        # stage_edit_event's changes-list logic that's treated as "no
+        # title change requested" - unlike stage_create_event, this does
+        # NOT raise its own "emoji only" error. Preserved as-is (existing
+        # behavior, not something this refactor should silently change),
+        # though possibly worth a follow-up decision later.
+        return _strip_unsafe_text(v) if v else v
+
+    @field_validator("location", "description")
+    @classmethod
+    def _strip_free_text(cls, v):
+        # "is not None" here (not truthy) is deliberate and load-bearing:
+        # an explicit "" means "clear this field", while None means "the
+        # caller didn't mention it, leave it alone". Collapsing "" to
+        # None here would silently turn a clear-the-location request
+        # into a no-op.
+        return _strip_unsafe_text(v) if v is not None else v
+
+    @model_validator(mode="after")
+    def _parse_dates(self) -> "_EditEventInput":
+        # Parse/localize now, same as stage_create_event - a bad
+        # date/time fails here, before anything is staged, instead of
+        # being baked as a raw string into apply_fn's closure where it
+        # would only surface (and keep re-surfacing) at confirm time.
+        self.start_dt = _localize(_parse_datetime(self.start)) if self.start else None
+        self.end_dt = _localize(_parse_datetime(self.end)) if self.end else None
+        return self
+
+
+def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: str = None,
+                      location: str = None, description: str = None, calendar_name: str = None) -> str:
+    data = _EditEventInput(
+        event_uid=event_uid, title=title, start=start, end=end,
+        location=location, description=description, calendar_name=calendar_name,
+    )
+    title, location, description = data.title, data.location, data.description
+    start_dt, end_dt = data.start_dt, data.end_dt
+    event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, data.event_uid)
 
     changes = []
     if title:
@@ -1082,11 +1267,21 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
     return _stage(desc, apply_fn)
 
 
+class _DeleteEventInput(BaseModel):
+    """Same scoping call as _EditEventInput: validates only event_uid's
+    shape. UID/event resolution stays in stage_delete_event itself."""
+    event_uid: str
+    calendar_name: str | None = None
+
+    @field_validator("event_uid")
+    @classmethod
+    def _uid_required(cls, v: str) -> str:
+        return _require_event_uid(v)
+
+
 def stage_delete_event(event_uid: str, calendar_name: str = None) -> str:
-    if not event_uid or not event_uid.strip():
-        raise CalendarError("event_uid is required - use calendar_list_events or "
-                             "calendar_search_events to find it first. Never guess a UID.")
-    event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, event_uid.strip())
+    data = _DeleteEventInput(event_uid=event_uid, calendar_name=calendar_name)
+    event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, data.event_uid)
     try:
         title = _ical_field(event.icalendar_component, "summary", event_uid)
     except Exception as e:
