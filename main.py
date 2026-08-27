@@ -32,17 +32,20 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
+import attire_manager
 import calendar_manager
 import duration_manager
 import memory
 import project_manager
 from console_log import alog, flush as flush_console
+from attire_manager import AttireManagerError
 from calendar_manager import CalendarError
 from duration_manager import DurationError
 from project_manager import ProjectManagerError
 from prompt_log_engine import log_prompt, log_console, router as prompt_log_router
 from config import (
     AGENT_API_KEY,
+    ATTIRE_SEED_ASSISTANT_TURN_LIMIT,
     CORS_ALLOWED_ORIGINS,
     DELETE_FILE_ALLOWED_EXTENSIONS,
     DOCKER_CPU_COUNT,
@@ -751,6 +754,33 @@ def duration_confirm_new_category(args: dict) -> str:
         return f"Error: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Attire tracking tools (attire_manager.py). One global record per character
+# (not per chat), structured slots only, current state only - see
+# attire_manager.py's module docstring for the full design rationale.
+# ---------------------------------------------------------------------------
+
+def attire_manager_update(args: dict) -> str:
+    try:
+        record, changed = attire_manager.update_attire(
+            args.get("character_name", ""),
+            head=args.get("head"),
+            top=args.get("top"),
+            bottom=args.get("bottom"),
+            feet=args.get("feet"),
+            accessories=args.get("accessories"),
+        )
+        if not changed:
+            return f"No change needed - {record['name']}'s attire already matches that."
+        return f"Updated {record['name']}'s attire ({', '.join(changed)})."
+    except AttireManagerError as e:
+        return f"Error: {e}"
+
+
+def attire_manager_get(args: dict) -> str:
+    return attire_manager.get_attire_text(args.get("character_name", ""))
+
+
 TOOLS = [
     {
         "type": "function",
@@ -1311,6 +1341,53 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_manager_update",
+            "description": (
+                "Record a character's current attire - either seeding it for the first time "
+                "(e.g. from a description in the character card, before anything has actually "
+                "changed) or logging a change. Call this the moment the narrative describes ANY "
+                "change to what a character is wearing - full outfit changes as well as subtle/"
+                "partial ones (loosening or removing a tie, unbuttoning a shirt, taking off shoes "
+                "or an accessory, a jacket coming off, one item being swapped for another). Only "
+                "pass the slot(s) that changed or that you're seeding; omit everything else. Pass "
+                "an empty string for a slot to mean it is now bare/nothing (e.g. shoes removed)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character whose attire changed, exactly as you refer to them."},
+                    "head": {"type": "string", "description": "Headwear, e.g. 'wide-brimmed hat'. Omit if unchanged; empty string to clear."},
+                    "top": {"type": "string", "description": "Upper-body garment, e.g. 'black leather jacket'. Omit if unchanged; empty string to clear."},
+                    "bottom": {"type": "string", "description": "Lower-body garment, e.g. 'ripped jeans'. Omit if unchanged; empty string to clear."},
+                    "feet": {"type": "string", "description": "Footwear, e.g. 'combat boots'. Omit if unchanged; empty string to clear."},
+                    "accessories": {"type": "string", "description": "Comma-separated list of accessories, e.g. 'silver necklace, fingerless gloves'. Omit if unchanged; empty string to clear all."},
+                },
+                "required": ["character_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_manager_get",
+            "description": (
+                "Look up a character's current attire. Usually unnecessary since a tracked "
+                "character's current attire is already shown to you automatically at the top "
+                "of the conversation - use this only if that wasn't shown (e.g. a brand-new "
+                "character never updated before) or you need to double-check before narrating."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character to look up, exactly as you refer to them."},
+                },
+                "required": ["character_name"],
+            },
+        },
+    },
 ]
 
 TOOL_FUNCTIONS = {
@@ -1350,6 +1427,8 @@ TOOL_FUNCTIONS = {
     "duration_get_estimate": duration_get_estimate,
     "duration_correct_entry": duration_correct_entry,
     "duration_confirm_new_category": duration_confirm_new_category,
+    "attire_manager_update": attire_manager_update,
+    "attire_manager_get": attire_manager_get,
 }
 
 # ---------------------------------------------------------------------------
@@ -1380,10 +1459,11 @@ TOOL_GROUPS = {
     "project_manager_set_all_tasks_status": "project", "project_manager_batch_update": "project",
     "duration_get_estimate": "duration", "duration_correct_entry": "duration",
     "duration_confirm_new_category": "duration",
+    "attire_manager_update": "attire", "attire_manager_get": "attire",
 }
 # Stable order so the assembled instruction text reads the same way (and
 # hits the same prompt-cache prefix) whenever the same group set is chosen.
-_GROUP_ORDER = ["utility", "files", "memory", "calendar", "project", "duration"]
+_GROUP_ORDER = ["utility", "files", "memory", "calendar", "project", "duration", "attire"]
 
 GROUP_INSTRUCTIONS = {
     "utility": (
@@ -1505,6 +1585,28 @@ GROUP_INSTRUCTIONS = {
         "after the user explicitly agrees to a specific new category name "
         "you proposed following an 'uncategorized' flag - never on your "
         "own initiative."
+    ),
+    "attire": (
+        "A tracked character's current attire is normally shown to you "
+        "automatically near the top of this conversation, under "
+        "[PERSISTENT ATTIRE STATE] - treat it as authoritative and read it "
+        "before narrating what someone is wearing. If a character in this "
+        "scene has NO such entry yet, that means their attire has never "
+        "been logged - check whether the character card above describes "
+        "what they're currently wearing (persona/description text often "
+        "does) and, if so, call attire_manager_update ONCE now to seed it, "
+        "even though nothing has actually changed yet - establishing an "
+        "outfit for the first time counts just as much as changing one, "
+        "and should not wait for an in-scene change to happen first. Once "
+        "seeded (or already tracked), call attire_manager_update the "
+        "moment the narrative - yours or the user's - describes any "
+        "change, including subtle or partial ones (loosening or removing a "
+        "tie, unbuttoning a shirt, taking off shoes or an accessory, a "
+        "jacket coming off, one item swapped for another). Pass only the "
+        "slot(s) that changed (or, for seeding, only the slot(s) the card "
+        "actually describes - leave the rest unset rather than guessing). "
+        "Use attire_manager_get only if you need to double-check a "
+        "character's state and it wasn't already shown to you above."
     ),
 }
 
@@ -2233,9 +2335,48 @@ async def chat_completions(request: Request):
         (m.get("content") for m in reversed(body.get("messages", [])) if m.get("role") == "assistant"),
         "",
     )
+
+    # SillyTavern's own leading system message, if any (the character
+    # card). Extracted here - earlier than it used to be - because
+    # force_tool_names below needs it; the per-section token-count
+    # diagnostic further down reuses this same variable rather than
+    # re-extracting it.
+    character_card_text = None
+    if upstream_body["messages"] and upstream_body["messages"][0].get("role") == "system":
+        character_card_text = upstream_body["messages"][0].get("content") or ""
+
     force_tool_names = set()
     if calendar_manager.has_pending_change():
-        force_tool_names = {name for name, group in TOOL_GROUPS.items() if group == "calendar"}
+        force_tool_names |= {name for name, group in TOOL_GROUPS.items() if group == "calendar"}
+
+    # A known character's name appearing in the character card forces the
+    # attire group in regardless of embedding score, for the same reason
+    # the calendar case above does: the trigger language for a clothing
+    # change ("he loosens his tie") is diffuse narrative prose, not
+    # keyword-y like "add a task" - it may well score below
+    # TOOL_SELECTION_MIN_SCORE even when a change is clearly happening.
+    attire_state_now = attire_manager._load()
+    known_attire_match = attire_manager.find_character_names_in_text(
+        attire_state_now, character_card_text or ""
+    )
+    if known_attire_match:
+        force_tool_names |= {name for name, group in TOOL_GROUPS.items() if group == "attire"}
+    elif character_card_text:
+        # No tracked record yet - most likely a brand-new character whose
+        # card describes an outfit that's never been logged. Rather than
+        # relying on embedding luck to notice that (the same weak-signal
+        # problem as above, but worse: there's no "change" language to
+        # match against at all on a first-ever outfit), force the group in
+        # for a bounded window at the start of the chat so the model has a
+        # chance to seed it from the card description. Self-terminating:
+        # once seeded, known_attire_match starts hitting above instead; if
+        # the window passes with nothing seeded, this falls back to normal
+        # embedding scoring rather than forcing the group in forever.
+        assistant_turn_count = sum(
+            1 for m in body.get("messages", []) if m.get("role") == "assistant"
+        )
+        if assistant_turn_count <= ATTIRE_SEED_ASSISTANT_TURN_LIMIT:
+            force_tool_names |= {name for name, group in TOOL_GROUPS.items() if group == "attire"}
 
     selected_tools, tool_scores, tool_tier = select_tools(
         str(last_user_text or ""), force_tool_names, str(prior_assistant_text or "")
@@ -2280,6 +2421,19 @@ async def chat_completions(request: Request):
         messages_to_prepend.append({"role": "system", "content": project_state_text})
         prepend_sections.append(("project_state", project_state_text))
     alog(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
+
+    # Attire state for any already-tracked character mentioned in the
+    # character card - reuses attire_state_now/known_attire_match computed
+    # earlier for force_tool_names rather than reloading and re-scanning.
+    # Best-effort: zero or multiple name matches both just skip injection
+    # (see find_character_names_in_text's docstring) rather than guessing.
+    attire_state_text = attire_manager.build_context_text_for_ids(
+        attire_state_now, known_attire_match
+    )
+    if attire_state_text:
+        messages_to_prepend.append({"role": "system", "content": attire_state_text})
+        prepend_sections.append(("attire_state", attire_state_text))
+    alog(f"[AGENT] Attire state text sent to model:\n{attire_state_text or '(none)'}")
 
     # Read-only, local-file-only - see calendar_manager.get_cached_context()
     # docstring for why this never triggers a live CalDAV call.
@@ -2352,13 +2506,12 @@ async def chat_completions(request: Request):
 
     # Best-effort exact per-section token counts via llama-server's
     # /tokenize endpoint - purely diagnostic, printed to console to help
-    # spot which system-prompt section is worth trimming. "character_card"
-    # is SillyTavern's own leading system message, if any - inspected here
-    # for visibility only, never modified. A tokenize failure just skips
-    # this log line; it never blocks the actual turn.
-    character_card_text = None
-    if upstream_body["messages"] and upstream_body["messages"][0].get("role") == "system":
-        character_card_text = upstream_body["messages"][0].get("content") or ""
+    # spot which system-prompt section is worth trimming. character_card_text
+    # (SillyTavern's own leading system message, if any) was already
+    # extracted earlier in this function for force_tool_names - reused here
+    # rather than re-extracted, inspected only for visibility, never
+    # modified. A tokenize failure just skips this log line; it never
+    # blocks the actual turn.
 
     # The tools schema (this server's own TOOLS plus any client-registered
     # ones) is sent as JSON on every single request and rendered into the

@@ -1,6 +1,6 @@
 """
 Shared fixtures for testing calendar_manager.py, duration_manager.py,
-project_manager.py, console_log.py, and memory.py.
+project_manager.py, console_log.py, memory.py, and attire_manager.py.
 
 CRITICAL ORDERING:
 - install_fake_memory_module() MUST run before duration_manager is
@@ -36,6 +36,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import calendar_manager as cm  # noqa: E402  (import after sys.path fix, deliberately)
+import attire_manager as am  # noqa: E402
 import console_log  # noqa: E402
 
 from tests.fakes.fake_caldav import FakeCalendar  # noqa: E402
@@ -300,3 +301,21 @@ def client():
     app = FastAPI()
     app.include_router(pe.router)
     return TestClient(app)
+
+
+# ---------------------------------------------------------------------------
+# attire_manager fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tmp_attire_file(tmp_path, monkeypatch):
+    """Points attire_manager's on-disk store (attire.json) at a throwaway
+    file under pytest's own tmp_path, so tests never read or write the
+    real attire_data/attire.json on this machine. Unlike calendar_manager,
+    attire_manager has no other module-level state to reset between tests
+    (no cached client, no pending-change lifecycle) - the file itself,
+    freshly pointed at an empty tmp_path each test, is the only thing that
+    needs isolating."""
+    fake_path = tmp_path / "attire.json"
+    monkeypatch.setattr(am, "STATE_FILE", fake_path)
+    return fake_path

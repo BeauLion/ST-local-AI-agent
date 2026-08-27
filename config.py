@@ -395,6 +395,26 @@ DURATION_CATEGORY_ALIASES = {
 
 
 # ─────────────────────────────────────────────────────────────
+# Attire manager (attire_manager.py)
+# ─────────────────────────────────────────────────────────────
+
+ATTIRE_DATA_DIR = os.path.join(PROJECT_ROOT, "attire_data")
+
+# "accessories" is the one multi-item (list) slot; everything else is a
+# single string-or-None. See attire_manager.py's module docstring.
+ATTIRE_SLOTS = ("head", "top", "bottom", "feet", "accessories")
+
+MAX_CHARACTER_NAME_LENGTH = 200
+MAX_ATTIRE_ITEM_LENGTH = 200
+
+# How many assistant turns (from the start of the chat) the attire tool
+# group gets force-included for an untracked character whose card
+# describes an outfit, giving the model a window to seed it. See
+# main.py's force_tool_names attire logic.
+ATTIRE_SEED_ASSISTANT_TURN_LIMIT = 3
+
+
+# ─────────────────────────────────────────────────────────────
 # run_python tool (Docker sandbox)
 # ─────────────────────────────────────────────────────────────
 
