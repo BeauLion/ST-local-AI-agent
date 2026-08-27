@@ -263,6 +263,15 @@ def build_context_text_for_ids(state: dict, character_ids: list) -> str:
         "Update only the slot(s) that actually changed - do not restate slots that "
         "didn't change. An empty value means that slot is now bare/nothing. When in "
         "doubt about whether something counts, log it anyway; a spurious update is "
-        "cheaper than a stale one."
+        "cheaper than a stale one.\n\n"
+        "IMPORTANT - if a slot already describes one or more items (e.g. feet: 'white socks'), and an item is added (e.g. "
+        "('black sneakers are put on feet'),you MUST restate the FULL corrected value for that "
+        "slot ('black sneakers and white socks'), not just the part that changed."
+        "if a slot shown above already describes more than one item (e.g. "
+        "feet: 'black sneakers and white socks'), and only PART of that changes (e.g. "
+        "just the socks come off), you MUST restate the FULL corrected value for that "
+        "slot ('black sneakers'), not just the part that changed." 
+        "Never set a slot to empty or to only the changed portion when it was sharing space with something "
+        "that didn't change - that silently deletes the part you didn't mean to touch."
     ]
     return "\n\n".join(lines)

@@ -415,6 +415,24 @@ def test_build_context_includes_seeding_and_subtle_change_guidance(tmp_attire_fi
     assert "cheaper than a stale one" in result
 
 
+def test_build_context_includes_compound_value_restatement_guidance(tmp_attire_file):
+    """Option A from the layered-clothing brainstorm: instruction-only
+    discipline telling the model to restate a slot's FULL value rather
+    than overwrite it with just the changed portion, when that slot
+    already holds more than one item. Locks down that this guidance is
+    actually present in the injected block - this is the specific text
+    the live test is meant to exercise, so a silent regression here
+    would be easy to miss without an explicit assertion."""
+    am.update_attire("Aria", feet="black sneakers and white socks")
+    state = am._load()
+    aria_id = next(iter(state["characters"]))
+
+    result = am.build_context_text_for_ids(state, [aria_id])
+
+    assert "FULL corrected value" in result
+    assert "silently delete" in result
+
+
 def test_build_context_includes_multiple_characters_when_multiple_ids_given(tmp_attire_file):
     am.update_attire("Aria", top="jacket")
     am.update_attire("Kai", top="hoodie")

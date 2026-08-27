@@ -1353,7 +1353,11 @@ TOOLS = [
                 "partial ones (loosening or removing a tie, unbuttoning a shirt, taking off shoes "
                 "or an accessory, a jacket coming off, one item being swapped for another). Only "
                 "pass the slot(s) that changed or that you're seeding; omit everything else. Pass "
-                "an empty string for a slot to mean it is now bare/nothing (e.g. shoes removed)."
+                "an empty string for a slot to mean it is now bare/nothing (e.g. shoes removed). "
+                "If a slot already describes more than one item (e.g. 'black sneakers and white "
+                "socks') and only part of it changes, pass the FULL corrected value for that slot "
+                "('black sneakers') - never just the changed part or an empty value, or whatever "
+                "else was sharing that slot gets silently lost."
             ),
             "parameters": {
                 "type": "object",
@@ -1605,6 +1609,11 @@ GROUP_INSTRUCTIONS = {
         "jacket coming off, one item swapped for another). Pass only the "
         "slot(s) that changed (or, for seeding, only the slot(s) the card "
         "actually describes - leave the rest unset rather than guessing). "
+        "If a slot already holds more than one item (e.g. 'black sneakers "
+        "and white socks') and only part of it changes, you MUST pass the "
+        "FULL corrected value for that slot, not just the part that "
+        "changed or an empty value - overwriting with only the changed "
+        "portion silently deletes whatever else was sharing that slot. "
         "Use attire_manager_get only if you need to double-check a "
         "character's state and it wasn't already shown to you above."
     ),
