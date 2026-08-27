@@ -70,6 +70,7 @@ install_fake_sentence_transformers_module()
 del sys.modules["memory"]
 import memory  # noqa: E402
 
+import prompt_log_engine as pe  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # calendar_manager fixtures
@@ -251,3 +252,51 @@ def tmp_doc_index_file(tmp_path, monkeypatch):
     fake_path = tmp_path / "doc_index.json"
     monkeypatch.setattr(memory, "DOC_INDEX_FILE", fake_path)
     return fake_path
+
+
+# ---------------------------------------------------------------------------
+# prompt_log_engine fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tmp_log_dir(tmp_path, monkeypatch):
+    """Redirects every prompt_log_engine function at a throwaway
+    directory, and points SESSION_LOG_PATH at a fixed, known filename
+    inside it - so tests never read/write the real prompt_logs/ folder
+    or depend on the real wall-clock session filename. Both
+    _PROMPT_LOG_DIR and SESSION_LOG_PATH are plain module-level globals
+    referenced fresh inside every function that uses them (not captured
+    in a closure at def time), so monkeypatching the attribute here
+    redirects every function correctly."""
+    monkeypatch.setattr(pe, "_PROMPT_LOG_DIR", tmp_path)
+    monkeypatch.setattr(pe, "SESSION_LOG_PATH", tmp_path / "session_test.log")
+    return tmp_path
+
+
+@pytest.fixture
+def prompt_log_enabled(monkeypatch):
+    """Forces PROMPT_LOG_ENABLED on for a test, regardless of config.py's
+    real value. Monkeypatches the ATTRIBUTE on prompt_log_engine, not
+    config - PROMPT_LOG_ENABLED was pulled in via `from config import
+    PROMPT_LOG_ENABLED`, a one-time name binding at import, not a live
+    reference back to config.py."""
+    monkeypatch.setattr(pe, "PROMPT_LOG_ENABLED", True)
+
+
+@pytest.fixture
+def prompt_log_disabled(monkeypatch):
+    """Forces PROMPT_LOG_ENABLED off for a test."""
+    monkeypatch.setattr(pe, "PROMPT_LOG_ENABLED", False)
+
+
+@pytest.fixture
+def client():
+    """A FastAPI TestClient wired up with just prompt_log_engine's
+    router - mirrors how main.py wires it into the real app
+    (`app.include_router(prompt_log_router)`), without pulling in the
+    rest of main.py's own routes/state."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    app.include_router(pe.router)
+    return TestClient(app)
