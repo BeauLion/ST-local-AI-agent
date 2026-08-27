@@ -59,12 +59,13 @@ def test_refresh_creates_missing_parent_directory(fake_calendars, tmp_path, monk
 
 def test_refresh_sorts_events_by_start_time(fake_calendars, tmp_cache_file):
     from datetime import datetime
-    fake_calendars[0].seed_event("Later", datetime(2026, 8, 27, 14, 0))
-    fake_calendars[0].seed_event("Earlier", datetime(2026, 8, 27, 9, 0))
+    with freeze_time(FROZEN_NOW):
+        fake_calendars[0].seed_event("Later", datetime(2026, 8, 27, 14, 0))
+        fake_calendars[0].seed_event("Earlier", datetime(2026, 8, 27, 9, 0))
 
-    cm.refresh_cache()
+        cm.refresh_cache()
 
-    payload = json.loads(tmp_cache_file.read_text(encoding="utf-8"))
+        payload = json.loads(tmp_cache_file.read_text(encoding="utf-8"))
     assert [e["title"] for e in payload["events"]] == ["Earlier", "Later"]
 
 
