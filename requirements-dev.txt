@@ -1,0 +1,10 @@
+# Dev-only dependencies - not needed to run the agent itself, only to run
+# the test suite. Install with: pip install -r requirements-dev.txt
+pytest
+freezegun
+
+# NOT actually a test-only dependency - calendar_manager.py's resolve_when()
+# imports this directly at runtime, but it's missing from the real
+# requirements.txt. Listed here so the test suite runs standalone; you
+# should also add this line to requirements.txt itself.
+dateparser

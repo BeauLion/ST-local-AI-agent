@@ -25,6 +25,7 @@ from pathlib import Path
 from statistics import median
 
 import numpy as np
+from pydantic import BaseModel, model_validator
 
 import memory
 from config import (
@@ -241,10 +242,27 @@ def resolve_category(text: str, *, state: dict | None = None) -> str | None:
     return None
 
 
+class _ConfirmCategoryInput(BaseModel):
+    """Validates confirm_new_category()'s one real input: the category
+    name's shape. Everything else in the original function - checking
+    whether `clean` is already canonical/custom, appending to
+    custom_categories, reclassifying the last uncategorized entry - is
+    live-state-dependent (reads/mutates `state`) and stays as plain
+    function code below, same as calendar_manager.py's stage_edit_event
+    keeps its UID resolution out of its Pydantic model."""
+    name: str
+    clean: str = None  # computed: normalized + underscored form the rest of the function uses
+
+    @model_validator(mode="after")
+    def _normalize_and_require(self) -> "_ConfirmCategoryInput":
+        self.clean = _normalize_key(self.name).replace(" ", "_")
+        if not self.clean:
+            raise DurationError("A category name is required.")
+        return self
+
+
 def confirm_new_category(name: str, reclassify_last: bool = True) -> str:
-    clean = _normalize_key(name).replace(" ", "_")
-    if not clean:
-        raise DurationError("A category name is required.")
+    clean = _ConfirmCategoryInput(name=name).clean
 
     with _lock:
         state = _load()
@@ -344,10 +362,29 @@ def parse_duration_minutes(value_text: str) -> float | None:
     return value
 
 
+class _CorrectEntryInput(BaseModel):
+    """Validates correct_entry()'s one field-shape check: that
+    value_text actually parses to a duration. The match-finding logic
+    (title match, category match, most-recent-overall fallback, "no
+    entries exist yet") all reads live `state`/`entries` and stays as
+    plain function code - same reasoning as _ConfirmCategoryInput
+    above."""
+    task_or_category: str = ""
+    value_text: str
+    minutes: float = None  # computed
+
+    @model_validator(mode="after")
+    def _parse_minutes(self) -> "_CorrectEntryInput":
+        self.minutes = parse_duration_minutes(self.value_text)
+        if self.minutes is None:
+            raise DurationError(
+                f"Couldn't parse a duration from “{self.value_text}”. Try e.g. '20min', '1h', '90'."
+            )
+        return self
+
+
 def correct_entry(task_or_category: str, value_text: str) -> str:
-    minutes = parse_duration_minutes(value_text)
-    if minutes is None:
-        raise DurationError(f"Couldn't parse a duration from “{value_text}”. Try e.g. '20min', '1h', '90'.")
+    minutes = _CorrectEntryInput(task_or_category=task_or_category, value_text=value_text).minutes
 
     with _lock:
         state = _load()

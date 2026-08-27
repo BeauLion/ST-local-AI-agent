@@ -31,6 +31,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pydantic import BaseModel, field_validator, model_validator
+
 import duration_manager
 from config import (
     MAX_BATCH_OPERATIONS,
@@ -366,8 +368,24 @@ def resolve_project(state: dict, project_ref):
 
 # --------------------------- mutations (projects) ---------------------------
 
+class _ProjectNameInput(BaseModel):
+    """Shared by create_project and rename_project - both need exactly
+    the same "name is required, ≤ MAX_PROJECT_NAME_LENGTH chars,
+    whitespace-normalized" check. State-dependent checks (does another
+    project already have this exact name, does this project_id exist)
+    stay as plain function code, same reasoning as calendar_manager.py's
+    stage_edit_event keeping UID resolution out of its model."""
+    name: str
+    clean_name: str = None  # computed
+
+    @model_validator(mode="after")
+    def _require_and_normalize(self) -> "_ProjectNameInput":
+        self.clean_name = _require_length(self.name, "Project name", MAX_PROJECT_NAME_LENGTH)
+        return self
+
+
 def create_project(name: str) -> dict:
-    clean_name = _require_length(name, "Project name", MAX_PROJECT_NAME_LENGTH)
+    clean_name = _ProjectNameInput(name=name).clean_name
     with _lock:
         state = _load()
         if any(p["name"].lower() == clean_name.lower() for p in state["projects"].values()):
@@ -417,7 +435,7 @@ def set_project_status(project_id: str, status: str) -> dict:
 
 
 def rename_project(project_id: str, name: str) -> dict:
-    clean_name = _require_length(name, "Project name", MAX_PROJECT_NAME_LENGTH)
+    clean_name = _ProjectNameInput(name=name).clean_name
     with _lock:
         state = _load()
         project = state["projects"].get(project_id)
@@ -443,10 +461,38 @@ def delete_project(project_id: str):
 
 # --------------------------- mutations (tasks) ---------------------------
 
+class _CreateTaskInput(BaseModel):
+    """Validates create_task()'s field shape: title requiredness/length,
+    priority falling back to "normal" when invalid (mirrors the
+    original's silent-fallback behavior exactly, not an error), and
+    notes truncation. The duplicate-open-title check and project
+    existence check both need live `state`, so they stay as plain
+    function code below."""
+    title: str
+    priority: str = "normal"
+    notes: str = ""
+
+    clean_title: str = None  # computed
+
+    @field_validator("priority")
+    @classmethod
+    def _fallback_invalid_priority(cls, v: str) -> str:
+        return v if v in TASK_PRIORITIES else "normal"
+
+    @field_validator("notes")
+    @classmethod
+    def _coerce_and_truncate_notes(cls, v) -> str:
+        return str(v or "")[:MAX_TASK_NOTE_LENGTH]
+
+    @model_validator(mode="after")
+    def _require_title(self) -> "_CreateTaskInput":
+        self.clean_title = _require_length(self.title, "Task title", MAX_TASK_TITLE_LENGTH)
+        return self
+
+
 def create_task(project_id: str, title: str, *, priority="normal", notes="") -> dict:
-    clean_title = _require_length(title, "Task title", MAX_TASK_TITLE_LENGTH)
-    if priority not in TASK_PRIORITIES:
-        priority = "normal"
+    data = _CreateTaskInput(title=title, priority=priority, notes=notes)
+    clean_title, priority, notes = data.clean_title, data.priority, data.notes
     with _lock:
         state = _load()
         project = state["projects"].get(project_id)
@@ -474,7 +520,7 @@ def create_task(project_id: str, title: str, *, priority="normal", notes="") -> 
             "archived": False,
             "archived_at": None,
             "priority": priority,
-            "notes": str(notes or "")[:MAX_TASK_NOTE_LENGTH],
+            "notes": notes,
             "sort_order": len(project["tasks"]),
         }
         project["tasks"][task_id] = task
@@ -528,19 +574,52 @@ def set_task_status(project_id: str, task_id: str, status: str) -> tuple:
         return task, flag
 
 
+class _UpdateTaskDetailsInput(BaseModel):
+    """Validates update_task_details()'s optional field shapes. None
+    means "caller didn't mention this field, leave the task untouched" -
+    a load-bearing distinction preserved throughout, same pattern as
+    calendar_manager.py's _EditEventInput's "is not None" checks. Project/
+    task existence needs live state and stays as plain function code."""
+    title: str | None = None
+    priority: str | None = None
+    notes: str | None = None
+
+    @field_validator("title")
+    @classmethod
+    def _require_title_when_given(cls, v):
+        if v is None:
+            return v
+        return _require_length(v, "Task title", MAX_TASK_TITLE_LENGTH)
+
+    @field_validator("priority")
+    @classmethod
+    def _fallback_invalid_priority_when_given(cls, v):
+        if v is None:
+            return v
+        return v if v in TASK_PRIORITIES else "normal"
+
+    @field_validator("notes")
+    @classmethod
+    def _coerce_and_truncate_notes_when_given(cls, v):
+        if v is None:
+            return v
+        return str(v or "")[:MAX_TASK_NOTE_LENGTH]
+
+
 def update_task_details(project_id: str, task_id: str, *, title=None, priority=None, notes=None) -> dict:
+    data = _UpdateTaskDetailsInput(title=title, priority=priority, notes=notes)
     with _lock:
         state = _load()
         project = state["projects"].get(project_id)
         if not project or task_id not in project["tasks"]:
             raise ProjectManagerError("Task not found.")
         task = project["tasks"][task_id]
-        if title is not None:
-            task["title"] = _require_length(title, "Task title", MAX_TASK_TITLE_LENGTH)
-        if priority is not None:
-            task["priority"] = priority if priority in TASK_PRIORITIES else "normal"
-        if notes is not None:
-            task["notes"] = str(notes or "")[:MAX_TASK_NOTE_LENGTH]
+        if data.title is not None:
+            task["title"] = data.title
+        if data.priority is not None:
+            task["priority"] = data.priority
+        if data.notes is not None:
+            task["notes"] = data.notes
         task["updated_at"] = _now()
         project["updated_at"] = _now()
         _recalculate_next_action(project)
@@ -548,11 +627,27 @@ def update_task_details(project_id: str, task_id: str, *, title=None, priority=N
         return task
 
 
+class _UpdateTaskNotesInput(BaseModel):
+    """Validates update_task_notes()'s mode enum and the mode-dependent
+    text requirement (text required for replace/append, not for clear -
+    a cross-field rule, hence @model_validator rather than a per-field
+    check). Project/task existence and the actual note-merge logic
+    (_compute_next_notes) both need live state and stay as plain
+    function code below."""
+    mode: str
+    text: str = ""
+
+    @model_validator(mode="after")
+    def _validate_mode_and_text(self) -> "_UpdateTaskNotesInput":
+        if self.mode not in ("replace", "append", "clear"):
+            raise ProjectManagerError(f"Invalid note mode: {self.mode}")
+        if self.mode != "clear" and not _normalize_text(self.text):
+            raise ProjectManagerError("Note text is required for replace or append.")
+        return self
+
+
 def update_task_notes(project_id: str, task_id: str, mode: str, text: str = "") -> dict:
-    if mode not in ("replace", "append", "clear"):
-        raise ProjectManagerError(f"Invalid note mode: {mode}")
-    if mode != "clear" and not _normalize_text(text):
-        raise ProjectManagerError("Note text is required for replace or append.")
+    _UpdateTaskNotesInput(mode=mode, text=text)  # raises before touching state if invalid
     with _lock:
         state = _load()
         project = state["projects"].get(project_id)
@@ -596,41 +691,91 @@ def reorder_tasks(project_id: str, ordered_task_ids: list):
 
 # --------------------------- batch operations ---------------------------
 
+class _CreateTaskOperationFields(BaseModel):
+    """Field-shape validation for a "create_task" batch operation.
+    Mirrors _CreateTaskInput's title/priority/notes rules (see
+    create_task() above) - this operation type needs no state-dependent
+    resolution at all, unlike the other two operation types below."""
+    title: str | None = None
+    priority: str | None = None
+    notes: str | None = None
+    clean_title: str = None  # computed
+
+    @field_validator("priority")
+    @classmethod
+    def _fallback_invalid_priority(cls, v):
+        return v if v in TASK_PRIORITIES else "normal"
+
+    @field_validator("notes")
+    @classmethod
+    def _coerce_and_truncate_notes(cls, v) -> str:
+        return str(v or "")[:MAX_TASK_NOTE_LENGTH]
+
+    @model_validator(mode="after")
+    def _require_title(self) -> "_CreateTaskOperationFields":
+        self.clean_title = _require_length(self.title, "Task title", MAX_TASK_TITLE_LENGTH)
+        return self
+
+
+class _UpdateTaskStatusOperationFields(BaseModel):
+    """Field-shape validation for an "update_task_status" batch
+    operation - just the status enum. task_ref resolution needs live
+    project state (get_task) and stays in _normalize_batch_operation."""
+    status: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def _require_valid_status(cls, v):
+        if v not in TASK_STATUSES:
+            raise ProjectManagerError(f"Invalid task status: {v}")
+        return v
+
+
+class _UpdateTaskNotesOperationFields(BaseModel):
+    """Field-shape validation for an "update_task_notes" batch operation:
+    mode enum + the same mode-dependent text requirement as
+    _UpdateTaskNotesInput above (cross-field, hence @model_validator).
+    task_ref resolution stays in _normalize_batch_operation."""
+    mode: str | None = None
+    text: str | None = None
+    clean_text: str = None  # computed
+
+    @model_validator(mode="after")
+    def _validate_mode_and_text(self) -> "_UpdateTaskNotesOperationFields":
+        if self.mode not in ("replace", "append", "clear"):
+            raise ProjectManagerError(f"Invalid note mode: {self.mode}")
+        if self.mode != "clear" and not _normalize_text(self.text):
+            raise ProjectManagerError("Note text is required for replace or append.")
+        self.clean_text = str(self.text or "")[:MAX_TASK_NOTE_LENGTH]
+        return self
+
+
 def _normalize_batch_operation(operation: dict, project: dict) -> dict:
     if not isinstance(operation, dict):
         raise ProjectManagerError("Every batch operation must be an object.")
     op_type = _normalize_text(operation.get("type")).lower()
 
     if op_type == "create_task":
-        return {
-            "type": op_type,
-            "title": _require_length(operation.get("title"), "Task title", MAX_TASK_TITLE_LENGTH),
-            "priority": operation.get("priority") if operation.get("priority") in TASK_PRIORITIES else "normal",
-            "notes": str(operation.get("notes") or "")[:MAX_TASK_NOTE_LENGTH],
-        }
+        fields = _CreateTaskOperationFields(
+            title=operation.get("title"), priority=operation.get("priority"), notes=operation.get("notes"),
+        )
+        return {"type": op_type, "title": fields.clean_title, "priority": fields.priority, "notes": fields.notes}
 
     if op_type == "update_task_status":
-        status = operation.get("status")
-        if status not in TASK_STATUSES:
-            raise ProjectManagerError(f"Invalid task status: {status}")
+        fields = _UpdateTaskStatusOperationFields(status=operation.get("status"))
         task_ref = operation.get("task") or operation.get("taskId") or operation.get("task_id")
         task = get_task(project, task_ref)
         if not task:
             raise ProjectManagerError(f"Task not found or ambiguous: {task_ref}")
-        return {"type": op_type, "task_id": task["id"], "status": status}
+        return {"type": op_type, "task_id": task["id"], "status": fields.status}
 
     if op_type == "update_task_notes":
-        mode = operation.get("mode")
-        if mode not in ("replace", "append", "clear"):
-            raise ProjectManagerError(f"Invalid note mode: {mode}")
+        fields = _UpdateTaskNotesOperationFields(mode=operation.get("mode"), text=operation.get("text"))
         task_ref = operation.get("task") or operation.get("taskId") or operation.get("task_id")
         task = get_task(project, task_ref)
         if not task:
             raise ProjectManagerError(f"Task not found or ambiguous: {task_ref}")
-        text = operation.get("text")
-        if mode != "clear" and not _normalize_text(text):
-            raise ProjectManagerError("Note text is required for replace or append.")
-        return {"type": op_type, "task_id": task["id"], "mode": mode, "text": str(text or "")[:MAX_TASK_NOTE_LENGTH]}
+        return {"type": op_type, "task_id": task["id"], "mode": fields.mode, "text": fields.clean_text}
 
     raise ProjectManagerError(f"Unsupported batch operation: {op_type or 'missing type'}")
 
