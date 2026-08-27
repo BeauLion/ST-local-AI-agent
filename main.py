@@ -1346,18 +1346,13 @@ TOOLS = [
         "function": {
             "name": "attire_manager_update",
             "description": (
-                "Record a character's current attire - either seeding it for the first time "
-                "(e.g. from a description in the character card, before anything has actually "
-                "changed) or logging a change. Call this the moment the narrative describes ANY "
-                "change to what a character is wearing - full outfit changes as well as subtle/"
-                "partial ones (loosening or removing a tie, unbuttoning a shirt, taking off shoes "
-                "or an accessory, a jacket coming off, one item being swapped for another). Only "
-                "pass the slot(s) that changed or that you're seeding; omit everything else. Pass "
-                "an empty string for a slot to mean it is now bare/nothing (e.g. shoes removed). "
-                "If a slot already describes more than one item (e.g. 'black sneakers and white "
-                "socks') and only part of it changes, pass the FULL corrected value for that slot "
-                "('black sneakers') - never just the changed part or an empty value, or whatever "
-                "else was sharing that slot gets silently lost."
+                "Record a change in the character's attire. Call this the moment the narrative describes ANY change to what a character is wearing"
+                " - full outfit changes as well as subtle/partial ones (loosening or removing a tie, unbuttoning a shirt, taking off shoes or an accessory,"
+                " a jacket coming off, one item being swapped for another). Only pass the slot(s) that changed; omit everything else. Pass an empty string for"
+                " a slot to mean it is now bare/nothing (e.g. shoes removed). If a slot already describes one or more items (e.g. feet: 'white socks'), and an "
+                "item is added (e.g. 'black sneakers are put on feet'), you MUST restate the FULL corrected value for that slot (e.g. feet: 'black sneakers and white socks')."
+                " If a slot shown above already describes more than one item (e.g. feet: 'black sneakers and white socks'), and only PART of that changes (e.g. just the socks come off),"
+                " you MUST restate the FULL corrected value for that slot (feet: 'black sneakers')."
             ),
             "parameters": {
                 "type": "object",
@@ -1594,15 +1589,7 @@ GROUP_INSTRUCTIONS = {
         "A tracked character's current attire is normally shown to you "
         "automatically near the top of this conversation, under "
         "[PERSISTENT ATTIRE STATE] - treat it as authoritative and read it "
-        "before narrating what someone is wearing. If a character in this "
-        "scene has NO such entry yet, that means their attire has never "
-        "been logged - check whether the character card above describes "
-        "what they're currently wearing (persona/description text often "
-        "does) and, if so, call attire_manager_update ONCE now to seed it, "
-        "even though nothing has actually changed yet - establishing an "
-        "outfit for the first time counts just as much as changing one, "
-        "and should not wait for an in-scene change to happen first. Once "
-        "seeded (or already tracked), call attire_manager_update the "
+        "before narrating what someone is wearing. Call attire_manager_update the "
         "moment the narrative - yours or the user's - describes any "
         "change, including subtle or partial ones (loosening or removing a "
         "tie, unbuttoning a shirt, taking off shoes or an accessory, a "
