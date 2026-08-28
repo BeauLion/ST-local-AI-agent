@@ -138,6 +138,30 @@ def fake_main_module(monkeypatch):
     return fake
 
 
+@pytest.fixture(autouse=True)
+def fake_prompt_log(monkeypatch):
+    """Records every log_prompt()/log_console() call attire_subagent.py
+    makes, without touching the real prompt-log file on disk. Autouse:
+    every test in this file gets this for free, since otherwise every
+    single test (not just the ones specifically about logging) would hit
+    the real prompt_log_engine and its on-disk session file. This suite
+    isn't re-testing prompt_log_engine's own file I/O (that's its own
+    module's concern) - just confirming attire_subagent.py calls it with
+    sensible, inspectable arguments, the same way fake_main_module stands
+    in for main.py rather than re-testing main.py itself."""
+    calls = {"prompt": [], "console": []}
+
+    def _log_prompt(*args, **kwargs):
+        calls["prompt"].append((args, kwargs))
+
+    def _log_console(*args, **kwargs):
+        calls["console"].append((args, kwargs))
+
+    monkeypatch.setattr(sa, "log_prompt", _log_prompt)
+    monkeypatch.setattr(sa, "log_console", _log_console)
+    return calls
+
+
 def _tool_call(name: str, arguments) -> dict:
     """Builds one OpenAI-shaped tool_call dict. `arguments` may be a
     dict (auto-serialized to JSON, the normal case) or a raw string
@@ -399,3 +423,99 @@ def test_non_2xx_response_is_caught_and_applies_nothing(tmp_attire_file, fake_ll
     _run("hello", "hi there")  # must not raise
 
     assert fake_main_module.calls == []
+
+
+# ---------------------------------------------------------------------------
+# prompt-log-viewer integration
+# ---------------------------------------------------------------------------
+
+def test_does_not_log_anything_when_returning_early_for_blank_input(
+    tmp_attire_file, fake_llama_client, fake_main_module, fake_prompt_log
+):
+    _run("", "")
+    assert fake_prompt_log["prompt"] == []
+    assert fake_prompt_log["console"] == []
+
+
+def test_logs_the_outgoing_request_with_four_section_labels(
+    tmp_attire_file, fake_llama_client, fake_main_module, fake_prompt_log
+):
+    """The four labels must line up positionally with the four messages
+    this module always sends (system prompt, current state, user,
+    assistant) - see log_prompt()'s section_labels contract."""
+    _run("He takes off his shoes.", "You watch him kick them aside.")
+
+    assert len(fake_prompt_log["prompt"]) == 1
+    (body, iteration, section_labels), _ = fake_prompt_log["prompt"][0]
+    assert iteration == 0
+    assert section_labels == [
+        "attire_subagent_system",
+        "attire_subagent_current_state",
+        "attire_subagent_user_turn",
+        "attire_subagent_assistant_turn",
+    ]
+    assert len(section_labels) == len(body["messages"])
+
+
+def test_logs_the_exact_body_that_was_sent_to_llama_server(
+    tmp_attire_file, fake_llama_client, fake_main_module, fake_prompt_log
+):
+    _run("hello", "hi there")
+
+    (logged_body, _, _), _ = fake_prompt_log["prompt"][0]
+    _, posted_body = fake_llama_client.calls[0]
+    assert logged_body is posted_body
+
+
+def test_logs_no_change_outcome_with_kind_content(
+    tmp_attire_file, fake_llama_client, fake_main_module, fake_prompt_log
+):
+    fake_llama_client.set_response({"choices": [{"message": {}}]})
+
+    _run("The weather was nice today.", "It really was.")
+
+    (iteration, response), kwargs = fake_prompt_log["console"][0]
+    assert iteration == 0
+    assert response["kind"] == "content"
+
+
+def test_logs_tool_calls_outcome_with_kind_tool_calls_and_raw_payload(
+    tmp_attire_file, fake_llama_client, fake_main_module, fake_prompt_log
+):
+    args = {"character_name": "Aria", "slot": "feet", "item": "black shoes"}
+    calls = [_tool_call("attire_add_item", args)]
+    fake_llama_client.set_response({"choices": [{"message": {"tool_calls": calls}}]})
+
+    _run("She puts on black shoes.", "The shoes click on the floor.")
+
+    (iteration, response), kwargs = fake_prompt_log["console"][0]
+    assert iteration == 0
+    assert response["kind"] == "tool_calls"
+    assert json.loads(response["text"]) == calls
+
+
+def test_logs_network_failure_with_kind_error(
+    tmp_attire_file, fake_llama_client, fake_main_module, fake_prompt_log
+):
+    fake_llama_client.set_exception(httpx.ConnectError("connection refused"))
+
+    _run("hello", "hi there")
+
+    assert fake_prompt_log["prompt"], "the request should still be logged even though it then failed"
+    (iteration, response), kwargs = fake_prompt_log["console"][0]
+    assert iteration == 0
+    assert response["kind"] == "error"
+    assert "connection refused" in response["text"]
+
+
+def test_passes_reasoning_content_through_as_thinking_when_present(
+    tmp_attire_file, fake_llama_client, fake_main_module, fake_prompt_log
+):
+    fake_llama_client.set_response({
+        "choices": [{"message": {"reasoning_content": "she still has socks on underneath"}}]
+    })
+
+    _run("She puts on black shoes.", "The shoes click on the floor.")
+
+    (_, _), kwargs = fake_prompt_log["console"][0]
+    assert kwargs.get("thinking") == "she still has socks on underneath"

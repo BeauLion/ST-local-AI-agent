@@ -32,6 +32,26 @@ another ("shoes on over socks") can't accidentally erase the other by
 getting a "restate the full value" instruction wrong - the add path
 structurally cannot touch anything else in the slot.
 
+Prompt-log integration: reuses main.py's own log_prompt()/log_console()
+(same session log file, same viewer at /prompt-log-viewer) so a bad or
+missing tool call here is exactly as inspectable as a main-agent turn -
+the outgoing request, the model's raw response, and every alog() line
+this module writes all land in one entry, tagged with the
+"attire_subagent_*" section labels below. Always logged under iteration
+0, since this is a single one-shot pass, not a multi-round loop - same
+convention main.py's own MAX_TOOL_ITERATIONS bailout already uses for a
+fixed, non-positional iteration number.
+
+KNOWN EDGE CASE (accepted, not engineered around): because this writes
+into the SAME session log file as the main agent, a sub-agent pass that
+blows past its caller's timeout (see chat_completions) could still be
+writing its own log entries after the NEXT turn's agent_loop has already
+started writing its. The viewer pairs prompt/console entries positionally,
+so a very late write could interleave with an unrelated turn's entries.
+This only manifests when the 15s timeout is actually exceeded, which is
+already the documented fail-open path elsewhere in this pipeline - not
+solved here for the same reason it isn't solved there.
+
 Fail-open by design throughout: any failure here is logged and swallowed,
 never raised back into a real conversation turn. The worst case is one
 turn of stale attire state, which is honest-if-late rather than wrong.
@@ -44,6 +64,7 @@ import httpx
 import attire_manager
 from config import AGENT_API_KEY, LLAMA_SERVER_URL
 from console_log import alog
+from prompt_log_engine import log_prompt, log_console
 
 _SYSTEM_PROMPT = (
     "You are a silent continuity tracker, not a conversational participant. "
@@ -85,6 +106,13 @@ _SYSTEM_PROMPT = (
 )
 
 _MUTATING_TOOLS = {"attire_add_item", "attire_remove_item", "attire_replace_slot"}
+
+_SECTION_LABELS = [
+    "attire_subagent_system",
+    "attire_subagent_current_state",
+    "attire_subagent_user_turn",
+    "attire_subagent_assistant_turn",
+]
 
 
 def _build_state_summary() -> str:
@@ -128,6 +156,10 @@ async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
         "stream": False,
     }
 
+    # iteration is always 0 - this is a single one-shot pass, not a
+    # multi-round loop, so there's no meaningful iteration to track.
+    log_prompt(body, 0, _SECTION_LABELS)
+
     try:
         async with httpx.AsyncClient(
             timeout=30.0, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}
@@ -137,13 +169,25 @@ async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
             data = resp.json()
     except Exception as e:
         alog(f"[ATTIRE-SUBAGENT] Request to llama-server failed: {e}")
+        log_console(0, {"kind": "error", "text": str(e)})
         return
 
     choices = data.get("choices") or [{}]
     message = choices[0].get("message", {})
+    # Only populated if llama-server is run with --reasoning-format and
+    # the loaded model actually produces a reasoning block - same as
+    # main.py's own agent_loop, just read from the non-streaming message
+    # shape instead of accumulated across streamed deltas.
+    thinking = message.get("reasoning_content") or None
     calls = message.get("tool_calls") or []
+
     if not calls:
         alog("[ATTIRE-SUBAGENT] No attire change detected this turn.")
+        log_console(
+            0,
+            {"kind": "content", "text": message.get("content") or "(no attire change)"},
+            thinking=thinking,
+        )
         return
 
     dispatch = {
@@ -167,3 +211,9 @@ async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
             continue
         result = dispatch[name](args)
         alog(f"[ATTIRE-SUBAGENT] {name}({args}) -> {result}")
+
+    # Same kind/shape main.py's own agent_loop logs for a tool-calling
+    # iteration - the raw model tool_calls payload as `text`; the
+    # per-call outcomes above ride along as this entry's buffered
+    # console `lines` via alog(), same pairing the main agent gets.
+    log_console(0, {"kind": "tool_calls", "text": json.dumps(calls, indent=2)}, thinking=thinking)
