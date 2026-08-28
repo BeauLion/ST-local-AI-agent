@@ -413,6 +413,15 @@ MAX_ATTIRE_ITEM_LENGTH = 200
 # main.py's force_tool_names attire logic.
 ATTIRE_SEED_ASSISTANT_TURN_LIMIT = 3
 
+# Post-turn attire sub-agent (attire_subagent.py) - a separate, one-shot
+# completion call against the same llama-server, run after every finished
+# turn and decoupled entirely from the main agent's own tool selection.
+# See main.py's chat_completions: the NEXT request waits on this (up to
+# this many seconds) before reading attire state for injection, but never
+# blocks longer than that - a slow/hung pass just means one turn of stale
+# state, not a frozen agent.
+ATTIRE_SUBAGENT_TIMEOUT_SECONDS = 15
+
 
 # ─────────────────────────────────────────────────────────────
 # run_python tool (Docker sandbox)

@@ -33,6 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 import attire_manager
+import attire_subagent
 import calendar_manager
 import duration_manager
 import memory
@@ -46,6 +47,7 @@ from prompt_log_engine import log_prompt, log_console, router as prompt_log_rout
 from config import (
     AGENT_API_KEY,
     ATTIRE_SEED_ASSISTANT_TURN_LIMIT,
+    ATTIRE_SUBAGENT_TIMEOUT_SECONDS,
     CORS_ALLOWED_ORIGINS,
     DELETE_FILE_ALLOWED_EXTENSIONS,
     DOCKER_CPU_COUNT,
@@ -781,6 +783,22 @@ def attire_manager_get(args: dict) -> str:
     return attire_manager.get_attire_text(args.get("character_name", ""))
 
 
+# Holds the currently-running (or just-finished) post-turn attire pass, if
+# any. Set by _spawn_attire_subagent() at the end of a turn; consumed
+# (awaited-with-timeout, then cleared) at the top of the NEXT chat_completions
+# call. Single-user local server - one slot is enough, no queue needed.
+_attire_subagent_task: asyncio.Task | None = None
+
+
+def _spawn_attire_subagent(user_text: str, assistant_text: str) -> None:
+    """Fire-and-forget: kicks off the background attire pass and stores the
+    task so the next turn can wait on it if it isn't done yet."""
+    global _attire_subagent_task
+    _attire_subagent_task = asyncio.create_task(
+        attire_subagent.run_attire_subagent(user_text, assistant_text)
+    )
+
+
 TOOLS = [
     {
         "type": "function",
@@ -1341,6 +1359,12 @@ TOOLS = [
             },
         },
     },
+]
+
+# Extracted (not inlined into TOOLS above) so attire_subagent.py's separate
+# one-shot completion call can reuse these exact schemas instead of a
+# second hand-copied version that could silently drift from this one.
+ATTIRE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
@@ -1388,6 +1412,7 @@ TOOLS = [
         },
     },
 ]
+TOOLS += ATTIRE_TOOL_SCHEMAS
 
 TOOL_FUNCTIONS = {
     "get_current_time": get_current_time,
@@ -2351,6 +2376,22 @@ async def chat_completions(request: Request):
     # change ("he loosens his tie") is diffuse narrative prose, not
     # keyword-y like "add a task" - it may well score below
     # TOOL_SELECTION_MIN_SCORE even when a change is clearly happening.
+    # Post-turn attire sub-agent from the PREVIOUS turn: give it up to
+    # ATTIRE_SUBAGENT_TIMEOUT_SECONDS to finish before reading attire state
+    # below. asyncio.shield() means a timeout here doesn't cancel the task -
+    # it keeps running and will still write attire.json when it's done, just
+    # too late to be reflected in THIS turn's context.
+    global _attire_subagent_task
+    if _attire_subagent_task is not None:
+        pending_task, _attire_subagent_task = _attire_subagent_task, None
+        try:
+            await asyncio.wait_for(asyncio.shield(pending_task), timeout=ATTIRE_SUBAGENT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            alog(f"[ATTIRE-SUBAGENT] Still running after {ATTIRE_SUBAGENT_TIMEOUT_SECONDS}s - "
+                 f"proceeding with existing attire state for this turn.")
+        except Exception as e:
+            alog(f"[ATTIRE-SUBAGENT] Previous turn's pass raised: {e}")
+
     attire_state_now = attire_manager._load()
     known_attire_match = attire_manager.find_character_names_in_text(
         attire_state_now, character_card_text or ""
@@ -2572,6 +2613,8 @@ async def chat_completions(request: Request):
             "choices": [{"index": 0, "message": final_message, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
+        if finish_reason == "stop":
+            _spawn_attire_subagent(str(last_user_text or ""), final_message.get("content") or "")
         return JSONResponse(content=final_data)
 
     # Client wants real streaming: forward each content delta to SillyTavern
@@ -2604,6 +2647,10 @@ async def chat_completions(request: Request):
                 yield sse({"index": 0, "delta": {}, "finish_reason": "tool_calls"})
                 yield b"data: [DONE]\n\n"
                 return
+
+            if kind == "done":
+                _spawn_attire_subagent(str(last_user_text or ""), payload.get("content") or "")
+                continue
             # "done" carries the full message for the non-streaming path only;
             # its content has already been sent as deltas above.
 
