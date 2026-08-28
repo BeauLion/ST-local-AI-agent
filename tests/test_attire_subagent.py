@@ -231,19 +231,43 @@ def test_request_uses_the_tool_schemas_from_the_main_module(tmp_attire_file, fak
     assert body["tools"] == fake_main_module.ATTIRE_TOOL_SCHEMAS
 
 
-def test_messages_include_system_prompt_then_state_then_user_then_assistant(
+def test_messages_include_system_prompt_then_state_then_transcript(
     tmp_attire_file, fake_llama_client, fake_main_module
 ):
     _run("He takes off his shoes.", "You watch him kick them aside.")
     _, body = fake_llama_client.calls[0]
     messages = body["messages"]
 
+    assert len(messages) == 3
     assert messages[0]["role"] == "system"
     assert "continuity tracker" in messages[0]["content"]
     assert messages[1]["role"] == "system"
     assert "[CURRENT ATTIRE STATE]" in messages[1]["content"]
-    assert messages[2] == {"role": "user", "content": "He takes off his shoes."}
-    assert messages[3] == {"role": "assistant", "content": "You watch him kick them aside."}
+    assert messages[2]["role"] == "user"
+    assert "He takes off his shoes." in messages[2]["content"]
+    assert "You watch him kick them aside." in messages[2]["content"]
+
+
+def test_transcript_message_is_not_shaped_as_a_live_conversation_turn(
+    tmp_attire_file, fake_llama_client, fake_main_module
+):
+    """Regression test: the exchange must NOT be sent as separate
+    role="user"/role="assistant" messages. That shape is exactly what a
+    roleplay-tuned model has been trained to continue, and caused it to
+    parrot/extend the scene as narrative content instead of analyzing it
+    - see chat discussion. Everything about the exchange must live inside
+    a single user message, explicitly framed as not-a-conversation."""
+    _run("He takes off his shoes.", "You watch him kick them aside.")
+    _, body = fake_llama_client.calls[0]
+    messages = body["messages"]
+
+    roles = [m["role"] for m in messages]
+    assert roles.count("assistant") == 0
+    assert roles.count("user") == 1
+
+    transcript_message = messages[-1]
+    assert "not a conversation with you" in transcript_message["content"].lower()
+    assert "do not write any narrative" in transcript_message["content"].lower()
 
 
 def test_state_summary_reports_no_tracked_characters_when_state_is_empty(
@@ -451,8 +475,7 @@ def test_logs_the_outgoing_request_with_four_section_labels(
     assert section_labels == [
         "attire_subagent_system",
         "attire_subagent_current_state",
-        "attire_subagent_user_turn",
-        "attire_subagent_assistant_turn",
+        "attire_subagent_transcript",
     ]
     assert len(section_labels) == len(body["messages"])
 

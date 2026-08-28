@@ -100,9 +100,15 @@ _SYSTEM_PROMPT = (
     "also wipe the socks, which are still being worn.\n\n"
     "Call a tool once per change you're confident about - additions and "
     "removals both count and are equally worth logging. If nothing "
-    "described a clothing change, call no tool at all - silence is the "
-    "normal, expected outcome for most turns. Never narrate, never "
-    "comment, never guess at a change that wasn't explicitly described."
+    "described a clothing change, respond with nothing at all - no text, "
+    "no tool call, nothing.\n\n"
+    "CRITICAL: you are not a character in this story and this is not a "
+    "conversation with you. You must NEVER write narrative, dialogue, "
+    "commentary, or any in-character text - not even to summarize or "
+    "acknowledge what happened. Continuing, extending, or replying to "
+    "the exchange below is never a correct response, regardless of what "
+    "it contains. Your only valid outputs are: one or more tool calls, "
+    "or nothing."
 )
 
 _MUTATING_TOOLS = {"attire_add_item", "attire_remove_item", "attire_replace_slot"}
@@ -110,8 +116,7 @@ _MUTATING_TOOLS = {"attire_add_item", "attire_remove_item", "attire_replace_slot
 _SECTION_LABELS = [
     "attire_subagent_system",
     "attire_subagent_current_state",
-    "attire_subagent_user_turn",
-    "attire_subagent_assistant_turn",
+    "attire_subagent_transcript",
 ]
 
 
@@ -127,6 +132,30 @@ def _build_state_summary() -> str:
         for record in state["characters"].values()
     ]
     return "\n\n".join(blocks)
+
+
+def _build_transcript_message(user_text: str, assistant_text: str) -> str:
+    """Wraps the exchange to analyze as plain text inside ONE user
+    message, deliberately NOT as separate role="user"/role="assistant"
+    messages. Sending the exchange as real user/assistant turns puts this
+    request in exactly the shape a roleplay-tuned model has been trained
+    to continue - in practice this caused the model to parrot/continue
+    the scene as narrative content instead of analyzing it, regardless of
+    how the system prompt was worded (see chat discussion). Presenting it
+    as an inert block of text to read, with an explicit "this is not a
+    conversation with you" framing right next to it, removes that
+    structural cue rather than trying to instruct around it."""
+    return (
+        "Here is the most recent exchange to analyze. This is NOT a "
+        "conversation with you - you are not continuing it, replying to "
+        "it, or narrating anything that happens in it.\n\n"
+        f"--- USER ---\n{user_text or '(nothing)'}\n\n"
+        f"--- ASSISTANT ---\n{assistant_text or '(nothing)'}\n"
+        "--- END OF EXCHANGE ---\n\n"
+        "Call whichever attire tool(s) apply based on what changed above, "
+        "or respond with nothing if attire didn't change. Do not write "
+        "any narrative, dialogue, or commentary of your own."
+    )
 
 
 async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
@@ -146,8 +175,7 @@ async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "system", "content": f"[CURRENT ATTIRE STATE]\n{_build_state_summary()}"},
-        {"role": "user", "content": user_text or ""},
-        {"role": "assistant", "content": assistant_text or ""},
+        {"role": "user", "content": _build_transcript_message(user_text, assistant_text)},
     ]
     body = {
         "messages": messages,
