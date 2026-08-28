@@ -182,6 +182,17 @@ async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
         "tools": agent_main.ATTIRE_TOOL_SCHEMAS,
         "tool_choice": "auto",
         "stream": False,
+        # Hard cap on completion length. agent_loop's own request to
+        # llama-server inherits max_tokens/stop/etc. from the original
+        # SillyTavern request; this sub-agent builds its request from
+        # scratch and had NO such cap, which let a degenerate generation
+        # (the model failing to emit a clean stop, e.g. looping on a
+        # chat-template channel-transition token) burn thousands of
+        # tokens instead of failing fast. A tool call or a short "nothing
+        # changed" conclusion both fit comfortably well under this; this
+        # exists purely as a backstop against runaway repetition, not a
+        # tuned budget for legitimate output.
+        "max_tokens": 500,
     }
 
     # iteration is always 0 - this is a single one-shot pass, not a
@@ -189,8 +200,21 @@ async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
     log_prompt(body, 0, _SECTION_LABELS)
 
     try:
+        # No client-side timeout, matching main.py's own agent_loop
+        # (httpx.AsyncClient(timeout=None, ...)) - this call shares the
+        # same llama-server sequentially with the main agent, so it may
+        # have to wait for a slot to free up before its own prompt even
+        # starts processing. The actual timeout boundary for this whole
+        # design is the CALLER's wait-with-timeout in chat_completions
+        # (ATTIRE_SUBAGENT_TIMEOUT_SECONDS) - that governs how long the
+        # NEXT turn waits, not how long this completion call is allowed
+        # to run. An earlier version of this file set timeout=30.0 here
+        # too, which was wrong: it killed legitimate slow completions
+        # (a large/queued prompt taking >30s to even start generating)
+        # with a client-side cancellation, surfacing as an empty-message
+        # exception here and a "cancel task" line in llama-server's log.
         async with httpx.AsyncClient(
-            timeout=30.0, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}
+            timeout=None, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}
         ) as client:
             resp = await client.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json=body)
             resp.raise_for_status()

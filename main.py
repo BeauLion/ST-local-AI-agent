@@ -816,14 +816,28 @@ def attire_manager_get(args: dict) -> str:
 # call. Single-user local server - one slot is enough, no queue needed.
 _attire_subagent_task: asyncio.Task | None = None
 
+# Separate from _attire_subagent_task above: a plain set holding a strong
+# reference to every attire sub-agent task for its ENTIRE lifetime, not
+# just until the next turn stops waiting on it. Needed because asyncio's
+# own docs warn that a Task with no strong reference anywhere may be
+# garbage-collected mid-execution, even while still pending - clearing
+# _attire_subagent_task to None on a timeout (see chat_completions below)
+# would otherwise leave a still-running task referenced nowhere at all.
+# Each task removes itself from this set via add_done_callback once it
+# actually finishes, so this never grows unbounded.
+_background_tasks: set[asyncio.Task] = set()
+
 
 def _spawn_attire_subagent(user_text: str, assistant_text: str) -> None:
     """Fire-and-forget: kicks off the background attire pass and stores the
     task so the next turn can wait on it if it isn't done yet."""
     global _attire_subagent_task
-    _attire_subagent_task = asyncio.create_task(
+    task = asyncio.create_task(
         attire_subagent.run_attire_subagent(user_text, assistant_text)
     )
+    _attire_subagent_task = task
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 TOOLS = [

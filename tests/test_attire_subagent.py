@@ -223,6 +223,20 @@ def test_request_is_non_streaming_with_auto_tool_choice(tmp_attire_file, fake_ll
     assert body["tool_choice"] == "auto"
 
 
+def test_request_caps_max_tokens_as_a_runaway_generation_backstop(
+    tmp_attire_file, fake_llama_client, fake_main_module
+):
+    """Regression test: an earlier version of this request had no
+    max_tokens at all, which let a degenerate generation (the model
+    failing to emit a clean stop) burn thousands of tokens on repeated
+    garbage before anything caught it - see chat discussion. This isn't
+    asserting the exact budget is correct, just that SOME cap exists."""
+    _run("hello", "hi there")
+    _, body = fake_llama_client.calls[0]
+    assert isinstance(body.get("max_tokens"), int)
+    assert body["max_tokens"] > 0
+
+
 def test_request_uses_the_tool_schemas_from_the_main_module(tmp_attire_file, fake_llama_client, fake_main_module):
     """Confirms the sub-agent reuses main.py's ATTIRE_TOOL_SCHEMAS rather
     than a second hand-copied schema that could drift."""
