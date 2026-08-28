@@ -46,7 +46,6 @@ from project_manager import ProjectManagerError
 from prompt_log_engine import log_prompt, log_console, router as prompt_log_router
 from config import (
     AGENT_API_KEY,
-    ATTIRE_SEED_ASSISTANT_TURN_LIMIT,
     ATTIRE_SUBAGENT_TIMEOUT_SECONDS,
     CORS_ALLOWED_ORIGINS,
     DELETE_FILE_ALLOWED_EXTENSIONS,
@@ -1412,7 +1411,12 @@ ATTIRE_TOOL_SCHEMAS = [
         },
     },
 ]
-TOOLS += ATTIRE_TOOL_SCHEMAS
+# Deliberately NOT merged into TOOLS: attire tracking is now handled
+# entirely by the post-turn attire_subagent.py pass, not by the main
+# agent mid-conversation. ATTIRE_TOOL_SCHEMAS stays defined here purely
+# so attire_subagent.py can import and reuse the same schema for its own
+# separate completion call - it's just never added to what this agent
+# sees or can select.
 
 TOOL_FUNCTIONS = {
     "get_current_time": get_current_time,
@@ -1483,11 +1487,10 @@ TOOL_GROUPS = {
     "project_manager_set_all_tasks_status": "project", "project_manager_batch_update": "project",
     "duration_get_estimate": "duration", "duration_correct_entry": "duration",
     "duration_confirm_new_category": "duration",
-    "attire_manager_update": "attire", "attire_manager_get": "attire",
 }
 # Stable order so the assembled instruction text reads the same way (and
 # hits the same prompt-cache prefix) whenever the same group set is chosen.
-_GROUP_ORDER = ["utility", "files", "memory", "calendar", "project", "duration", "attire"]
+_GROUP_ORDER = ["utility", "files", "memory", "calendar", "project", "duration"]
 
 GROUP_INSTRUCTIONS = {
     "utility": (
@@ -1609,25 +1612,6 @@ GROUP_INSTRUCTIONS = {
         "after the user explicitly agrees to a specific new category name "
         "you proposed following an 'uncategorized' flag - never on your "
         "own initiative."
-    ),
-    "attire": (
-        "A tracked character's current attire is normally shown to you "
-        "automatically near the top of this conversation, under "
-        "[PERSISTENT ATTIRE STATE] - treat it as authoritative and read it "
-        "before narrating what someone is wearing. Call attire_manager_update the "
-        "moment the narrative - yours or the user's - describes any "
-        "change, including subtle or partial ones (loosening or removing a "
-        "tie, unbuttoning a shirt, taking off shoes or an accessory, a "
-        "jacket coming off, one item swapped for another). Pass only the "
-        "slot(s) that changed (or, for seeding, only the slot(s) the card "
-        "actually describes - leave the rest unset rather than guessing). "
-        "If a slot already holds more than one item (e.g. 'black sneakers "
-        "and white socks') and only part of it changes, you MUST pass the "
-        "FULL corrected value for that slot, not just the part that "
-        "changed or an empty value - overwriting with only the changed "
-        "portion silently deletes whatever else was sharing that slot. "
-        "Use attire_manager_get only if you need to double-check a "
-        "character's state and it wasn't already shown to you above."
     ),
 }
 
@@ -2370,12 +2354,6 @@ async def chat_completions(request: Request):
     if calendar_manager.has_pending_change():
         force_tool_names |= {name for name, group in TOOL_GROUPS.items() if group == "calendar"}
 
-    # A known character's name appearing in the character card forces the
-    # attire group in regardless of embedding score, for the same reason
-    # the calendar case above does: the trigger language for a clothing
-    # change ("he loosens his tie") is diffuse narrative prose, not
-    # keyword-y like "add a task" - it may well score below
-    # TOOL_SELECTION_MIN_SCORE even when a change is clearly happening.
     # Post-turn attire sub-agent from the PREVIOUS turn: give it up to
     # ATTIRE_SUBAGENT_TIMEOUT_SECONDS to finish before reading attire state
     # below. asyncio.shield() means a timeout here doesn't cancel the task -
@@ -2392,28 +2370,18 @@ async def chat_completions(request: Request):
         except Exception as e:
             alog(f"[ATTIRE-SUBAGENT] Previous turn's pass raised: {e}")
 
+    # Still needed below (NOT for tool selection anymore) purely for the
+    # informational [PERSISTENT ATTIRE STATE] context block - attire is no
+    # longer a main-agent-selectable tool group, so there's nothing here
+    # to force in. Seeding a brand-new character from the card is also
+    # deliberately not attempted here anymore: attire_subagent.py only
+    # reacts to explicit changes in the last exchange, so an untracked
+    # character stays untracked until their outfit actually changes -
+    # accepted tradeoff, not a bug.
     attire_state_now = attire_manager._load()
     known_attire_match = attire_manager.find_character_names_in_text(
         attire_state_now, character_card_text or ""
     )
-    if known_attire_match:
-        force_tool_names |= {name for name, group in TOOL_GROUPS.items() if group == "attire"}
-    elif character_card_text:
-        # No tracked record yet - most likely a brand-new character whose
-        # card describes an outfit that's never been logged. Rather than
-        # relying on embedding luck to notice that (the same weak-signal
-        # problem as above, but worse: there's no "change" language to
-        # match against at all on a first-ever outfit), force the group in
-        # for a bounded window at the start of the chat so the model has a
-        # chance to seed it from the card description. Self-terminating:
-        # once seeded, known_attire_match starts hitting above instead; if
-        # the window passes with nothing seeded, this falls back to normal
-        # embedding scoring rather than forcing the group in forever.
-        assistant_turn_count = sum(
-            1 for m in body.get("messages", []) if m.get("role") == "assistant"
-        )
-        if assistant_turn_count <= ATTIRE_SEED_ASSISTANT_TURN_LIMIT:
-            force_tool_names |= {name for name, group in TOOL_GROUPS.items() if group == "attire"}
 
     selected_tools, tool_scores, tool_tier = select_tools(
         str(last_user_text or ""), force_tool_names, str(prior_assistant_text or "")

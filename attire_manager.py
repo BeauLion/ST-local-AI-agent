@@ -250,19 +250,9 @@ def build_context_text_for_ids(state: dict, character_ids: list) -> str:
     if not blocks:
         return ""
     lines = ["[PERSISTENT ATTIRE STATE]"] + blocks + [
-        "Treat this as the authoritative current outfit for each character listed. "
-        "Call attire_manager_update the moment the narrative - yours or the user's - "
-        "describes ANY change to what a character is wearing, not just full outfit "
-        "changes. This includes subtle or partial changes that are easy to skip: "
-        "loosening or removing a tie, unbuttoning a shirt, rolling up sleeves, taking "
-        "off shoes or socks, removing a jacket or coat, taking off jewelry or an "
-        "accessory, a garment getting torn/soaked/dirtied and no longer being worn "
-        "properly, or one item being swapped for another. If you are narrating a scene "
-        "and you write a sentence that touches any of the above, call the tool in that "
-        "same turn - do not wait for the change to become large or for the scene to end. "
-        "Update only the slot(s) that actually changed - do not restate slots that "
-        "didn't change. An empty value means that slot is now bare/nothing. When in "
-        "doubt about whether something counts, log it anyway; a spurious update is "
-        "cheaper than a stale one.\n\n"
+        "Treat this as the authoritative current outfit for each character listed - "
+        "keep your narration consistent with it. This is maintained automatically by "
+        "a background process; you do not have a tool for updating it and do not need "
+        "to log changes yourself."
     ]
     return "\n\n".join(lines)
