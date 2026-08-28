@@ -1,16 +1,28 @@
 """
-Tests for attire_manager.py: character resolution, the update_attire/
-get_attire_text/build_context_text_for_ids read/write surface, and
+Tests for attire_manager.py: character resolution, the v2 add_item/
+remove_item/replace_slot/get_attire_text/build_context_text_for_ids
+read/write surface, v1->v2 on-disk migration, and
 find_character_names_in_text (the best-effort scan used by main.py for
-both context injection and force-including the attire tool group - see
-that function's docstring for why it deliberately does whole-word,
-case-insensitive matching only, no fuzzy/nickname matching).
+context injection - see that function's docstring for why it
+deliberately does whole-word, case-insensitive matching only, no
+fuzzy/nickname matching).
+
+v2 background (see brainstorm-layered-clothing.md): every slot is now a
+list, and the old single "update_attire(full value)" call is replaced by
+three verbs - add_item (append, cannot touch anything else in the slot),
+remove_item (best-effort single-item removal, fail-open on ambiguity),
+and replace_slot (the one deliberate full-wipe operation). Several tests
+below exist specifically to lock down the failure mode this schema
+change was built to close: layering one item onto another (or removing
+one of several) must never be able to silently erase a sibling item.
 
 Unlike calendar_manager, there's no staging/confirm safety model here and
 no live network seam to fake - every write is immediate and local, so
 these tests exercise attire_manager directly against the tmp_attire_file
 fixture rather than needing anything like fake_calendars.
 """
+import json
+
 import pytest
 from freezegun import freeze_time
 
@@ -27,7 +39,7 @@ def test_resolve_creates_a_new_character_when_none_matches(tmp_attire_file):
     record = am.resolve_character(state, "Aria")
 
     assert record["name"] == "Aria"
-    assert record["slots"] == {"head": None, "top": None, "bottom": None, "feet": None, "accessories": []}
+    assert record["slots"] == {"head": [], "top": [], "bottom": [], "feet": [], "accessories": []}
     assert record["id"] in state["characters"]
 
 
@@ -148,197 +160,436 @@ def test_find_never_raises_on_characters_with_empty_names(tmp_attire_file):
 
 
 # ---------------------------------------------------------------------------
-# update_attire - validation
+# v1 -> v2 migration (_load / _migrate_record)
 # ---------------------------------------------------------------------------
 
-def test_update_requires_at_least_one_slot(tmp_attire_file):
-    with pytest.raises(AttireManagerError, match="At least one slot"):
-        am.update_attire("Aria")
+def test_load_migrates_v1_string_slots_into_lists(tmp_attire_file):
+    """Simulates a real v1 attire.json on disk (head/top/bottom/feet as a
+    string-or-None, only accessories as a list) and confirms _load()
+    upgrades every record transparently - no separate migration script."""
+    v1_state = {
+        "characters": {
+            "abc123": {
+                "id": "abc123",
+                "name": "Aria",
+                "slots": {
+                    "head": None, "top": "jacket", "bottom": None,
+                    "feet": "boots", "accessories": ["necklace"],
+                },
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            }
+        }
+    }
+    tmp_attire_file.write_text(json.dumps(v1_state), encoding="utf-8")
+
+    state = am._load()
+    record = state["characters"]["abc123"]
+
+    assert record["slots"] == {
+        "head": [], "top": ["jacket"], "bottom": [], "feet": ["boots"], "accessories": ["necklace"],
+    }
 
 
-def test_update_requires_character_name(tmp_attire_file):
+def test_load_migration_is_idempotent_on_already_list_slots(tmp_attire_file):
+    """A record already in v2 format passes through _migrate_record
+    untouched - guards against a future _load() call double-wrapping a
+    list into a nested one-element list."""
+    v2_state = {
+        "characters": {
+            "abc123": {
+                "id": "abc123",
+                "name": "Aria",
+                "slots": {
+                    "head": [], "top": ["jacket"], "bottom": [],
+                    "feet": ["boots", "socks"], "accessories": [],
+                },
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            }
+        }
+    }
+    tmp_attire_file.write_text(json.dumps(v2_state), encoding="utf-8")
+
+    state = am._load()
+    record = state["characters"]["abc123"]
+
+    assert record["slots"]["feet"] == ["boots", "socks"]
+
+
+def test_migrate_record_handles_missing_slots_key_defensively(tmp_attire_file):
+    """Defensive case - a record somehow missing the 'slots' key entirely
+    (shouldn't happen via this module's own writes) still gets a full set
+    of empty lists rather than crashing _load()."""
+    state = {"characters": {"abc": {"id": "abc", "name": "Aria", "updated_at": "x"}}}
+    tmp_attire_file.write_text(json.dumps(state), encoding="utf-8")
+
+    loaded = am._load()
+
+    assert loaded["characters"]["abc"]["slots"] == {
+        "head": [], "top": [], "bottom": [], "feet": [], "accessories": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# add_item / remove_item / replace_slot - validation
+# ---------------------------------------------------------------------------
+
+def test_add_item_requires_character_name(tmp_attire_file):
     with pytest.raises(AttireManagerError, match="character_name is required"):
-        am.update_attire("", top="jacket")
+        am.add_item("", "top", "jacket")
 
 
-def test_update_rejects_item_text_over_max_length(tmp_attire_file, monkeypatch):
+def test_add_item_rejects_unknown_slot(tmp_attire_file):
+    with pytest.raises(AttireManagerError, match="Unknown slot"):
+        am.add_item("Aria", "hands", "gloves")
+
+
+def test_add_item_rejects_empty_item(tmp_attire_file):
+    with pytest.raises(AttireManagerError, match="item is required"):
+        am.add_item("Aria", "top", "")
+
+
+def test_add_item_rejects_item_text_over_max_length(tmp_attire_file, monkeypatch):
     monkeypatch.setattr(am, "MAX_ATTIRE_ITEM_LENGTH", 5)
     with pytest.raises(AttireManagerError, match="5 characters or fewer"):
-        am.update_attire("Aria", top="way too long")
+        am.add_item("Aria", "top", "way too long")
+
+
+def test_remove_item_requires_character_name(tmp_attire_file):
+    with pytest.raises(AttireManagerError, match="character_name is required"):
+        am.remove_item("", "top", "jacket")
+
+
+def test_remove_item_rejects_unknown_slot(tmp_attire_file):
+    am.add_item("Aria", "top", "jacket")
+    with pytest.raises(AttireManagerError, match="Unknown slot"):
+        am.remove_item("Aria", "hands", "jacket")
+
+
+def test_remove_item_rejects_empty_item_hint(tmp_attire_file):
+    am.add_item("Aria", "top", "jacket")
+    with pytest.raises(AttireManagerError, match="item_hint is required"):
+        am.remove_item("Aria", "top", "")
+
+
+def test_remove_item_raises_for_untracked_character(tmp_attire_file):
+    with pytest.raises(AttireManagerError, match="No attire record exists yet"):
+        am.remove_item("Nobody", "top", "jacket")
+
+
+def test_replace_slot_requires_character_name(tmp_attire_file):
+    with pytest.raises(AttireManagerError, match="character_name is required"):
+        am.replace_slot("", "top", "jacket")
+
+
+def test_replace_slot_rejects_unknown_slot(tmp_attire_file):
+    with pytest.raises(AttireManagerError, match="Unknown slot"):
+        am.replace_slot("Aria", "hands", "gloves")
+
+
+def test_replace_slot_rejects_item_text_over_max_length(tmp_attire_file, monkeypatch):
+    monkeypatch.setattr(am, "MAX_ATTIRE_ITEM_LENGTH", 5)
+    with pytest.raises(AttireManagerError, match="5 characters or fewer"):
+        am.replace_slot("Aria", "top", "way too long")
 
 
 # ---------------------------------------------------------------------------
-# update_attire - creating and updating
+# add_item - behavior
 # ---------------------------------------------------------------------------
 
-def test_update_creates_a_new_character_on_first_call(tmp_attire_file):
-    record, changed = am.update_attire("Aria", top="leather jacket")
+def test_add_item_creates_a_new_character_on_first_call(tmp_attire_file):
+    record, added = am.add_item("Aria", "top", "leather jacket")
 
+    assert added is True
     assert record["name"] == "Aria"
-    assert record["slots"]["top"] == "leather jacket"
-    assert changed == ["top"]
+    assert record["slots"]["top"] == ["leather jacket"]
 
 
-def test_update_only_touches_the_slots_passed(tmp_attire_file):
-    am.update_attire("Aria", top="leather jacket", feet="boots")
+def test_add_item_appends_without_touching_other_items_in_the_slot(tmp_attire_file):
+    """The core fix this whole schema change exists for: layering one
+    item onto another must never be able to erase what was already
+    there. This is the exact socks/shoes scenario from the live bug."""
+    am.add_item("Aria", "feet", "yellow socks")
 
-    record, changed = am.update_attire("Aria", top="denim jacket")
+    record, added = am.add_item("Aria", "feet", "black shoes")
 
-    assert record["slots"]["top"] == "denim jacket"
-    assert record["slots"]["feet"] == "boots"  # untouched
-    assert changed == ["top"]
-
-
-def test_update_can_change_multiple_slots_in_one_call(tmp_attire_file):
-    record, changed = am.update_attire("Aria", top="jacket", bottom="jeans", feet="boots")
-
-    assert set(changed) == {"top", "bottom", "feet"}
-    assert record["slots"]["top"] == "jacket"
-    assert record["slots"]["bottom"] == "jeans"
-    assert record["slots"]["feet"] == "boots"
+    assert added is True
+    assert record["slots"]["feet"] == ["yellow socks", "black shoes"]
 
 
-def test_update_with_empty_string_clears_a_slot(tmp_attire_file):
-    am.update_attire("Aria", feet="boots")
+def test_add_item_does_not_touch_other_slots(tmp_attire_file):
+    am.add_item("Aria", "top", "jacket")
 
-    record, changed = am.update_attire("Aria", feet="")
+    record, _ = am.add_item("Aria", "feet", "boots")
 
-    assert record["slots"]["feet"] is None
-    assert changed == ["feet"]
-
-
-def test_update_with_omitted_slot_leaves_it_unchanged_not_cleared(tmp_attire_file):
-    """The not-passed-vs-empty-string distinction, mirroring
-    calendar_manager's location/description convention: None means 'no
-    change requested', not 'clear this'."""
-    am.update_attire("Aria", feet="boots")
-
-    record, changed = am.update_attire("Aria", top="jacket")
-
-    assert record["slots"]["feet"] == "boots"
-    assert "feet" not in changed
+    assert record["slots"]["top"] == ["jacket"]
+    assert record["slots"]["feet"] == ["boots"]
 
 
-def test_update_reports_no_change_when_value_already_matches(tmp_attire_file):
-    am.update_attire("Aria", top="jacket")
+def test_add_item_is_a_no_op_when_item_already_present(tmp_attire_file):
+    am.add_item("Aria", "feet", "black shoes")
 
-    record, changed = am.update_attire("Aria", top="jacket")
+    record, added = am.add_item("Aria", "feet", "black shoes")
 
-    assert changed == []
-
-
-def test_update_reports_no_change_when_clearing_an_already_empty_slot(tmp_attire_file):
-    record, changed = am.update_attire("Aria", top="")
-    assert changed == []
-    assert record["slots"]["top"] is None
+    assert added is False
+    assert record["slots"]["feet"] == ["black shoes"]  # not duplicated
 
 
-def test_update_strips_whitespace_from_item_text(tmp_attire_file):
-    record, _ = am.update_attire("Aria", top="  leather jacket  ")
-    assert record["slots"]["top"] == "leather jacket"
+def test_add_item_dedup_check_is_case_and_whitespace_insensitive(tmp_attire_file):
+    am.add_item("Aria", "feet", "black shoes")
+
+    record, added = am.add_item("Aria", "feet", "  BLACK shoes  ")
+
+    assert added is False
+    assert record["slots"]["feet"] == ["black shoes"]
 
 
-def test_update_sets_updated_at_on_change(tmp_attire_file):
-    with freeze_time("2026-08-26 10:00:00"):
-        record, changed = am.update_attire("Aria", top="jacket")
-        assert changed
-        assert record["updated_at"].startswith("2026-08-26T10:00:00")
+def test_add_item_strips_whitespace_from_item_text(tmp_attire_file):
+    record, _ = am.add_item("Aria", "top", "  leather jacket  ")
+    assert record["slots"]["top"] == ["leather jacket"]
 
 
-def test_update_does_not_bump_updated_at_when_nothing_actually_changed(tmp_attire_file):
-    with freeze_time("2026-08-26 10:00:00"):
-        am.update_attire("Aria", top="jacket")
+def test_add_item_is_case_insensitive_for_an_existing_character(tmp_attire_file):
+    am.add_item("Aria", "top", "jacket")
 
-    with freeze_time("2026-08-27 12:00:00"):
-        record, changed = am.update_attire("Aria", top="jacket")  # same value again
+    record, added = am.add_item("ARIA", "feet", "boots")
 
-    assert changed == []
-    assert record["updated_at"].startswith("2026-08-26T10:00:00")  # unchanged
-
-
-def test_update_persists_across_separate_load_calls(tmp_attire_file):
-    """Confirms _save() actually wrote to disk, not just mutated an
-    in-memory dict that happened to still be around."""
-    am.update_attire("Aria", top="jacket")
-
-    reloaded = am._load()
-    record = am.resolve_character(reloaded, "Aria", create_if_missing=False)
-
-    assert record["slots"]["top"] == "jacket"
-
-
-def test_update_is_case_insensitive_for_an_existing_character(tmp_attire_file):
-    am.update_attire("Aria", top="jacket")
-
-    record, changed = am.update_attire("ARIA", feet="boots")
-
-    assert changed == ["feet"]
+    assert added is True
     state = am._load()
     assert len(state["characters"]) == 1  # same character, not a duplicate
 
 
+def test_add_item_persists_across_separate_load_calls(tmp_attire_file):
+    """Confirms _save() actually wrote to disk, not just mutated an
+    in-memory dict that happened to still be around."""
+    am.add_item("Aria", "top", "jacket")
+
+    reloaded = am._load()
+    record = am.resolve_character(reloaded, "Aria", create_if_missing=False)
+
+    assert record["slots"]["top"] == ["jacket"]
+
+
+def test_add_item_sets_updated_at_on_change(tmp_attire_file):
+    with freeze_time("2026-08-26 10:00:00"):
+        record, added = am.add_item("Aria", "top", "jacket")
+        assert added
+        assert record["updated_at"].startswith("2026-08-26T10:00:00")
+
+
+def test_add_item_does_not_bump_updated_at_when_already_present(tmp_attire_file):
+    with freeze_time("2026-08-26 10:00:00"):
+        am.add_item("Aria", "top", "jacket")
+
+    with freeze_time("2026-08-27 12:00:00"):
+        record, added = am.add_item("Aria", "top", "jacket")
+
+    assert added is False
+    assert record["updated_at"].startswith("2026-08-26T10:00:00")  # unchanged
+
+
 # ---------------------------------------------------------------------------
-# update_attire - accessories (the one list-valued slot)
+# remove_item - behavior
 # ---------------------------------------------------------------------------
 
-def test_accessories_splits_on_commas(tmp_attire_file):
-    record, changed = am.update_attire("Aria", accessories="necklace, gloves")
+def test_remove_item_removes_an_exact_match(tmp_attire_file):
+    am.add_item("Aria", "feet", "yellow socks")
+    am.add_item("Aria", "feet", "black shoes")
+
+    record, removed = am.remove_item("Aria", "feet", "black shoes")
+
+    assert removed == "black shoes"
+    assert record["slots"]["feet"] == ["yellow socks"]
+
+
+def test_remove_item_leaves_other_items_in_the_slot_untouched(tmp_attire_file):
+    """Mirrors add_item's core-fix test from the other direction:
+    removing one item must never touch a sibling item in the same slot."""
+    am.add_item("Aria", "feet", "yellow socks")
+    am.add_item("Aria", "feet", "black shoes")
+
+    am.remove_item("Aria", "feet", "black shoes")
+
+    state = am._load()
+    record = am.resolve_character(state, "Aria", create_if_missing=False)
+    assert record["slots"]["feet"] == ["yellow socks"]
+
+
+def test_remove_item_matches_case_insensitively(tmp_attire_file):
+    am.add_item("Aria", "top", "Leather Jacket")
+
+    record, removed = am.remove_item("Aria", "top", "leather jacket")
+
+    assert removed == "Leather Jacket"
+    assert record["slots"]["top"] == []
+
+
+def test_remove_item_matches_via_substring_when_hint_is_shorter_than_stored(tmp_attire_file):
+    """'jacket' should match a stored 'denim jacket' - the item-identity
+    fuzziness explicitly accepted in the module docstring."""
+    am.add_item("Aria", "top", "denim jacket")
+
+    record, removed = am.remove_item("Aria", "top", "jacket")
+
+    assert removed == "denim jacket"
+    assert record["slots"]["top"] == []
+
+
+def test_remove_item_matches_via_substring_when_hint_is_longer_than_stored(tmp_attire_file):
+    am.add_item("Aria", "top", "jacket")
+
+    record, removed = am.remove_item("Aria", "top", "her denim jacket")
+
+    assert removed == "jacket"
+    assert record["slots"]["top"] == []
+
+
+def test_remove_item_is_a_no_op_when_nothing_matches(tmp_attire_file):
+    am.add_item("Aria", "feet", "yellow socks")
+
+    record, removed = am.remove_item("Aria", "feet", "sandals")
+
+    assert removed is None
+    assert record["slots"]["feet"] == ["yellow socks"]  # unchanged
+
+
+def test_remove_item_is_a_no_op_when_the_hint_is_ambiguous(tmp_attire_file):
+    """Two candidate substring matches - not confident enough to guess
+    which one the narrative meant, so nothing changes. Fail-open, per
+    the module docstring."""
+    am.add_item("Aria", "top", "denim jacket")
+    am.add_item("Aria", "top", "leather jacket")
+
+    record, removed = am.remove_item("Aria", "top", "jacket")
+
+    assert removed is None
+    assert record["slots"]["top"] == ["denim jacket", "leather jacket"]  # unchanged
+
+
+def test_remove_item_persists_across_separate_load_calls(tmp_attire_file):
+    am.add_item("Aria", "top", "jacket")
+    am.remove_item("Aria", "top", "jacket")
+
+    reloaded = am._load()
+    record = am.resolve_character(reloaded, "Aria", create_if_missing=False)
+
+    assert record["slots"]["top"] == []
+
+
+def test_remove_item_sets_updated_at_only_when_something_was_actually_removed(tmp_attire_file):
+    with freeze_time("2026-08-26 10:00:00"):
+        am.add_item("Aria", "top", "jacket")
+
+    with freeze_time("2026-08-27 12:00:00"):
+        record, removed = am.remove_item("Aria", "top", "no such item")
+
+    assert removed is None
+    assert record["updated_at"].startswith("2026-08-26T10:00:00")  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# replace_slot - behavior
+# ---------------------------------------------------------------------------
+
+def test_replace_slot_creates_a_new_character_on_first_call(tmp_attire_file):
+    record, changed = am.replace_slot("Aria", "top", "leather jacket")
+
+    assert changed is True
+    assert record["slots"]["top"] == ["leather jacket"]
+
+
+def test_replace_slot_splits_on_commas(tmp_attire_file):
+    record, changed = am.replace_slot("Aria", "accessories", "necklace, gloves")
 
     assert record["slots"]["accessories"] == ["necklace", "gloves"]
-    assert changed == ["accessories"]
+    assert changed is True
 
 
-def test_accessories_strips_whitespace_around_each_item(tmp_attire_file):
-    record, _ = am.update_attire("Aria", accessories="  necklace ,  gloves  ")
+def test_replace_slot_strips_whitespace_around_each_item(tmp_attire_file):
+    record, _ = am.replace_slot("Aria", "accessories", "  necklace ,  gloves  ")
     assert record["slots"]["accessories"] == ["necklace", "gloves"]
 
 
-def test_accessories_drops_empty_items_between_commas(tmp_attire_file):
-    record, _ = am.update_attire("Aria", accessories="necklace, , gloves")
+def test_replace_slot_drops_empty_items_between_commas(tmp_attire_file):
+    record, _ = am.replace_slot("Aria", "accessories", "necklace, , gloves")
     assert record["slots"]["accessories"] == ["necklace", "gloves"]
 
 
-def test_accessories_empty_string_clears_the_list(tmp_attire_file):
-    am.update_attire("Aria", accessories="necklace, gloves")
+def test_replace_slot_empty_string_clears_the_list(tmp_attire_file):
+    am.replace_slot("Aria", "accessories", "necklace, gloves")
 
-    record, changed = am.update_attire("Aria", accessories="")
+    record, changed = am.replace_slot("Aria", "accessories", "")
 
     assert record["slots"]["accessories"] == []
-    assert changed == ["accessories"]
+    assert changed is True
 
 
-def test_accessories_whitespace_only_string_clears_the_list(tmp_attire_file):
-    am.update_attire("Aria", accessories="necklace")
+def test_replace_slot_whitespace_only_string_clears_the_list(tmp_attire_file):
+    am.replace_slot("Aria", "accessories", "necklace")
 
-    record, changed = am.update_attire("Aria", accessories="   ")
+    record, changed = am.replace_slot("Aria", "accessories", "   ")
 
     assert record["slots"]["accessories"] == []
-    assert changed == ["accessories"]
+    assert changed is True
 
 
-def test_accessories_no_change_when_list_is_identical(tmp_attire_file):
-    am.update_attire("Aria", accessories="necklace, gloves")
+def test_replace_slot_no_change_when_list_is_identical(tmp_attire_file):
+    am.replace_slot("Aria", "accessories", "necklace, gloves")
 
-    record, changed = am.update_attire("Aria", accessories="necklace, gloves")
+    record, changed = am.replace_slot("Aria", "accessories", "necklace, gloves")
 
-    assert changed == []
+    assert changed is False
 
 
-def test_accessories_order_change_counts_as_a_change(tmp_attire_file):
-    """Lists are compared positionally, not as sets - re-ordering the same
-    items is treated as a real change. Documenting current behavior, not
-    asserting it's the only reasonable choice."""
-    am.update_attire("Aria", accessories="necklace, gloves")
+def test_replace_slot_order_change_counts_as_a_change(tmp_attire_file):
+    """Lists are compared positionally, not as sets - re-ordering the
+    same items is treated as a real change. Documenting current
+    behavior, not asserting it's the only reasonable choice."""
+    am.replace_slot("Aria", "accessories", "necklace, gloves")
 
-    record, changed = am.update_attire("Aria", accessories="gloves, necklace")
+    record, changed = am.replace_slot("Aria", "accessories", "gloves, necklace")
 
-    assert changed == ["accessories"]
+    assert changed is True
     assert record["slots"]["accessories"] == ["gloves", "necklace"]
 
 
-def test_single_accessory_with_no_comma_is_a_one_item_list(tmp_attire_file):
-    record, _ = am.update_attire("Aria", accessories="necklace")
-    assert record["slots"]["accessories"] == ["necklace"]
+def test_replace_slot_wipes_items_that_add_item_would_have_preserved(tmp_attire_file):
+    """The deliberate distinction from add_item: this is the one call
+    allowed to discard something still being worn - e.g. a genuine full
+    outfit change scene, not a single item coming on or off."""
+    am.add_item("Aria", "feet", "yellow socks")
+    am.add_item("Aria", "feet", "black shoes")
+
+    record, changed = am.replace_slot("Aria", "feet", "sandals")
+
+    assert changed is True
+    assert record["slots"]["feet"] == ["sandals"]  # socks and shoes both gone
+
+
+def test_replace_slot_persists_across_separate_load_calls(tmp_attire_file):
+    am.replace_slot("Aria", "top", "jacket")
+
+    reloaded = am._load()
+    record = am.resolve_character(reloaded, "Aria", create_if_missing=False)
+
+    assert record["slots"]["top"] == ["jacket"]
+
+
+def test_replace_slot_sets_updated_at_on_change(tmp_attire_file):
+    with freeze_time("2026-08-26 10:00:00"):
+        record, changed = am.replace_slot("Aria", "top", "jacket")
+        assert changed
+        assert record["updated_at"].startswith("2026-08-26T10:00:00")
+
+
+def test_replace_slot_does_not_bump_updated_at_when_nothing_actually_changed(tmp_attire_file):
+    with freeze_time("2026-08-26 10:00:00"):
+        am.replace_slot("Aria", "top", "jacket")
+
+    with freeze_time("2026-08-27 12:00:00"):
+        record, changed = am.replace_slot("Aria", "top", "jacket")  # same value again
+
+    assert changed is False
+    assert record["updated_at"].startswith("2026-08-26T10:00:00")  # unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +602,9 @@ def test_get_attire_text_for_untracked_character_returns_the_error_message(tmp_a
 
 
 def test_get_attire_text_includes_character_name_and_all_slots(tmp_attire_file):
-    am.update_attire("Aria", top="jacket", feet="boots", accessories="necklace")
+    am.add_item("Aria", "top", "jacket")
+    am.add_item("Aria", "feet", "boots")
+    am.add_item("Aria", "accessories", "necklace")
 
     result = am.get_attire_text("Aria")
 
@@ -362,16 +615,19 @@ def test_get_attire_text_includes_character_name_and_all_slots(tmp_attire_file):
     assert "accessories: necklace" in result
 
 
-def test_get_attire_text_shows_none_for_empty_accessories(tmp_attire_file):
-    am.update_attire("Aria", top="jacket")
+def test_get_attire_text_shows_none_for_an_empty_slot(tmp_attire_file):
+    am.add_item("Aria", "top", "jacket")
     result = am.get_attire_text("Aria")
     assert "accessories: (none)" in result
 
 
-def test_get_attire_text_lists_multiple_accessories_comma_separated(tmp_attire_file):
-    am.update_attire("Aria", accessories="necklace, gloves")
+def test_get_attire_text_lists_multiple_items_in_a_slot_comma_separated(tmp_attire_file):
+    am.add_item("Aria", "feet", "yellow socks")
+    am.add_item("Aria", "feet", "black shoes")
+
     result = am.get_attire_text("Aria")
-    assert "accessories: necklace, gloves" in result
+
+    assert "feet: yellow socks, black shoes" in result
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +645,7 @@ def test_build_context_skips_an_id_that_no_longer_exists(tmp_attire_file):
 
 
 def test_build_context_includes_the_persistent_state_header(tmp_attire_file):
-    am.update_attire("Aria", top="jacket")
+    am.add_item("Aria", "top", "jacket")
     state = am._load()
     aria_id = next(iter(state["characters"]))
 
@@ -400,42 +656,39 @@ def test_build_context_includes_the_persistent_state_header(tmp_attire_file):
     assert "top: jacket" in result
 
 
-def test_build_context_includes_seeding_and_subtle_change_guidance(tmp_attire_file):
-    """Locks down that the tightened instruction text (added specifically
-    so the model doesn't skip subtle changes or wait for a full outfit
-    change) is actually present in the injected block, not just in
-    main.py's separate GROUP_INSTRUCTIONS."""
-    am.update_attire("Aria", top="jacket")
+def test_build_context_is_purely_informational_and_names_no_tool(tmp_attire_file):
+    """The main agent has no attire tools of its own - attire tracking is
+    handled entirely by the separate post-turn attire_subagent.py pass
+    (see main.py's ATTIRE_TOOL_SCHEMAS, which are only ever handed to
+    that sub-agent). This block must never instruct the main agent to
+    call anything, since it has nothing to call."""
+    am.add_item("Aria", "top", "jacket")
     state = am._load()
     aria_id = next(iter(state["characters"]))
 
     result = am.build_context_text_for_ids(state, [aria_id])
 
-    assert "attire_manager_update" in result
-    assert "cheaper than a stale one" in result
+    assert "maintained automatically" in result
+    assert "attire_add_item" not in result
+    assert "attire_remove_item" not in result
+    assert "attire_replace_slot" not in result
+    assert "attire_manager_update" not in result
 
 
-def test_build_context_includes_compound_value_restatement_guidance(tmp_attire_file):
-    """Option A from the layered-clothing brainstorm: instruction-only
-    discipline telling the model to restate a slot's FULL value rather
-    than overwrite it with just the changed portion, when that slot
-    already holds more than one item. Locks down that this guidance is
-    actually present in the injected block - this is the specific text
-    the live test is meant to exercise, so a silent regression here
-    would be easy to miss without an explicit assertion."""
-    am.update_attire("Aria", feet="black sneakers and white socks")
+def test_build_context_shows_multiple_items_in_a_layered_slot(tmp_attire_file):
+    am.add_item("Aria", "feet", "yellow socks")
+    am.add_item("Aria", "feet", "black shoes")
     state = am._load()
     aria_id = next(iter(state["characters"]))
 
     result = am.build_context_text_for_ids(state, [aria_id])
 
-    assert "FULL corrected value" in result
-    assert "silently delete" in result
+    assert "feet: yellow socks, black shoes" in result
 
 
 def test_build_context_includes_multiple_characters_when_multiple_ids_given(tmp_attire_file):
-    am.update_attire("Aria", top="jacket")
-    am.update_attire("Kai", top="hoodie")
+    am.add_item("Aria", "top", "jacket")
+    am.add_item("Kai", "top", "hoodie")
     state = am._load()
     ids = list(state["characters"].keys())
 
@@ -448,7 +701,7 @@ def test_build_context_includes_multiple_characters_when_multiple_ids_given(tmp_
 
 
 def test_build_context_only_includes_ids_that_still_exist_even_when_mixed_with_missing(tmp_attire_file):
-    am.update_attire("Aria", top="jacket")
+    am.add_item("Aria", "top", "jacket")
     state = am._load()
     aria_id = next(iter(state["characters"]))
 

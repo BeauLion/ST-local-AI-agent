@@ -761,19 +761,47 @@ def duration_confirm_new_category(args: dict) -> str:
 # attire_manager.py's module docstring for the full design rationale.
 # ---------------------------------------------------------------------------
 
-def attire_manager_update(args: dict) -> str:
+def attire_manager_add_item(args: dict) -> str:
     try:
-        record, changed = attire_manager.update_attire(
+        record, added = attire_manager.add_item(
             args.get("character_name", ""),
-            head=args.get("head"),
-            top=args.get("top"),
-            bottom=args.get("bottom"),
-            feet=args.get("feet"),
-            accessories=args.get("accessories"),
+            args.get("slot", ""),
+            args.get("item", ""),
+        )
+        if not added:
+            return f"No change needed - {record['name']}'s {args.get('slot')} already includes that."
+        return f"Added to {record['name']}'s {args.get('slot')}."
+    except AttireManagerError as e:
+        return f"Error: {e}"
+
+
+def attire_manager_remove_item(args: dict) -> str:
+    try:
+        record, removed = attire_manager.remove_item(
+            args.get("character_name", ""),
+            args.get("slot", ""),
+            args.get("item_hint", ""),
+        )
+        if removed is None:
+            return (
+                f"No change made - couldn't confidently match '{args.get('item_hint')}' "
+                f"to exactly one item in {record['name']}'s {args.get('slot')}."
+            )
+        return f"Removed '{removed}' from {record['name']}'s {args.get('slot')}."
+    except AttireManagerError as e:
+        return f"Error: {e}"
+
+
+def attire_manager_replace_slot(args: dict) -> str:
+    try:
+        record, changed = attire_manager.replace_slot(
+            args.get("character_name", ""),
+            args.get("slot", ""),
+            args.get("items", ""),
         )
         if not changed:
-            return f"No change needed - {record['name']}'s attire already matches that."
-        return f"Updated {record['name']}'s attire ({', '.join(changed)})."
+            return f"No change needed - {record['name']}'s {args.get('slot')} already matches that."
+        return f"Replaced {record['name']}'s {args.get('slot')}."
     except AttireManagerError as e:
         return f"Error: {e}"
 
@@ -1411,12 +1439,97 @@ ATTIRE_TOOL_SCHEMAS = [
         },
     },
 ]
-# Deliberately NOT merged into TOOLS: attire tracking is now handled
-# entirely by the post-turn attire_subagent.py pass, not by the main
-# agent mid-conversation. ATTIRE_TOOL_SCHEMAS stays defined here purely
-# so attire_subagent.py can import and reuse the same schema for its own
-# separate completion call - it's just never added to what this agent
-# sees or can select.
+# Deliberately NOT merged into TOOLS: attire tracking is handled entirely
+# by the post-turn attire_subagent.py pass, not by the main agent
+# mid-conversation. ATTIRE_TOOL_SCHEMAS stays defined here purely so
+# attire_subagent.py can import and reuse these exact schemas for its own
+# separate completion call - never added to what the main agent sees.
+#
+# v2 (see brainstorm-layered-clothing.md): three verbs instead of one
+# full-value update, so adding a layered item structurally cannot erase
+# anything else already in the slot - see attire_manager.py's docstring.
+ATTIRE_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_add_item",
+            "description": (
+                "Add one item to a slot WITHOUT touching anything else already there. Use this "
+                "whenever something is put on, layered, or added - e.g. shoes going on over socks, "
+                "a jacket going on over a shirt, a ring being put on. Never use this to describe an "
+                "item being removed or swapped."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character whose attire changed, exactly as you refer to them."},
+                    "slot": {"type": "string", "enum": list(attire_manager.ATTIRE_SLOTS), "description": "Which slot the item goes in."},
+                    "item": {"type": "string", "description": "The item being added, e.g. 'black leather jacket'."},
+                },
+                "required": ["character_name", "slot", "item"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_remove_item",
+            "description": (
+                "Remove one item from a slot. Use this when the narrative describes an item coming "
+                "off - taken off, removed, shrugged off, kicked off, etc. Only removes the ONE item "
+                "described; anything else in that slot is left untouched."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character whose attire changed, exactly as you refer to them."},
+                    "slot": {"type": "string", "enum": list(attire_manager.ATTIRE_SLOTS), "description": "Which slot to remove from."},
+                    "item_hint": {"type": "string", "description": "The item being removed, as described in the narrative, e.g. 'the jacket' or 'her shoes'."},
+                },
+                "required": ["character_name", "slot", "item_hint"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_replace_slot",
+            "description": (
+                "Wipe a slot and set it to a brand new value. ONLY use this for a genuine full "
+                "change - e.g. a character changes into a whole new outfit, or the scene explicitly "
+                "resets what someone is wearing. Do NOT use this to describe a single item coming "
+                "on or off - that silently deletes anything else in the slot. Use attire_add_item "
+                "or attire_remove_item for anything short of a full change."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character whose attire changed, exactly as you refer to them."},
+                    "slot": {"type": "string", "enum": list(attire_manager.ATTIRE_SLOTS), "description": "Which slot to replace."},
+                    "items": {"type": "string", "description": "Comma-separated full new contents of the slot, e.g. 'red sundress, sun hat'. Empty string clears it entirely."},
+                },
+                "required": ["character_name", "slot", "items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_manager_get",
+            "description": (
+                "Look up a character's current attire. Usually unnecessary since a tracked "
+                "character's current attire is already shown to you automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character to look up, exactly as you refer to them."},
+                },
+                "required": ["character_name"],
+            },
+        },
+    },
+]
 
 TOOL_FUNCTIONS = {
     "get_current_time": get_current_time,
@@ -1455,8 +1568,6 @@ TOOL_FUNCTIONS = {
     "duration_get_estimate": duration_get_estimate,
     "duration_correct_entry": duration_correct_entry,
     "duration_confirm_new_category": duration_confirm_new_category,
-    "attire_manager_update": attire_manager_update,
-    "attire_manager_get": attire_manager_get,
 }
 
 # ---------------------------------------------------------------------------
