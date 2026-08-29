@@ -429,6 +429,46 @@ ATTIRE_SUBAGENT_TIMEOUT_SECONDS = 15
 
 
 # ─────────────────────────────────────────────────────────────
+# iCloud Bridge (bridge_client.py) — EventKit-based fallback for
+# calendar_manager.py, used only when CalDAV itself is unreachable. See the
+# "BACKEND FALLBACK MODEL" note at the top of calendar_manager.py.
+# ─────────────────────────────────────────────────────────────
+
+# Master switch. When False, calendar_manager.py never attempts a bridge
+# fallback at all - a CalDAV connectivity failure just fails the way it
+# always has. Flip on once BRIDGE_URL/BRIDGE_TOKEN are set in .env and
+# the bridge has been reached at least once from this machine (e.g. via
+# the health-check curl in the bridge's own README).
+BRIDGE_ENABLED = False
+
+# Names of the environment variables bridge_client.py reads from .env -
+# same pattern as ICLOUD_USERNAME_ENV_VAR/ICLOUD_APP_PASSWORD_ENV_VAR
+# above. BRIDGE_URL is a Tailscale IP or MagicDNS hostname (e.g.
+# "http://100.x.x.x:8787") that could change if the Mac is ever
+# re-registered with Tailscale, so it lives in .env rather than here -
+# same reasoning as EXTRA_CORS_ORIGINS above: real addresses never end up
+# committed to the repo.
+BRIDGE_URL_ENV_VAR = "BRIDGE_URL"
+BRIDGE_TOKEN_ENV_VAR = "BRIDGE_TOKEN"
+
+# Per-request timeout (seconds) for calls to the bridge. Kept short-ish -
+# unlike caldav.icloud.com, the bridge is a Tailscale hop to a machine on
+# your own network, not a public server across the internet, so it
+# shouldn't normally be slow. A long timeout here would make the failover
+# itself feel sluggish on top of whatever CalDAV already spent timing out.
+BRIDGE_TIMEOUT_SECONDS = 15
+
+# Calendar to default to on the bridge when calendar_name isn't given.
+# Matched against EventKit calendar titles the same way CALENDAR_DEFAULT_
+# NAME is matched against CalDAV calendar names (exact, then unique
+# partial match) - set to the same value if your CalDAV and EventKit
+# calendars share a name, which they normally will since they're the same
+# iCloud account. Leave empty to just let the bridge's own
+# defaultCalendarForNewEvents() decide.
+BRIDGE_DEFAULT_CALENDAR_NAME = "Home"
+
+
+# ─────────────────────────────────────────────────────────────
 # run_python tool (Docker sandbox)
 # ─────────────────────────────────────────────────────────────
 

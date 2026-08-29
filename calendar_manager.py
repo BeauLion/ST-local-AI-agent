@@ -24,6 +24,36 @@ things speculatively without any real-world consequence.
 
 Only one change can be staged at a time (single-user, single-session use
 case) - staging a new one silently replaces whatever was staged before.
+
+BACKEND FALLBACK MODEL (bridge_client.py):
+CalDAV has occasionally been unreachable (timeouts against caldav.icloud.com
+- see handover-16/17). bridge_client.py talks to a second, independent path
+to the same iCloud account: a small FastAPI server running on a Mac,
+exposing Calendar via Apple's EventKit framework over Tailscale. It is a
+FALLBACK, not a second data source the model chooses between - every tool
+name/signature the model sees is unchanged. Internally:
+
+- READS (list_events/search_events) try CalDAV first; on a connectivity-
+  class failure (timeout/connection error - see CalendarConnectivityError
+  below) they transparently retry via the bridge instead.
+- WRITES stay staged/confirmed exactly as before, but which backend a
+  staged change targets is decided once, at STAGE time, not re-decided at
+  confirm time - see stage_create_event/_stage_create_event_via_bridge.
+- EDIT/DELETE route by the event's uid PREFIX ("caldav:..." or
+  "bridge:..."), not by testing connectivity again - an id from one
+  backend is meaningless to the other (EventKit identifiers and iCalendar
+  UIDs are different id spaces entirely), so there's no cross-backend
+  guessing, only "use whichever backend this id actually came from." If
+  CalDAV was up when an event was listed (a "caldav:" id) but goes down
+  before the edit/delete is confirmed, that confirm fails honestly rather
+  than silently trying to guess the same event on the bridge - consistent
+  with this module's existing "never guess, never risk touching the wrong
+  event" posture (see _find_event_with_fallback).
+- The bridge itself must be reachable for any of this to help - if the
+  Mac is asleep or the bridge process isn't running, a CalDAV outage is
+  still a real outage. BRIDGE_ENABLED (config.py) is a master off-switch;
+  when False, none of the above triggers and behavior is identical to
+  before the bridge existed.
 """
 
 import json
@@ -38,11 +68,14 @@ from zoneinfo import ZoneInfo
 
 import caldav
 import icalendar
+import requests.exceptions
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+import bridge_client
 from console_log import alog
 from config import (
+    BRIDGE_ENABLED,
     CALDAV_LOG_RAW_REQUESTS,
     CALDAV_TIMEOUT_SECONDS,
     CALENDAR_BATCH_DEFAULT_DURATION_MINUTES,
@@ -93,6 +126,35 @@ class CalendarError(Exception):
     """Raised for any calendar problem - caught by main.py's tool wrappers
     and turned into a plain 'Error: ...' string the model can read, relay
     honestly, and react to (same pattern as ProjectManagerError)."""
+
+
+class CalendarConnectivityError(CalendarError):
+    """A CalendarError specifically caused by CalDAV being unreachable
+    (timeout, connection refused, 5xx) rather than a normal answer from a
+    reachable server (auth failure, 404, bad input). Every existing
+    `except CalendarError` in this module and in main.py still catches
+    this unchanged - it's a strict subclass - but the read/write wrapper
+    functions below catch it specifically to decide whether falling back
+    to the bridge is worth attempting at all. See _is_connectivity_exc."""
+
+
+def _is_connectivity_exc(exc: Exception) -> bool:
+    """True for network-level failures reaching caldav.icloud.com - the
+    cases a bridge fallback might actually help with. False for anything
+    else (auth errors, 404s, 'no calendar found', bad data): those are
+    real answers from a server that IS reachable, and retrying against a
+    different backend wouldn't change them, only risk masking the real
+    problem. Deliberately narrow (requests' own connection/timeout
+    exception types only) rather than trying to also classify caldav's
+    DAVError subclasses - the one real-world failure seen so far
+    (handover-16's "Read timed out") is a requests.exceptions.ReadTimeout
+    surfacing unwrapped, exactly what this catches."""
+    return isinstance(exc, (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectTimeout,
+        requests.exceptions.ReadTimeout,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +243,14 @@ def _get_client() -> caldav.DAVClient:
                 _wrap_request_logging(client)
                 client.principal()  # forces a round-trip now, not on first real use
             except Exception as e:
-                raise CalendarError(
+                msg = (
                     f"Could not connect to iCloud calendar: {e}. Double-check the "
                     f"Apple ID and app-specific password in .env, and that the "
                     f"app-specific password hasn't been revoked."
                 )
+                if _is_connectivity_exc(e):
+                    raise CalendarConnectivityError(msg)
+                raise CalendarError(msg)
             _cached_client = client
         return _cached_client
 
@@ -201,6 +266,8 @@ def _get_calendars(refresh: bool = False):
         # Connection may have gone stale (password revoked mid-session, etc).
         # Drop the cached client so the next call reconnects fresh.
         _reset_client()
+        if _is_connectivity_exc(e):
+            raise CalendarConnectivityError(f"Could not list iCloud calendars: {e}")
         raise CalendarError(f"Could not list iCloud calendars: {e}")
     if not calendars:
         raise CalendarError("No calendars found on this iCloud account.")
@@ -219,6 +286,8 @@ def _date_search_with_retry(cal, start_dt, end_dt, error_prefix: str):
         try:
             return cal.date_search(start_dt, end_dt)
         except Exception as second_error:
+            if _is_connectivity_exc(second_error):
+                raise CalendarConnectivityError(f"{error_prefix}: {second_error}")
             raise CalendarError(f"{error_prefix}: {second_error}")
 
 
@@ -389,13 +458,48 @@ def _event_to_dict(event, calendar_label: str = "") -> dict:
         raise CalendarError("Could not read an event's data: empty calendar object.")
 
     return {
-        "uid": _ical_field(component, "uid"),
+        "uid": f"caldav:{_ical_field(component, 'uid')}",
         "title": _ical_field(component, "summary", "(no title)"),
         "start": _ical_field(component, "dtstart"),
         "end": _ical_field(component, "dtend"),
         "location": _ical_field(component, "location"),
         "description": _ical_field(component, "description"),
         "calendar": calendar_label,
+        "backend": "caldav",
+    }
+
+
+def _split_uid(uid: str) -> tuple[str, str]:
+    """Split a uid the model was shown ('caldav:ABC-123' or
+    'bridge:E4F9') into (backend, raw_id) - the raw id is what actually
+    gets passed to that backend's own lookup/update/delete calls. A uid
+    with no recognized prefix is treated as a bare CalDAV UID, for
+    backward compatibility with anything staged/logged before
+    backend-prefixing was added."""
+    if uid.startswith("caldav:"):
+        return "caldav", uid[len("caldav:"):]
+    if uid.startswith("bridge:"):
+        return "bridge", uid[len("bridge:"):]
+    return "caldav", uid
+
+
+def _bridge_event_to_dict(ev: dict) -> dict:
+    """bridge_client's normalized event dict -> this module's unified
+    event-dict shape (same keys _event_to_dict produces), so list_events/
+    search_events can return a single mixed-backend list the model can't
+    tell apart except by the uid prefix and the informational 'backend'
+    field."""
+    start_local = ev["start"].astimezone(_LOCAL_TZ) if ev.get("start") else None
+    end_local = ev["end"].astimezone(_LOCAL_TZ) if ev.get("end") else None
+    return {
+        "uid": f"bridge:{ev['id']}",
+        "title": ev.get("title") or "(no title)",
+        "start": str(start_local) if start_local else "",
+        "end": str(end_local) if end_local else "",
+        "location": ev.get("location") or "",
+        "description": ev.get("notes") or "",
+        "calendar": ev.get("calendar_title") or "(unnamed)",
+        "backend": "bridge",
     }
 
 
@@ -507,11 +611,6 @@ _last_results: list[dict] = []
 
 
 def list_events(start: str = None, end: str = None, calendar_name: str = None, when: str = None) -> list[dict]:
-    # A named calendar_name is used as-is; when omitted, _resolve_calendar
-    # falls back to CALENDAR_DEFAULT_NAME (config.py), or the first
-    # calendar iCloud returns if that's unset/unmatched.
-    calendars = [_resolve_calendar(calendar_name)]
-
     if when and not (start or end):
         start_dt, end_dt = resolve_when(when)
     elif start:
@@ -530,11 +629,18 @@ def list_events(start: str = None, end: str = None, calendar_name: str = None, w
         start_dt = datetime.now()
         end_dt = start_dt + timedelta(days=CALENDAR_DEFAULT_LOOKAHEAD_DAYS)
 
-    results = []
-    for cal in calendars:
-        label = cal.name or "(unnamed)"
-        events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not fetch events from '{label}'")
-        results.extend(_event_to_dict(e, label) for e in events)
+    try:
+        # A named calendar_name is used as-is; when omitted, _resolve_calendar
+        # falls back to CALENDAR_DEFAULT_NAME (config.py), or the first
+        # calendar iCloud returns if that's unset/unmatched.
+        calendars = [_resolve_calendar(calendar_name)]
+        results = []
+        for cal in calendars:
+            label = cal.name or "(unnamed)"
+            events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not fetch events from '{label}'")
+            results.extend(_event_to_dict(e, label) for e in events)
+    except CalendarConnectivityError as e:
+        results = _list_events_via_bridge(start_dt, end_dt, calendar_name, cause=e)
 
     results.sort(key=lambda e: e["start"])
     with _last_results_lock:
@@ -543,11 +649,25 @@ def list_events(start: str = None, end: str = None, calendar_name: str = None, w
     return results
 
 
+def _list_events_via_bridge(start_dt: datetime, end_dt: datetime, calendar_name: str, cause: Exception) -> list[dict]:
+    """CalDAV was unreachable (cause) - answer this same read from the
+    iCloud bridge instead. Not gated on BRIDGE_ENABLED at the call site;
+    that's checked once here so every read/write fallback path shares one
+    rule for whether attempting the bridge at all is worth it."""
+    if not BRIDGE_ENABLED:
+        raise CalendarError(f"CalDAV is currently unreachable: {cause}")
+    try:
+        bridge_cal = bridge_client.resolve_calendar(calendar_name) if calendar_name else None
+        calendar_id = bridge_cal["id"] if bridge_cal else None
+        raw_events = bridge_client.list_events(start_dt, end_dt, calendar_id=calendar_id)
+    except bridge_client.BridgeError as e:
+        raise CalendarError(f"CalDAV is unreachable ({cause}) and the iCloud bridge also failed: {e}")
+    return [_bridge_event_to_dict(ev) for ev in raw_events]
+
+
 def search_events(query: str, start: str = None, end: str = None, calendar_name: str = None, when: str = None) -> list[dict]:
     if not query or not query.strip():
         raise CalendarError("A search query is required.")
-
-    calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
 
     if when and not (start or end):
         start_dt, end_dt = resolve_when(when)
@@ -556,19 +676,42 @@ def search_events(query: str, start: str = None, end: str = None, calendar_name:
         end_dt = _parse_datetime(end) if end else datetime.now() + timedelta(days=CALENDAR_SEARCH_LOOKAHEAD_DAYS)
 
     key = query.strip().lower()
-    matches = []
-    for cal in calendars:
-        label = cal.name or "(unnamed)"
-        events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not search '{label}'")
-        for event in events:
-            d = _event_to_dict(event, label)
-            haystack = f"{d['title']} {d['description']} {d['location']}".lower()
-            if key in haystack:
-                matches.append(d)
+    try:
+        calendars = [_resolve_calendar(calendar_name)] if calendar_name else _get_calendars()
+        matches = []
+        for cal in calendars:
+            label = cal.name or "(unnamed)"
+            events = _date_search_with_retry(cal, start_dt, end_dt, f"Could not search '{label}'")
+            for event in events:
+                d = _event_to_dict(event, label)
+                haystack = f"{d['title']} {d['description']} {d['location']}".lower()
+                if key in haystack:
+                    matches.append(d)
+    except CalendarConnectivityError as e:
+        matches = _search_events_via_bridge(key, start_dt, end_dt, calendar_name, cause=e)
+
     matches.sort(key=lambda e: e["start"])
     with _last_results_lock:
         _last_results.clear()
         _last_results.extend(matches)
+    return matches
+
+
+def _search_events_via_bridge(key: str, start_dt: datetime, end_dt: datetime, calendar_name: str, cause: Exception) -> list[dict]:
+    if not BRIDGE_ENABLED:
+        raise CalendarError(f"CalDAV is currently unreachable: {cause}")
+    try:
+        bridge_cal = bridge_client.resolve_calendar(calendar_name) if calendar_name else None
+        calendar_id = bridge_cal["id"] if bridge_cal else None
+        raw_events = bridge_client.list_events(start_dt, end_dt, calendar_id=calendar_id)
+    except bridge_client.BridgeError as e:
+        raise CalendarError(f"CalDAV is unreachable ({cause}) and the iCloud bridge also failed: {e}")
+    matches = []
+    for ev in raw_events:
+        d = _bridge_event_to_dict(ev)
+        haystack = f"{d['title']} {d['description']} {d['location']}".lower()
+        if key in haystack:
+            matches.append(d)
     return matches
 
 
@@ -861,10 +1004,14 @@ class _CreateEventInput(BaseModel):
 
 def stage_create_event(title: str, start: str, end: str = None, location: str = "",
                         description: str = "", calendar_name: str = None) -> str:
-    data = _CreateEventInput(
-        title=title, start=start, end=end, location=location,
-        description=description, calendar_name=calendar_name,
-    )
+    try:
+        data = _CreateEventInput(
+            title=title, start=start, end=end, location=location,
+            description=description, calendar_name=calendar_name,
+        )
+    except CalendarConnectivityError as e:
+        return _stage_create_event_via_bridge(title, start, end, location, description, calendar_name, cause=e)
+
     cal, title, location, description = data.calendar, data.title, data.location, data.description
     start_dt, end_dt = data.start_dt, data.end_dt
 
@@ -882,6 +1029,19 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
                 location=location or None, description=description or None,
             )
         except Exception as e:
+            if _is_connectivity_exc(e):
+                # CalDAV was reachable at STAGE time but went down before
+                # CONFIRM - deliberately not auto-switching backends on a
+                # write the user already confirmed (see module docstring's
+                # "BACKEND FALLBACK MODEL" note). A clear failure here is
+                # safer than silently creating the event somewhere the
+                # staged description never mentioned.
+                raise CalendarError(
+                    f"CalDAV became unreachable while confirming this change: {e}. "
+                    f"Try calendar_confirm_pending again once it's back, or "
+                    f"cancel this and re-propose the event so it can go "
+                    f"through the iCloud bridge instead."
+                )
             raise CalendarError(f"Failed to create event: {e}")
         return f"Created '{title}' on {start_dt.strftime('%A %Y-%m-%d')} {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}."
 
@@ -889,6 +1049,77 @@ def stage_create_event(title: str, start: str, end: str = None, location: str = 
             f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
             + (f" at {location}" if location else "")
             + f" (in calendar '{cal.name or '(unnamed)'}')")
+    return _stage(desc, apply_fn)
+
+
+def _stage_create_event_via_bridge(title: str, start: str, end: str, location: str, description: str,
+                                    calendar_name: str, cause: Exception) -> str:
+    """CalDAV was unreachable while resolving a calendar for a new event -
+    build the same staged create against the iCloud bridge instead. Field
+    cleaning/date parsing is redone here independently of _CreateEventInput
+    (a small, deliberate duplication) rather than trying to salvage a
+    pydantic model whose validator raised partway through - see
+    CalendarConnectivityError's docstring for why that's the trigger."""
+    if not BRIDGE_ENABLED:
+        raise CalendarError(f"CalDAV is currently unreachable: {cause}")
+
+    if not (title and title.strip()):
+        raise CalendarError("An event title is required.")
+    cleaned_title = _strip_unsafe_text(title)
+    if not cleaned_title:
+        raise CalendarError(
+            "An event title is required (the title given was emoji/symbols "
+            "only, which had to be removed - see calendar_manager.py's "
+            "_strip_unsafe_text for why)."
+        )
+    cleaned_location = _strip_unsafe_text(location)
+    cleaned_description = _strip_unsafe_text(description)
+    start_dt = _parse_datetime(start)
+    end_dt = _parse_datetime(end) if end else start_dt + timedelta(hours=1)
+    if end_dt <= start_dt:
+        raise CalendarError("Event end time must be after the start time.")
+    start_dt = _localize(start_dt)
+    end_dt = _localize(end_dt)
+
+    try:
+        bridge_cal = bridge_client.resolve_calendar(calendar_name)
+    except bridge_client.BridgeError as e:
+        raise CalendarError(
+            f"CalDAV is unreachable ({cause}) and the iCloud bridge also "
+            f"failed to resolve a calendar: {e}"
+        )
+    bridge_calendar_id = bridge_cal["id"] if bridge_cal else None
+    bridge_calendar_label = bridge_cal["title"] if bridge_cal else "(bridge default)"
+
+    def apply_fn() -> str:
+        try:
+            existing = bridge_client.list_events(
+                start_dt - timedelta(minutes=1), start_dt + timedelta(minutes=1),
+                calendar_id=bridge_calendar_id,
+            )
+        except bridge_client.BridgeError:
+            existing = []  # don't let a failed duplicate-check block the real create attempt
+        target = cleaned_title.strip().lower()
+        for ev in existing:
+            if (ev.get("title") or "").strip().lower() == target:
+                return (f"'{cleaned_title}' on {start_dt.strftime('%A %Y-%m-%d')} "
+                         f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')} already exists - "
+                         f"not creating a duplicate.")
+        try:
+            bridge_client.create_event(
+                cleaned_title, start_dt, end_dt, calendar_id=bridge_calendar_id,
+                location=cleaned_location, description=cleaned_description,
+            )
+        except bridge_client.BridgeError as e:
+            raise CalendarError(f"Failed to create event via iCloud bridge: {e}")
+        return (f"Created '{cleaned_title}' on {start_dt.strftime('%A %Y-%m-%d')} "
+                f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')} (via iCloud bridge).")
+
+    desc = (f"CREATE '{cleaned_title}' on {start_dt.strftime('%a %Y-%m-%d')} "
+            f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
+            + (f" at {cleaned_location}" if cleaned_location else "")
+            + f" (in bridge calendar '{bridge_calendar_label}' - CalDAV is "
+            + f"currently unreachable: {cause})")
     return _stage(desc, apply_fn)
 
 
@@ -1201,17 +1432,45 @@ def _get_event_by_uid_via_search(calendar_name: str, uid: str):
     return _search_calendars_for_uid(calendars, uid)
 
 
-def _find_event_with_fallback(calendar_name: str, event_uid: str):
-    """Resolve an event by UID, scanning all calendars unless calendar_name
-    narrows it. Falls back to the sole most-recent list/search result if
-    either the UID wasn't found OR calendar_name itself doesn't match any
-    real calendar - the model has been observed fabricating BOTH a
-    plausible-looking UID and a plausible-looking calendar name on the same
-    call, not just the UID. A bad calendar_name must not hard-fail before
-    this fallback gets a chance to run. Returns (event, calendar,
-    resolved_uid, was_corrected)."""
+def _find_event_with_fallback(calendar_name: str, event_uid: str) -> dict:
+    """Resolve an event by its (backend-prefixed) uid. Routes straight to
+    whichever backend the prefix names - there's no cross-backend
+    guessing, since an EventKit identifier and an iCalendar UID are
+    different id spaces entirely; a "bridge:" id can only ever be found
+    via the bridge and vice versa.
+
+    Falls back to the sole most-recent list/search result if the uid/
+    calendar_name look fabricated, same rescue behavior this had before
+    backend-prefixing, just backend-aware now.
+
+    Returns a dict shaped either
+      {"backend": "caldav", "event": <caldav Event>, "calendar": <caldav Calendar>,
+       "uid": "caldav:...", "corrected": bool}
+    or
+      {"backend": "bridge", "raw_id": "...", "uid": "bridge:...",
+       "title": "...", "corrected": bool}
+    stage_edit_event/stage_delete_event branch on "backend" to build the
+    right apply_fn."""
+    backend, raw_id = _split_uid(event_uid)
+
+    if backend == "bridge":
+        return _find_bridge_event_with_fallback(raw_id, event_uid)
+
     try:
-        event, cal = _get_event_by_uid_via_search(calendar_name, event_uid)
+        event, cal = _get_event_by_uid_via_search(calendar_name, raw_id)
+    except CalendarConnectivityError as e:
+        # Distinct from the generic except below: this uid was found via
+        # CalDAV, so CalDAV being down right now is the actual reason it
+        # can't be looked up - falling through to "not found" would be a
+        # misleading answer. Raise immediately with an honest explanation
+        # instead of letting the rescue-pool logic paper over it.
+        raise CalendarError(
+            f"CalDAV is currently unreachable ({e}), so this event (found "
+            f"via CalDAV) can't be looked up right now. If you just ran "
+            f"calendar_list_events/calendar_search_events and it returned a "
+            f"'bridge:' uid instead, use that one - it routes through the "
+            f"iCloud bridge automatically."
+        )
     except CalendarError:
         # calendar_name didn't resolve to a real calendar - don't give up,
         # fall through to the last-result rescue below just like an
@@ -1219,7 +1478,8 @@ def _find_event_with_fallback(calendar_name: str, event_uid: str):
         event, cal = None, None
 
     if event is not None:
-        return event, cal, event_uid, False
+        return {"backend": "caldav", "event": event, "calendar": cal,
+                "uid": f"caldav:{raw_id}", "corrected": False}
 
     with _last_results_lock:
         candidates = list(_last_results)
@@ -1236,11 +1496,17 @@ def _find_event_with_fallback(calendar_name: str, event_uid: str):
         pool = candidates
 
     if len(pool) == 1:
-        corrected_uid = pool[0]["uid"]
+        corrected_uid_full = pool[0]["uid"]  # already backend-prefixed
+        corrected_backend, corrected_raw = _split_uid(corrected_uid_full)
+        if corrected_backend == "bridge":
+            result = _find_bridge_event_with_fallback(corrected_raw, corrected_uid_full)
+            result["corrected"] = corrected_uid_full != event_uid
+            return result
         corrected_cal_name = pool[0].get("calendar")
-        corrected_event, corrected_cal = _get_event_by_uid_via_search(corrected_cal_name, corrected_uid)
+        corrected_event, corrected_cal = _get_event_by_uid_via_search(corrected_cal_name, corrected_raw)
         if corrected_event is not None:
-            return corrected_event, corrected_cal, corrected_uid, corrected_uid != event_uid
+            return {"backend": "caldav", "event": corrected_event, "calendar": corrected_cal,
+                    "uid": corrected_uid_full, "corrected": corrected_uid_full != event_uid}
 
     raise CalendarError(
         f"Could not find an event with uid '{event_uid}' in the last "
@@ -1248,6 +1514,30 @@ def _find_event_with_fallback(calendar_name: str, event_uid: str):
         f"window. Call calendar_list_events or calendar_search_events again "
         f"to get the exact uid, then retry using that exact value."
     )
+
+
+def _find_bridge_event_with_fallback(raw_id: str, full_uid: str) -> dict:
+    """The bridge has no GET-single-event endpoint (only a date-range
+    list), so a bridge id can't be independently re-verified the way a
+    CalDAV UID can via a fresh date_search. Instead this requires the id
+    to still be present in _last_results - the same cache
+    stage_edit_event/stage_delete_event already rely on for the
+    fabricated-uid rescue - which is guaranteed to hold it if the model's
+    uid actually came from a real list_events/search_events call moments
+    earlier, and correctly refuses otherwise rather than silently trusting
+    an unverifiable id."""
+    with _last_results_lock:
+        candidates = list(_last_results)
+    match = next((c for c in candidates if c.get("uid") == full_uid), None)
+    if match is None:
+        raise CalendarError(
+            f"Could not confirm bridge event '{full_uid}' still exists - it "
+            f"wasn't in the most recent calendar_list_events/"
+            f"calendar_search_events result. Call one of those again to get "
+            f"a fresh uid, then retry using that exact value."
+        )
+    return {"backend": "bridge", "raw_id": raw_id, "uid": full_uid,
+            "title": match.get("title") or "(no title)", "corrected": False}
 
 
 def _require_event_uid(v: str) -> str:
@@ -1348,7 +1638,7 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
     )
     title, location, description = data.title, data.location, data.description
     start_dt, end_dt = data.start_dt, data.end_dt
-    event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, data.event_uid)
+    found = _find_event_with_fallback(calendar_name, data.event_uid)
 
     changes = []
     if title:
@@ -1363,6 +1653,26 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
         changes.append("description updated")
     if not changes:
         raise CalendarError("No fields to change were provided.")
+
+    if found["backend"] == "bridge":
+        raw_id = found["raw_id"]
+        event_uid = found["uid"]
+
+        def apply_fn() -> str:
+            try:
+                bridge_client.update_event(
+                    raw_id, title=title, start_dt=start_dt, end_dt=end_dt,
+                    location=location, description=description,
+                )
+            except bridge_client.BridgeError as e:
+                raise CalendarError(f"Failed to edit event via iCloud bridge: {e}")
+            return f"Edited event {event_uid} (via iCloud bridge): {', '.join(changes)}."
+
+        desc = (f"EDIT event {event_uid} (via iCloud bridge - CalDAV was "
+                f"unreachable when this event was found): {', '.join(changes)}")
+        return _stage(desc, apply_fn)
+
+    event, cal, event_uid = found["event"], found["calendar"], found["uid"]
 
     def apply_fn() -> str:
         try:
@@ -1383,11 +1693,18 @@ def stage_edit_event(event_uid: str, title: str = None, start: str = None, end: 
                     comp["DESCRIPTION"] = description
             event.save()
         except Exception as e:
+            if _is_connectivity_exc(e):
+                raise CalendarError(
+                    f"CalDAV became unreachable while confirming this change: "
+                    f"{e}. Try calendar_confirm_pending again once it's back - "
+                    f"this event was found via CalDAV, so it can't be retried "
+                    f"through the bridge automatically."
+                )
             raise CalendarError(f"Failed to edit event: {e}")
         return f"Edited event {event_uid}: {', '.join(changes)}."
 
     desc = f"EDIT event {event_uid}: {', '.join(changes)}"
-    if corrected:
+    if found.get("corrected"):
         desc += " (auto-matched to the event just shown in your last search/list result)"
     return _stage(desc, apply_fn)
 
@@ -1406,7 +1723,23 @@ class _DeleteEventInput(BaseModel):
 
 def stage_delete_event(event_uid: str, calendar_name: str = None) -> str:
     data = _DeleteEventInput(event_uid=event_uid, calendar_name=calendar_name)
-    event, cal, event_uid, corrected = _find_event_with_fallback(calendar_name, data.event_uid)
+    found = _find_event_with_fallback(calendar_name, data.event_uid)
+
+    if found["backend"] == "bridge":
+        raw_id, event_uid, title = found["raw_id"], found["uid"], found["title"]
+
+        def apply_fn() -> str:
+            try:
+                bridge_client.delete_event(raw_id)
+            except bridge_client.BridgeError as e:
+                raise CalendarError(f"Failed to delete event via iCloud bridge: {e}")
+            return f"Deleted '{title}' (via iCloud bridge)."
+
+        desc = (f"DELETE event '{title}' (uid {event_uid}, via iCloud bridge "
+                f"- CalDAV was unreachable when this event was found)")
+        return _stage(desc, apply_fn)
+
+    event, event_uid = found["event"], found["uid"]
     try:
         title = _ical_field(event.icalendar_component, "summary", event_uid)
     except Exception as e:
@@ -1416,11 +1749,18 @@ def stage_delete_event(event_uid: str, calendar_name: str = None) -> str:
         try:
             event.delete()
         except Exception as e:
+            if _is_connectivity_exc(e):
+                raise CalendarError(
+                    f"CalDAV became unreachable while confirming this "
+                    f"change: {e}. Try calendar_confirm_pending again once "
+                    f"it's back - this event was found via CalDAV, so it "
+                    f"can't be retried through the bridge automatically."
+                )
             raise CalendarError(f"Failed to delete event: {e}")
         return f"Deleted '{title}'."
 
     desc = f"DELETE event '{title}' (uid {event_uid})"
-    if corrected:
+    if found.get("corrected"):
         desc += " (auto-matched to the event just shown in your last search/list result)"
     return _stage(desc, apply_fn)
 
