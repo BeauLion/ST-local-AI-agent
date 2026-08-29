@@ -41,7 +41,9 @@ import icalendar
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from console_log import alog
 from config import (
+    CALDAV_LOG_RAW_REQUESTS,
     CALDAV_TIMEOUT_SECONDS,
     CALENDAR_BATCH_DEFAULT_DURATION_MINUTES,
     CALENDAR_BATCH_MAX_EVENTS,
@@ -115,6 +117,57 @@ def _get_credentials() -> tuple[str, str]:
     return username, password
 
 
+# Header names never to write to the log, even though caldav's own request()
+# call rarely carries auth here (requests' auth= kwarg is applied later,
+# inside _sync_request) - kept as a defensive redaction, not a load-bearing
+# one.
+_CALDAV_REDACT_HEADERS = {"authorization", "cookie"}
+
+
+def _wrap_request_logging(client: caldav.DAVClient) -> None:
+    """Wrap this client's request() so every raw HTTP request it sends to
+    the CalDAV server - PROPFIND, REPORT, PUT, DELETE, everything - is
+    captured via console_log.alog(). main.py already flushes that buffer
+    into the per-iteration prompt log entry (see log_console() in
+    prompt_log_engine.py), so wrapping it here is enough to make raw CalDAV
+    traffic show up in prompt_log_viewer.html - no viewer changes needed.
+
+    request() is DAVClient's single choke point: every higher-level call
+    (propfind/report/put/delete/...) routes through self.request(...), so
+    wrapping it here catches all of them in one place.
+
+    Reassigns the instance attribute rather than patching the class, so it
+    only affects this one cached client (see _get_client()) and can't leak
+    into some other DAVClient instance elsewhere.
+
+    Gated by CALDAV_LOG_RAW_REQUESTS, independent of PROMPT_LOG_ENABLED -
+    see config.py for why."""
+    if not CALDAV_LOG_RAW_REQUESTS:
+        return
+    original_request = client.request
+
+    def logged_request(url, method="GET", body="", headers=None, *args, **kwargs):
+        safe_headers = {
+            k: ("<redacted>" if k.lower() in _CALDAV_REDACT_HEADERS else v)
+            for k, v in (headers or {}).items()
+        }
+        alog(
+            f"[CalDAV] --> {method} {url}\n"
+            f"[CalDAV]     headers: {json.dumps(safe_headers)}\n"
+            f"[CalDAV]     body:\n{body if body else '(empty)'}"
+        )
+        try:
+            response = original_request(url, method, body, headers, *args, **kwargs)
+        except Exception as e:
+            alog(f"[CalDAV] <-- ERROR {method} {url}: {e}")
+            raise
+        status = getattr(getattr(response, "response", None), "status_code", "?")
+        alog(f"[CalDAV] <-- {status} {method} {url}")
+        return response
+
+    client.request = logged_request
+
+
 def _get_client() -> caldav.DAVClient:
     global _cached_client
     with _client_lock:
@@ -125,6 +178,7 @@ def _get_client() -> caldav.DAVClient:
                     url=ICLOUD_CALDAV_URL, username=username, password=password,
                     timeout=CALDAV_TIMEOUT_SECONDS,
                 )
+                _wrap_request_logging(client)
                 client.principal()  # forces a round-trip now, not on first real use
             except Exception as e:
                 raise CalendarError(

@@ -289,7 +289,18 @@ CALENDAR_TIMEZONE = "Europe/Amsterdam"
 # Per-request timeout (seconds) for all CalDAV calls to iCloud. Previously
 # unset, which let a single stalled request hang on whatever the caldav
 # library's internal default is (~120s) with no way to recover from it.
-CALDAV_TIMEOUT_SECONDS = 45
+CALDAV_TIMEOUT_SECONDS = 30
+
+# When True, every raw HTTP request calendar_manager sends to the CalDAV
+# server (PROPFIND/REPORT/PUT/DELETE - method, URL, headers, body) is
+# written via console_log.alog(), which main.py already flushes into the
+# per-iteration prompt log - so these show up in prompt_log_viewer.html
+# with no extra plumbing. Independent of PROMPT_LOG_ENABLED: that flag
+# turns the whole prompt-log file off, this one just controls whether
+# CalDAV traffic specifically gets added to the console buffer (REPORT
+# bodies especially can be sizeable, so this can be flipped off without
+# losing the rest of the log).
+CALDAV_LOG_RAW_REQUESTS = True
 
 # Extra attempts (beyond the first) confirm_pending() makes if writing a
 # staged change to iCloud fails, with a short delay between attempts.
