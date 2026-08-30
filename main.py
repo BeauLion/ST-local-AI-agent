@@ -2121,6 +2121,16 @@ async def memory_browser_page():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
+@app.get("/dashboard")
+async def dashboard_page():
+    """Combined prompt-log-viewer + settings-panel page, tabbed. Reuses
+    both pages' existing CSS/JS verbatim (served by prompt_log_engine.py
+    and settings_engine.py respectively) - this route only serves the
+    shell that tabs between them."""
+    html_path = Path(__file__).parent / "web" / "dashboard.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
 # ---------------------------------------------------------------------------
 # Prompt-log viewer HTTP API (/prompt-logs*, /notes/search, and the viewer
 # page itself) now lives in prompt_log_engine.py, mounted above via

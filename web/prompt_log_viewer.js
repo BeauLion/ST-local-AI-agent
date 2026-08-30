@@ -1,3 +1,10 @@
+// Wrapped in an IIFE so this file's top-level names (render, groups, etc.)
+// never leak into the shared global scope - needed since web/dashboard.html
+// loads this alongside settings_panel.js as two plain (non-module) scripts
+// on the same page, and both used to declare a top-level `render`, which
+// silently clobbered each other there (whichever script ran second won).
+(function () {
+
 const ROLE_COLORS = {
   system: 'role-system', user: 'role-user', assistant: 'role-assistant',
   tool: 'role-tool', tools: 'role-tools', console: 'role-console',
@@ -606,3 +613,5 @@ document.getElementById('collapseAllBtn').addEventListener('click', () => {
 });
 
 loadFileList();
+
+})();

@@ -1,5 +1,11 @@
+// Wrapped in an IIFE so this file's top-level names (render, save, etc.)
+// never leak into the shared global scope - needed since web/dashboard.html
+// loads this alongside prompt_log_viewer.js as two plain (non-module)
+// scripts on the same page; see the matching comment there.
+(function () {
+
 const groupsEl = document.getElementById("groups");
-const statusEl = document.getElementById("status");
+const statusEl = document.getElementById("settingsStatus");
 const resetAllBtn = document.getElementById("reset-all");
 
 function showStatus(msg, ok) {
@@ -135,3 +141,5 @@ resetAllBtn.onclick = async () => {
 };
 
 loadSettings();
+
+})();
