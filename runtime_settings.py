@@ -134,6 +134,18 @@ SCHEMA = {
         "label": "Log raw CalDAV requests",
         "help": "Include raw CalDAV HTTP traffic in the console log.",
     },
+    "ATTIRE_SUBAGENT_ENABLED": {
+        "type": "bool",
+        "default": config.ATTIRE_SUBAGENT_ENABLED, "group": "Toggles",
+        "label": "Attire sub-agent",
+        "help": "Run the post-turn attire tracking pass after every turn. Off = no background pass, no wait on the next turn.",
+    },
+    "BRIDGE_ENABLED": {
+        "type": "bool",
+        "default": config.BRIDGE_ENABLED, "group": "Toggles",
+        "label": "iCloud bridge fallback",
+        "help": "Fall back to the EventKit bridge when CalDAV is unreachable. Off = a CalDAV outage just fails, no bridge attempt.",
+    },
 }
 
 _overrides: dict = {}

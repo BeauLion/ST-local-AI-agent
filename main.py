@@ -48,7 +48,6 @@ from settings_engine import router as settings_router
 import runtime_settings
 from config import (
     AGENT_API_KEY,
-    ATTIRE_SUBAGENT_ENABLED,
     ATTIRE_SUBAGENT_TIMEOUT_SECONDS,
     CORS_ALLOWED_ORIGINS,
     DELETE_FILE_ALLOWED_EXTENSIONS,
@@ -835,8 +834,10 @@ def _spawn_attire_subagent(user_text: str, assistant_text: str) -> None:
     No-ops entirely when ATTIRE_SUBAGENT_ENABLED is False - this is the
     single choke point for the feature, so disabling it here also means
     the wait-with-timeout block in chat_completions has nothing to wait
-    on (since _attire_subagent_task never gets set) and is skipped too."""
-    if not ATTIRE_SUBAGENT_ENABLED:
+    on (since _attire_subagent_task never gets set) and is skipped too.
+    Read live (not imported once at module load) so a flip in the
+    settings panel takes effect on the very next turn."""
+    if not runtime_settings.get("ATTIRE_SUBAGENT_ENABLED"):
         return
     global _attire_subagent_task
     task = asyncio.create_task(

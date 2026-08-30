@@ -76,7 +76,6 @@ import bridge_client
 import runtime_settings
 from console_log import alog
 from config import (
-    BRIDGE_ENABLED,
     CALDAV_TIMEOUT_SECONDS,
     CALENDAR_BATCH_DEFAULT_DURATION_MINUTES,
     CALENDAR_BATCH_MAX_EVENTS,
@@ -654,7 +653,7 @@ def _list_events_via_bridge(start_dt: datetime, end_dt: datetime, calendar_name:
     iCloud bridge instead. Not gated on BRIDGE_ENABLED at the call site;
     that's checked once here so every read/write fallback path shares one
     rule for whether attempting the bridge at all is worth it."""
-    if not BRIDGE_ENABLED:
+    if not runtime_settings.get("BRIDGE_ENABLED"):
         raise CalendarError(f"CalDAV is currently unreachable: {cause}")
     try:
         bridge_cal = bridge_client.resolve_calendar(calendar_name) if calendar_name else None
@@ -698,7 +697,7 @@ def search_events(query: str, start: str = None, end: str = None, calendar_name:
 
 
 def _search_events_via_bridge(key: str, start_dt: datetime, end_dt: datetime, calendar_name: str, cause: Exception) -> list[dict]:
-    if not BRIDGE_ENABLED:
+    if not runtime_settings.get("BRIDGE_ENABLED"):
         raise CalendarError(f"CalDAV is currently unreachable: {cause}")
     try:
         bridge_cal = bridge_client.resolve_calendar(calendar_name) if calendar_name else None
@@ -1060,7 +1059,7 @@ def _stage_create_event_via_bridge(title: str, start: str, end: str, location: s
     (a small, deliberate duplication) rather than trying to salvage a
     pydantic model whose validator raised partway through - see
     CalendarConnectivityError's docstring for why that's the trigger."""
-    if not BRIDGE_ENABLED:
+    if not runtime_settings.get("BRIDGE_ENABLED"):
         raise CalendarError(f"CalDAV is currently unreachable: {cause}")
 
     if not (title and title.strip()):
