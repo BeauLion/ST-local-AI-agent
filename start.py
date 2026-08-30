@@ -1,26 +1,34 @@
 """
-start.py — one script to launch everything.
+start.py — launches the agent server.
 
-Run this instead of typing two separate commands in two terminals:
+llama-server is now launched and owned by main.py itself (see
+model_manager.py + its lifespan hook in main.py), not by this script -
+that's what lets /model/swap stop and restart llama-server on request
+without you touching a terminal. This script's job shrank to just:
+
+  1. Launch the agent server (uvicorn) and wait for it to report ready
+     (main.py's own lifespan blocks serving until llama-server's health
+     check passes, so "ready" here already means the model is loaded)
+  2. Stream its output into this one terminal
+  3. On Ctrl+C, shut it down cleanly
+
+Run with:
     python start.py
 
-It will:
-  1. Launch llama-server using the command built from config.py
-  2. Wait until llama-server responds to health checks (so the agent
-     server never starts before the model is actually ready)
-  3. Launch the agent server (uvicorn)
-  4. Stream both processes' output into this one terminal
-  5. On Ctrl+C, shut both processes down cleanly
-
-If either process fails to start, this script will tell you which one
-and why, instead of leaving you guessing.
+NOTE ON --reload: intentionally OFF below. With llama-server's lifecycle
+now tied to main.py's own startup/shutdown, uvicorn's --reload would
+restart llama-server (a 10-60+ second model load) every time you save a
+change to any .py file in this folder while actively developing main.py -
+not just main.py itself, since --reload watches the whole directory.
+If you're doing heavy main.py development, run
+`uvicorn main:app --host 0.0.0.0 --port 8100 --reload` directly instead
+of this script for that session; use start.py for normal day-to-day use.
 """
 
 import subprocess
 import sys
 import time
 import signal
-import threading
 import os
 import httpx
 
@@ -32,65 +40,13 @@ def stream_output(proc: subprocess.Popen, label: str):
         print(f"[{label}] {line}", end="")
 
 
-def start_llama_server() -> subprocess.Popen:
-    cmd = config.build_llama_server_command()
-    print(f"[start.py] Launching llama-server:\n  {' '.join(cmd)}\n")
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            # Without this, Windows decodes the pipe using the legacy
-            # cp1252 codepage regardless of what encoding llama-server
-            # actually writes in, and any non-cp1252 byte sequence crashes
-            # start.py entirely (see the matching fix in start_agent_server
-            # below - both ends of a pipe need to agree on UTF-8).
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError:
-        print(f"[start.py] ERROR: could not find llama-server.exe at:")
-        print(f"  {config.LLAMA_SERVER_EXE}")
-        print("  Check LLAMA_SERVER_EXE in config.py.")
-        sys.exit(1)
-
-    # Read llama-server's output continuously on a background thread.
-    # Without this, its stdout pipe buffer fills up once it writes enough
-    # startup text and the process silently hangs, never finishing boot.
-    threading.Thread(
-        target=stream_output, args=(proc, "llama"), daemon=True
-    ).start()
-
-    return proc
-
-
-def wait_for_llama_server(timeout_seconds: int = 120) -> bool:
-    """Polls llama-server until it responds or we give up."""
-    url = f"{config.LLAMA_SERVER_URL}/health"
-    print(f"[start.py] Waiting for llama-server to become ready at {url} ...")
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        try:
-            resp = httpx.get(url, timeout=2)
-            if resp.status_code == 200:
-                print("[start.py] llama-server is ready.\n")
-                return True
-        except httpx.RequestError:
-            pass
-        time.sleep(1)
-    return False
-
-
 def start_agent_server() -> subprocess.Popen:
     cmd = [
         sys.executable, "-m", "uvicorn", "main:app",
         "--host", config.AGENT_SERVER_HOST,
         "--port", str(config.AGENT_SERVER_PORT),
-        "--reload",
     ]
-    print(f"[start.py] Launching agent server:\n  {' '.join(cmd)}\n")
+    print(f"[start.py] Launching agent server (which will launch llama-server itself):\n  {' '.join(cmd)}\n")
 
     # Force unbuffered stdout on the child process. Without this, print()
     # statements in main.py (our [AGENT] logs) get block-buffered because
@@ -121,28 +77,43 @@ def start_agent_server() -> subprocess.Popen:
     )
 
 
+def wait_for_agent_server(timeout_seconds: int = 180) -> bool:
+    """
+    Polls the agent server's own health, which only starts responding once
+    its lifespan startup (llama-server launch + health check) has finished -
+    so "ready" here means the whole stack is up, model included. Longer
+    default timeout than the old llama-only wait, since it now also covers
+    llama-server's own load time inside it.
+    """
+    url = f"http://localhost:{config.AGENT_SERVER_PORT}/model/status"
+    print(f"[start.py] Waiting for the agent server (and llama-server) to become ready at {url} ...")
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            resp = httpx.get(url, timeout=2)
+            if resp.status_code == 200 and resp.json().get("phase") == "ready":
+                print("[start.py] Agent server and llama-server are both ready.\n")
+                return True
+        except httpx.RequestError:
+            pass
+        time.sleep(1)
+    return False
+
+
 def main():
-    llama_proc = start_llama_server()
-
-    if not wait_for_llama_server():
-        print("[start.py] ERROR: llama-server did not become ready in time.")
-        print("  Check the output above for errors (e.g. model download, VRAM issues).")
-        llama_proc.terminate()
-        sys.exit(1)
-
     agent_proc = start_agent_server()
 
     def shutdown(signum=None, frame=None):
         print("\n[start.py] Shutting down...")
         agent_proc.terminate()
-        llama_proc.terminate()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
 
-    # Stream agent server output on the main thread. llama-server's own
-    # output has already been flowing since it started; we don't need to
-    # interleave it further, agent server logs are what you'll watch most.
+    if not wait_for_agent_server():
+        print("[start.py] WARNING: didn't confirm ready in time - check the output below for errors.")
+        print("  (The agent server keeps running either way; this is just a startup confirmation check.)")
+
     try:
         stream_output(agent_proc, "agent")
     except KeyboardInterrupt:

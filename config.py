@@ -67,20 +67,34 @@ LLAMA_MD = "./llama.cpp/mtp-gemma-4-12B-it.gguf"
 LLAMA_SPEC_TYPE = "draft-mtp"
 #LLAMA_MMPROJ = "./llama.cpp/mmproj-Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf"
 
-def build_llama_server_command() -> list[str]:
+def build_llama_server_command(
+    *,
+    model_repo: str | None = None,
+    ngl: int | None = None,
+    context: int | None = None,
+    md: str | None = None,
+    spec_type: str | None = None,
+) -> list[str]:
     """
     Builds the full llama-server launch command as a list of arguments,
     ready to pass to subprocess.Popen(). Mirrors exactly what you'd type
     by hand in PowerShell, just assembled from the settings above.
+
+    The keyword overrides let model_manager.py launch llama-server with a
+    different model/ngl/context without touching the module-level
+    constants above - those still define what boots on a fresh start.py
+    run (see model_manager.py's persisted model_state.json for what
+    ACTUALLY boots after you've swapped at least once) and what "reset to
+    defaults" resets to.
     """
     cmd = [
         LLAMA_SERVER_EXE,
-        "-hf", LLAMA_MODEL_REPO,
-        "-md", LLAMA_MD,
-        "--spec-type", LLAMA_SPEC_TYPE,
+        "-hf", model_repo or LLAMA_MODEL_REPO,
+        "-md", md or LLAMA_MD,
+        "--spec-type", spec_type or LLAMA_SPEC_TYPE,
         #"--mmproj", LLAMA_MMPROJ,
-        "-ngl", str(LLAMA_NGL),
-        "-c", str(LLAMA_CONTEXT),
+        "-ngl", str(ngl if ngl is not None else LLAMA_NGL),
+        "-c", str(context if context is not None else LLAMA_CONTEXT),
         "--temp", str(LLAMA_TEMP),
         "--host", LLAMA_SERVER_HOST,
         "--port", str(LLAMA_SERVER_PORT),
@@ -95,6 +109,30 @@ def build_llama_server_command() -> list[str]:
     if LLAMA_USE_JINJA:
         cmd.append("--jinja")
     return cmd
+
+
+# Optional one-tap swap targets for the settings panel's Model tab, so you
+# don't have to type a full -hf repo string on your phone. Purely
+# optional - the panel also has free-text fields for repo/ngl/context for
+# anything not listed here. Omitted ngl/context/md/spec_type per preset
+# fall back to whatever's CURRENTLY running, not to the defaults above.
+MODEL_PRESETS = [
+    # {"label": "Gemma 4 12B (current default)", "repo": LLAMA_MODEL_REPO,
+    #  "ngl": LLAMA_NGL, "context": LLAMA_CONTEXT, "md": LLAMA_MD, "spec_type": LLAMA_SPEC_TYPE},
+    # {"label": "Qwen3 14B", "repo": "Qwen/Qwen3-14B-GGUF:Q4_K_M", "ngl": 99, "context": 32768},
+]
+
+# How long (seconds) a model swap waits for llama-server's /health to
+# return 200 before giving up (and, for a swap, rolling back to the
+# previous model). Bigger models or a cold Hugging Face download need
+# more time than swapping between two already-cached GGUFs - tune this up
+# if you hit false-positive rollbacks on a fresh model you haven't run
+# before.
+LLAMA_SWAP_TIMEOUT_SECONDS = 180
+
+# How long (seconds) to wait for the OLD llama-server process to exit
+# cleanly (SIGTERM) before force-killing it, when starting up or swapping.
+LLAMA_STOP_TIMEOUT_SECONDS = 15
 
 
 # ─────────────────────────────────────────────────────────────

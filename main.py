@@ -45,7 +45,9 @@ from duration_manager import DurationError
 from project_manager import ProjectManagerError
 from prompt_log_engine import log_prompt, log_console, router as prompt_log_router
 from settings_engine import router as settings_router
+from model_engine import router as model_router
 import runtime_settings
+import model_manager
 from config import (
     AGENT_API_KEY,
     ATTIRE_SUBAGENT_TIMEOUT_SECONDS,
@@ -72,16 +74,24 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # llama-server is now launched and owned by THIS process (moved out of
+    # start.py - see the comment at the top of the new start.py) so that
+    # /model/swap can stop and restart it on request. Blocking calls run in
+    # a thread so they don't freeze the event loop, though nothing else is
+    # being served yet at this point anyway.
+    await asyncio.to_thread(model_manager.startup)
     # Starts the calendar cache's background refresh thread once, when the
     # server actually comes up (not on every reload-triggered reimport -
     # see calendar_manager.start_background_refresh()'s own guard too).
     calendar_manager.start_background_refresh()
     yield
+    await asyncio.to_thread(model_manager.shutdown)
 
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(prompt_log_router)
 app.include_router(settings_router)
+app.include_router(model_router)
 
 
 # ---------------------------------------------------------------------------
@@ -2443,6 +2453,20 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request):
+    # A model swap stops llama-server entirely for a window - fail fast
+    # with a clear reason instead of SillyTavern seeing a bare connection
+    # error and the user wondering what broke.
+    model_state = model_manager.status()
+    if model_state["phase"] != "ready":
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "message": f"llama-server is currently {model_state['phase']} "
+                           f"(model swap in progress?) - try again shortly.",
+                "type": "model_unavailable",
+            }},
+        )
+
     body = await request.json()
     client_wants_stream = body.get("stream", False)
 

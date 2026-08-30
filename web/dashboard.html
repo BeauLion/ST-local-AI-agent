@@ -13,7 +13,7 @@
      and the settings tab's max-width wrapper (previously done via body
      padding, now scoped to its own panel instead). */
   body { margin: 0; padding: 0; }
-  #tab-settings .wrap { max-width: 720px; margin: 0 auto; padding: 24px; }
+  #tab-settings .wrap, #tab-model .wrap { max-width: 720px; margin: 0 auto; padding: 24px; }
 
   .tab-bar {
     display: flex;
@@ -44,6 +44,7 @@
 <nav class="tab-bar">
   <button class="tab-btn" data-tab="logs">Prompt Log</button>
   <button class="tab-btn" data-tab="settings">Settings</button>
+  <button class="tab-btn" data-tab="model">Model</button>
 </nav>
 
 <section id="tab-logs" class="tab-panel">
@@ -89,7 +90,7 @@
   <div class="wrap">
     <header>
       <h1>Agent Settings</h1>
-      <p class="sub">Changes apply immediately — no restart needed. Model/port/context still require restarting <code>start.py</code>.</p>
+      <p class="sub">Changes apply immediately — no restart needed. Port/host/Docker settings still require restarting <code>start.py</code>. Model swaps are on the Model tab, also no restart needed.</p>
     </header>
     <div id="settingsStatus" class="status" hidden></div>
     <div id="groups"></div>
@@ -99,8 +100,49 @@
   </div>
 </section>
 
+<section id="tab-model" class="tab-panel">
+  <div class="wrap">
+    <header>
+      <h1>Model</h1>
+      <p class="sub">Swapping stops and restarts llama-server automatically — chat pauses for the duration (usually 10&ndash;60s for an already-downloaded GGUF, longer for a fresh Hugging Face download). A failed swap rolls back to the previous model on its own.</p>
+    </header>
+    <div id="modelStatus" class="status" hidden></div>
+
+    <div class="group">
+      <h2>Currently running</h2>
+      <div id="modelInfo"></div>
+    </div>
+
+    <div class="group">
+      <h2>Swap to</h2>
+      <div class="row">
+        <div class="label"><div class="name">Preset</div></div>
+        <select id="modelPresetSelect" style="flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px;"></select>
+      </div>
+      <div class="row">
+        <div class="label"><div class="name">Repo (-hf string)</div><div class="help">e.g. Qwen/Qwen3-14B-GGUF:Q4_K_M. Ignored if a preset is selected above.</div></div>
+        <input type="text" id="modelRepoInput" style="flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px;">
+      </div>
+      <div class="row">
+        <div class="label"><div class="name">GPU layers (ngl)</div><div class="help">Leave blank to keep the current value.</div></div>
+        <input type="number" id="modelNglInput">
+      </div>
+      <div class="row">
+        <div class="label"><div class="name">Context</div><div class="help">Leave blank to keep the current value.</div></div>
+        <input type="number" id="modelContextInput">
+      </div>
+    </div>
+
+    <footer style="display:flex; justify-content:space-between;">
+      <button id="modelResetBtn" class="danger">Reset to config.py default model</button>
+      <button id="modelSwapBtn" style="background:var(--accent); border:none; color:white; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:13px;">Swap model</button>
+    </footer>
+  </div>
+</section>
+
 <script src="/prompt_log_viewer.js" defer></script>
 <script src="/settings_panel.js" defer></script>
+<script src="/model_panel.js" defer></script>
 <script>
   // Tab switching, plus remembering the last-open tab per browser (not
   // synced anywhere - purely a local convenience) so a refresh lands back
