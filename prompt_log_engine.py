@@ -33,7 +33,8 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
-from config import PROMPT_LOG_DIR, PROMPT_LOG_ENABLED
+import runtime_settings
+from config import PROMPT_LOG_DIR
 from console_log import alog, flush as flush_console
 
 # ---------------------------------------------------------------------------
@@ -96,7 +97,7 @@ def log_prompt(upstream_body: dict, iteration: int, section_labels: list[str], t
     beyond that list's length is ordinary conversation history/tool-call
     round-trip messages, which grow between iterations. Best-effort: a
     write failure is printed but never blocks the actual turn."""
-    if not PROMPT_LOG_ENABLED:
+    if not runtime_settings.get("PROMPT_LOG_ENABLED"):
         return
     try:
         chunks = []
@@ -159,7 +160,7 @@ def log_console(iteration: int, response: dict | None = None, thinking: str | No
     populated when llama-server is run with --reasoning-format and the
     loaded model actually emits one). Writes nothing if there's nothing at
     all to record, so quiet iterations don't clutter the log."""
-    if not PROMPT_LOG_ENABLED:
+    if not runtime_settings.get("PROMPT_LOG_ENABLED"):
         flush_console()  # still drain it so it can't leak into a later request
         return
     lines = flush_console()

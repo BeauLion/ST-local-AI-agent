@@ -73,10 +73,10 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 import bridge_client
+import runtime_settings
 from console_log import alog
 from config import (
     BRIDGE_ENABLED,
-    CALDAV_LOG_RAW_REQUESTS,
     CALDAV_TIMEOUT_SECONDS,
     CALENDAR_BATCH_DEFAULT_DURATION_MINUTES,
     CALENDAR_BATCH_MAX_EVENTS,
@@ -204,7 +204,7 @@ def _wrap_request_logging(client: caldav.DAVClient) -> None:
 
     Gated by CALDAV_LOG_RAW_REQUESTS, independent of PROMPT_LOG_ENABLED -
     see config.py for why."""
-    if not CALDAV_LOG_RAW_REQUESTS:
+    if not runtime_settings.get("CALDAV_LOG_RAW_REQUESTS"):
         return
     original_request = client.request
 

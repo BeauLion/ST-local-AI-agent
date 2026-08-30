@@ -31,15 +31,13 @@ import numpy as np
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
+import runtime_settings
 from console_log import alog
 from config import (
-    DOCUMENT_SIMILARITY_THRESHOLD,
     EMBEDDING_MODEL,
     MEMORY_DATA_DIR,
-    MEMORY_DEDUPE_SIMILARITY_THRESHOLD,
     MEMORY_IDENTITY_SLOTS,
     MEMORY_MAX_FREEFORM_PINS,
-    MEMORY_SIMILARITY_THRESHOLD,
 )
 
 DOC_EXTENSIONS = (".txt", ".pdf")
@@ -157,7 +155,7 @@ def save_memory(text: str, slot: str = None) -> dict:
 
     text_vec = embed(text)
     similar = None
-    dupe_hits = _cosine_search(text_vec, memories, top_k=1, min_score=MEMORY_DEDUPE_SIMILARITY_THRESHOLD)
+    dupe_hits = _cosine_search(text_vec, memories, top_k=1, min_score=runtime_settings.get("MEMORY_DEDUPE_SIMILARITY_THRESHOLD"))
     if dupe_hits:
         m, score = dupe_hits[0]
         similar = {"id": m["id"], "text": m["text"], "score": score}
@@ -304,7 +302,7 @@ def search_memories(query: str, top_k: int = 3) -> list:
     auto-recall caller is responsible for surfacing pinned memories
     separately and filtering them out of this result to avoid duplicates)."""
     memories = _load_memories()
-    results = _cosine_search(embed(query), memories, top_k=top_k, min_score=MEMORY_SIMILARITY_THRESHOLD)
+    results = _cosine_search(embed(query), memories, top_k=top_k, min_score=runtime_settings.get("MEMORY_SIMILARITY_THRESHOLD"))
     alog(f"[MEMORY] Query: {query!r}")
     for m, score in results:
         alog(f"[MEMORY]   {score:.3f}  [{m['id']}] {m['text']}")
@@ -388,5 +386,5 @@ def _reindex_if_changed(folder: Path) -> dict:
 
 def search_documents(query: str, folder: Path, top_k: int = 4) -> list:
     index = _reindex_if_changed(folder)
-    results = _cosine_search(embed(query), index["chunks"], top_k=top_k, min_score=DOCUMENT_SIMILARITY_THRESHOLD)
+    results = _cosine_search(embed(query), index["chunks"], top_k=top_k, min_score=runtime_settings.get("DOCUMENT_SIMILARITY_THRESHOLD"))
     return [(r["source"], r["text"]) for r, score in results]

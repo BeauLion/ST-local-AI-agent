@@ -418,6 +418,18 @@ ATTIRE_SLOTS = ("head", "top", "bottom", "feet", "accessories")
 MAX_CHARACTER_NAME_LENGTH = 200
 MAX_ATTIRE_ITEM_LENGTH = 200
 
+# Master switch for the post-turn attire sub-agent (attire_subagent.py).
+# Set False to fully disable it - no background pass gets spawned after a
+# turn, and (as a direct consequence) the next turn's wait-with-timeout
+# block in main.py's chat_completions has nothing to wait on, so it's
+# skipped too. Nothing else about the attire feature is affected: existing
+# attire_manager tools/data and the [PERSISTENT ATTIRE STATE] context block
+# still work exactly as before - this only stops NEW state from being
+# tracked automatically. Useful for isolating whether the sub-agent is
+# responsible for a slowdown/bug, or just to save a completion round-trip
+# per turn if you're not using attire tracking right now.
+ATTIRE_SUBAGENT_ENABLED = False
+
 # Post-turn attire sub-agent (attire_subagent.py) - a separate, one-shot
 # completion call against the same llama-server, run after every finished
 # turn and decoupled entirely from the main agent's own tool selection.
@@ -439,7 +451,7 @@ ATTIRE_SUBAGENT_TIMEOUT_SECONDS = 15
 # always has. Flip on once BRIDGE_URL/BRIDGE_TOKEN are set in .env and
 # the bridge has been reached at least once from this machine (e.g. via
 # the health-check curl in the bridge's own README).
-BRIDGE_ENABLED = False
+BRIDGE_ENABLED = True
 
 # Names of the environment variables bridge_client.py reads from .env -
 # same pattern as ICLOUD_USERNAME_ENV_VAR/ICLOUD_APP_PASSWORD_ENV_VAR

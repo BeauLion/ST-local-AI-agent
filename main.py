@@ -44,8 +44,11 @@ from calendar_manager import CalendarError
 from duration_manager import DurationError
 from project_manager import ProjectManagerError
 from prompt_log_engine import log_prompt, log_console, router as prompt_log_router
+from settings_engine import router as settings_router
+import runtime_settings
 from config import (
     AGENT_API_KEY,
+    ATTIRE_SUBAGENT_ENABLED,
     ATTIRE_SUBAGENT_TIMEOUT_SECONDS,
     CORS_ALLOWED_ORIGINS,
     DELETE_FILE_ALLOWED_EXTENSIONS,
@@ -61,10 +64,6 @@ from config import (
     SAFE_FILES_DIR,
     TOOL_SELECTION_ALWAYS_INCLUDE,
     TOOL_SELECTION_CONTEXT_CHAR_LIMIT,
-    TOOL_SELECTION_ENABLED,
-    TOOL_SELECTION_MIN_SCORE,
-    TOOL_SELECTION_RESCUE_SCORE,
-    TOOL_SELECTION_RESCUE_TOP_K,
     WRITE_FILE_ALLOWED_EXTENSIONS,
     WRITE_FILE_MAX_CHARS,
 )
@@ -83,6 +82,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(prompt_log_router)
+app.include_router(settings_router)
 
 
 # ---------------------------------------------------------------------------
@@ -830,7 +830,14 @@ _background_tasks: set[asyncio.Task] = set()
 
 def _spawn_attire_subagent(user_text: str, assistant_text: str) -> None:
     """Fire-and-forget: kicks off the background attire pass and stores the
-    task so the next turn can wait on it if it isn't done yet."""
+    task so the next turn can wait on it if it isn't done yet.
+
+    No-ops entirely when ATTIRE_SUBAGENT_ENABLED is False - this is the
+    single choke point for the feature, so disabling it here also means
+    the wait-with-timeout block in chat_completions has nothing to wait
+    on (since _attire_subagent_task never gets set) and is skipped too."""
+    if not ATTIRE_SUBAGENT_ENABLED:
+        return
     global _attire_subagent_task
     task = asyncio.create_task(
         attire_subagent.run_attire_subagent(user_text, assistant_text)
@@ -1808,7 +1815,7 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
     """
     force_names = set(force_names or ())
 
-    if not TOOL_SELECTION_ENABLED:
+    if not runtime_settings.get("TOOL_SELECTION_ENABLED"):
         return TOOLS, {}, "disabled"
 
     text = (user_text or "").strip()
@@ -1820,7 +1827,8 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
     query_vec = np.array(memory.embed(text))
     scores = {name: float(query_vec @ vec) for name, vec in _TOOL_EMBEDDINGS.items()}
 
-    confident = {n for n, s in scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
+    min_score = runtime_settings.get("TOOL_SELECTION_MIN_SCORE")
+    confident = {n for n, s in scores.items() if s >= min_score}
 
     if confident:
         selected_names = _expand_to_groups(confident)   # was: selected_names = confident
@@ -1836,7 +1844,7 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
             prior_tail = prior_text[-TOOL_SELECTION_CONTEXT_CHAR_LIMIT:]
             combined_vec = np.array(memory.embed(f"{prior_tail} {text}"))
             combined_scores = {name: float(combined_vec @ vec) for name, vec in _TOOL_EMBEDDINGS.items()}
-            widened = {n for n, s in combined_scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
+            widened = {n for n, s in combined_scores.items() if s >= min_score}
             if widened:
                 # Debug log reflects the query that actually decided this,
                 # not the (lower, inconclusive) single-message scores.
@@ -1853,8 +1861,8 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
             # rescues nothing at all).
             ranked = sorted(scores.items(), key=lambda kv: -kv[1])
             selected_names = {
-                n for n, s in ranked[:TOOL_SELECTION_RESCUE_TOP_K]
-                if s >= TOOL_SELECTION_RESCUE_SCORE
+                n for n, s in ranked[:runtime_settings.get("TOOL_SELECTION_RESCUE_TOP_K")]
+                if s >= runtime_settings.get("TOOL_SELECTION_RESCUE_SCORE")
             }
             tier = "rescue" if selected_names else "core_only"
 
@@ -2445,6 +2453,10 @@ async def chat_completions(request: Request):
     # to detect tool calls early), regardless of what the client asked for.
     upstream_body = dict(body)
     upstream_body["stream"] = True
+    upstream_body["temperature"] = runtime_settings.get("LLAMA_TEMP")
+    upstream_body["top_p"] = runtime_settings.get("LLAMA_TOP_P")
+    upstream_body["top_k"] = runtime_settings.get("LLAMA_TOP_K")
+    upstream_body["min_p"] = runtime_settings.get("LLAMA_MIN_P")
 
     # Dynamic tool selection: only send the tools (and matching usage
     # instructions) relevant to what the user actually asked, instead of
