@@ -30,7 +30,7 @@ import numpy as np
 from ddgs import DDGS
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 
 import attire_manager
 import attire_subagent
@@ -738,6 +738,26 @@ def project_manager_batch_update(args: dict) -> str:
         return f"Error: {e}"
 
 
+def project_manager_set_gantt_dates(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        if args.get("clear"):
+            updated = project_manager.set_project_gantt_dates(project["id"], clear=True)
+            return f"Cleared Gantt dates for {updated['short_code']} \u2014 {updated['name']}."
+        updated = project_manager.set_project_gantt_dates(
+            project["id"], start=args.get("start"), end=args.get("end")
+        )
+        if updated["gantt_start"] and updated["gantt_end"]:
+            return (
+                f"Set {updated['short_code']} \u2014 {updated['name']} to run "
+                f"{updated['gantt_start']} \u2192 {updated['gantt_end']} on the Gantt chart."
+            )
+        return f"Updated Gantt date(s) for {updated['short_code']} \u2014 {updated['name']}; set the other end too to show it on the chart."
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Duration tracking tools (duration_manager.py). Task completions log a
 # duration anchor automatically (see project_manager._apply_task_status) -
@@ -1361,6 +1381,23 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "project_manager_set_gantt_dates",
+            "description": "Set (or clear) the start/end calendar dates a project shows as a bar with on the Gantt chart at /gantt-chart. Only call this when the user explicitly gives a date range for a project's Gantt bar - never infer dates from task talk. A project only appears on the chart once both start and end are set.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
+                    "start": {"type": "string", "description": "Start date, YYYY-MM-DD. Omit to leave unchanged."},
+                    "end": {"type": "string", "description": "End date, YYYY-MM-DD. Omit to leave unchanged."},
+                    "clear": {"type": "boolean", "description": "If true, remove both dates and hide this project from the Gantt chart. Ignores start/end."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "duration_get_estimate",
             "description": (
                 "Get a data-grounded duration estimate for a task/category, based on the "
@@ -1597,6 +1634,7 @@ TOOL_FUNCTIONS = {
     "project_manager_update_task_notes": project_manager_update_task_notes,
     "project_manager_set_all_tasks_status": project_manager_set_all_tasks_status,
     "project_manager_batch_update": project_manager_batch_update,
+    "project_manager_set_gantt_dates": project_manager_set_gantt_dates,
     "duration_get_estimate": duration_get_estimate,
     "duration_correct_entry": duration_correct_entry,
     "duration_confirm_new_category": duration_confirm_new_category,
@@ -1628,6 +1666,7 @@ TOOL_GROUPS = {
     "project_manager_get_overview": "project", "project_manager_create_task": "project",
     "project_manager_update_task_status": "project", "project_manager_update_task_notes": "project",
     "project_manager_set_all_tasks_status": "project", "project_manager_batch_update": "project",
+    "project_manager_set_gantt_dates": "project",
     "duration_get_estimate": "duration", "duration_correct_entry": "duration",
     "duration_confirm_new_category": "duration",
 }
@@ -1733,7 +1772,11 @@ GROUP_INSTRUCTIONS = {
         "requests, use project_manager_set_all_tasks_status once instead of "
         "enumerating tasks. Project-manager changes apply immediately - "
         "there is no separate confirmation step, so only call these tools "
-        "when the user's intent is unambiguous."
+        "when the user's intent is unambiguous. Use "
+        "project_manager_set_gantt_dates only when the user explicitly "
+        "gives a start/end date range for a project's bar on the Gantt "
+        "chart - never infer dates from task due-by talk or duration "
+        "estimates, which are unrelated."
     ),
     "duration": (
         "Use duration_get_estimate whenever the user asks how long a "
@@ -1996,6 +2039,15 @@ async def api_update_project(project_id: str, request: Request):
             project = await asyncio.to_thread(project_manager.rename_project, project_id, body["name"])
         if "status" in body:
             project = await asyncio.to_thread(project_manager.set_project_status, project_id, body["status"])
+        if body.get("clear_gantt_dates"):
+            project = await asyncio.to_thread(
+                project_manager.set_project_gantt_dates, project_id, clear=True
+            )
+        elif "gantt_start" in body or "gantt_end" in body:
+            project = await asyncio.to_thread(
+                project_manager.set_project_gantt_dates, project_id,
+                start=body.get("gantt_start"), end=body.get("gantt_end"),
+            )
         if project is None:
             state = await asyncio.to_thread(project_manager._load)
             project = state["projects"].get(project_id)
@@ -2139,6 +2191,43 @@ async def dashboard_page():
     shell that tabs between them."""
     html_path = Path(__file__).parent / "web" / "dashboard.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Gantt chart (frappe-gantt) - one bar per project with both gantt_start and
+# gantt_end set, coloured by task-completion progress. /gantt is plain JSON
+# already shaped as frappe-gantt Task rows (see project_manager.gantt_rows);
+# /gantt-chart serves the page that renders them. Both deliberately
+# unauthenticated, same as /projects - see handover-21 for why.
+# ---------------------------------------------------------------------------
+
+@app.get("/gantt")
+async def api_gantt():
+    state = await asyncio.to_thread(project_manager._load)
+    return {"rows": project_manager.gantt_rows(state)}
+
+
+@app.get("/gantt-chart")
+async def gantt_chart_page():
+    html_path = Path(__file__).parent / "web" / "gantt.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+# Vendored frappe-gantt (MIT) - kept as static files under web/ rather than
+# a CDN <script> tag, so the chart still works with no internet access at
+# all. Update by re-running `npm install frappe-gantt@<version> --no-save`
+# somewhere with network access and copying dist/frappe-gantt.umd.js +
+# dist/frappe-gantt.css over these two files.
+@app.get("/vendor/frappe-gantt.umd.js")
+async def gantt_lib_js():
+    js_path = Path(__file__).parent / "web" / "frappe-gantt.umd.js"
+    return Response(content=js_path.read_text(encoding="utf-8"), media_type="application/javascript")
+
+
+@app.get("/vendor/frappe-gantt.css")
+async def gantt_lib_css():
+    css_path = Path(__file__).parent / "web" / "frappe-gantt.css"
+    return Response(content=css_path.read_text(encoding="utf-8"), media_type="text/css")
 
 
 # ---------------------------------------------------------------------------

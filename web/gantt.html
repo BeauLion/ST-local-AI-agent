@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Project Gantt Chart</title>
+<link rel="stylesheet" href="/vendor/frappe-gantt.css">
+<style>
+  :root {
+    --bg: #1e1f24;
+    --panel: #26282f;
+    --border: #383a42;
+    --text: #e6e6e6;
+    --muted: #9a9ca3;
+    --accent: #5b8cff;
+    --danger: #e0555f;
+    --ok: #4caf7d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header h1 { font-size: 20px; margin: 0 0 4px; }
+  header .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+
+  .status {
+    padding: 10px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-bottom: 16px;
+  }
+  .status.ok { background: rgba(76,175,125,0.12); color: var(--ok); }
+  .status.err { background: rgba(224,85,95,0.12); color: var(--danger); }
+  .status[hidden] { display: none; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 20px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+
+  #ganttEmpty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+
+  /* --- date-setting form --- */
+  .date-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  .date-form .field { display: flex; flex-direction: column; gap: 4px; }
+  .date-form label { font-size: 11px; color: var(--muted); }
+  .date-form select, .date-form input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+  }
+  .date-form button {
+    border: none;
+    border-radius: 6px;
+    padding: 7px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .date-form .save { background: var(--accent); color: white; }
+  .date-form .clear { background: transparent; color: var(--danger); border: 1px solid var(--border); }
+
+  /* --- bar colours, matched to project_manager._gantt_bar_class --- */
+  .gantt-bar-low .bar { fill: #4a4d57; }
+  .gantt-bar-mid .bar { fill: #c9922c; }
+  .gantt-bar-high .bar { fill: #5b8cff; }
+  .gantt-bar-done .bar { fill: #4caf7d; }
+  .gantt-bar-paused .bar { fill: #6b6d76; }
+  .gantt-bar-low .bar-progress,
+  .gantt-bar-mid .bar-progress,
+  .gantt-bar-high .bar-progress,
+  .gantt-bar-done .bar-progress,
+  .gantt-bar-paused .bar-progress { fill: rgba(255,255,255,0.35); }
+
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-top: 10px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Project Gantt Chart</h1>
+    <p class="sub">One bar per project. Bar colour reflects task-completion progress; set start/end dates below to add a project to the chart.</p>
+  </header>
+
+  <div id="statusBox" class="status" hidden></div>
+
+  <div class="panel">
+    <h2>Set project dates</h2>
+    <div class="date-form">
+      <div class="field">
+        <label for="projectSelect">Project</label>
+        <select id="projectSelect"></select>
+      </div>
+      <div class="field">
+        <label for="startInput">Start</label>
+        <input type="date" id="startInput">
+      </div>
+      <div class="field">
+        <label for="endInput">End</label>
+        <input type="date" id="endInput">
+      </div>
+      <button class="save" id="saveBtn">Save</button>
+      <button class="clear" id="clearBtn">Clear dates</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Chart</h2>
+    <div id="ganttEmpty" hidden>No projects have both a start and end date set yet — use the form above to add one.</div>
+    <svg id="gantt"></svg>
+    <div class="legend">
+      <span><i class="swatch" style="background:#4a4d57"></i>Not started</span>
+      <span><i class="swatch" style="background:#c9922c"></i>In progress</span>
+      <span><i class="swatch" style="background:#5b8cff"></i>Over halfway</span>
+      <span><i class="swatch" style="background:#4caf7d"></i>Done</span>
+      <span><i class="swatch" style="background:#6b6d76"></i>Paused</span>
+    </div>
+  </div>
+</div>
+
+<script src="/vendor/frappe-gantt.umd.js"></script>
+<script>
+(function () {
+  const statusBox = document.getElementById("statusBox");
+  const projectSelect = document.getElementById("projectSelect");
+  const startInput = document.getElementById("startInput");
+  const endInput = document.getElementById("endInput");
+  const ganttEmpty = document.getElementById("ganttEmpty");
+  let ganttInstance = null;
+  let projectsById = {};
+
+  function showStatus(message, ok) {
+    statusBox.textContent = message;
+    statusBox.className = "status " + (ok ? "ok" : "err");
+    statusBox.hidden = false;
+    setTimeout(() => { statusBox.hidden = true; }, 4000);
+  }
+
+  async function loadProjects() {
+    const res = await fetch("/projects");
+    const data = await res.json();
+    projectsById = {};
+    projectSelect.innerHTML = "";
+    for (const p of data.projects) {
+      projectsById[p.id] = p;
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = `${p.short_code} \u2014 ${p.name}`;
+      projectSelect.appendChild(opt);
+    }
+    if (projectSelect.value) fillDatesFromSelection();
+  }
+
+  function fillDatesFromSelection() {
+    const p = projectsById[projectSelect.value];
+    startInput.value = (p && p.gantt_start) || "";
+    endInput.value = (p && p.gantt_end) || "";
+  }
+
+  async function loadGantt() {
+    const res = await fetch("/gantt");
+    const data = await res.json();
+    const rows = data.rows || [];
+    ganttEmpty.hidden = rows.length > 0;
+    document.getElementById("gantt").style.display = rows.length ? "" : "none";
+    if (!rows.length) return;
+    if (ganttInstance) {
+      ganttInstance.refresh(rows);
+    } else {
+      ganttInstance = new Gantt("#gantt", rows, {
+        view_mode: "Week",
+        date_format: "YYYY-MM-DD",
+        readonly: true,
+      });
+    }
+  }
+
+  projectSelect.addEventListener("change", fillDatesFromSelection);
+
+  document.getElementById("saveBtn").addEventListener("click", async () => {
+    const projectId = projectSelect.value;
+    if (!projectId) return;
+    const body = {};
+    if (startInput.value) body.gantt_start = startInput.value;
+    if (endInput.value) body.gantt_end = endInput.value;
+    if (!body.gantt_start && !body.gantt_end) {
+      showStatus("Set a start and/or end date first.", false);
+      return;
+    }
+    try {
+      const res = await fetch(`/projects/${projectId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+      showStatus("Saved.", true);
+      await loadProjects();
+      await loadGantt();
+    } catch (e) {
+      showStatus(e.message, false);
+    }
+  });
+
+  document.getElementById("clearBtn").addEventListener("click", async () => {
+    const projectId = projectSelect.value;
+    if (!projectId) return;
+    try {
+      const res = await fetch(`/projects/${projectId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clear_gantt_dates: true }),
+      });
+      if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+      showStatus("Cleared.", true);
+      startInput.value = "";
+      endInput.value = "";
+      await loadProjects();
+      await loadGantt();
+    } catch (e) {
+      showStatus(e.message, false);
+    }
+  });
+
+  (async function init() {
+    await loadProjects();
+    await loadGantt();
+  })();
+})();
+</script>
+</body>
+</html>

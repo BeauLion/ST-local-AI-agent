@@ -82,6 +82,13 @@ def _load() -> dict:
     state.setdefault("focused_project_id", None)
     if state["focused_project_id"] and state["focused_project_id"] not in state["projects"]:
         state["focused_project_id"] = None
+    # Migration: projects saved before Gantt support won't have these keys.
+    # Default both to None (not present) rather than backfilling a guessed
+    # date - a project with no Gantt dates simply doesn't appear on the
+    # chart until you set them, same as it never having any.
+    for project in state["projects"].values():
+        project.setdefault("gantt_start", None)
+        project.setdefault("gantt_end", None)
     return state
 
 
@@ -401,6 +408,8 @@ def create_project(name: str) -> dict:
             "next_action": "",
             "created_at": _now(),
             "updated_at": _now(),
+            "gantt_start": None,
+            "gantt_end": None,
             "tasks": {},
         }
         state["projects"][project_id] = project
@@ -442,6 +451,54 @@ def rename_project(project_id: str, name: str) -> dict:
         if not project:
             raise ProjectManagerError("Project not found.")
         project["name"] = clean_name
+        project["updated_at"] = _now()
+        _save(state)
+        return project
+
+
+_GANTT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_gantt_date(value, label: str):
+    """Returns a 'YYYY-MM-DD' string or None. Raises ProjectManagerError on
+    anything else - deliberately strict (day-level dates only, no time
+    component) since that's all a Gantt bar needs and it keeps the stored
+    value directly usable by frappe-gantt without reformatting."""
+    if value in (None, ""):
+        return None
+    text = _normalize_text(value)
+    if not _GANTT_DATE_RE.match(text):
+        raise ProjectManagerError(f"{label} must be in YYYY-MM-DD format.")
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ProjectManagerError(f"{label} is not a valid date.") from exc
+    return text
+
+
+def set_project_gantt_dates(project_id: str, start=None, end=None, *, clear: bool = False) -> dict:
+    """Sets the project's Gantt bar start/end dates. Pass clear=True to wipe
+    both back to None (removes the project from gantt_rows() output)
+    instead of trying to pass two empty strings through. Either date may be
+    given independently, but a project only shows up on the chart once
+    both are set - see gantt_rows()."""
+    with _lock:
+        state = _load()
+        project = state["projects"].get(project_id)
+        if not project:
+            raise ProjectManagerError("Project not found.")
+
+        if clear:
+            project["gantt_start"] = None
+            project["gantt_end"] = None
+        else:
+            new_start = _parse_gantt_date(start, "Start date") if start is not None else project["gantt_start"]
+            new_end = _parse_gantt_date(end, "End date") if end is not None else project["gantt_end"]
+            if new_start and new_end and new_end < new_start:
+                raise ProjectManagerError("End date must be on or after the start date.")
+            project["gantt_start"] = new_start
+            project["gantt_end"] = new_end
+
         project["updated_at"] = _now()
         _save(state)
         return project
@@ -933,6 +990,62 @@ def set_all_tasks_status(project_id: str, status: str) -> tuple:
         _recalculate_next_action(project)
         _save(state)
         return descriptions, flags
+
+
+# --------------------------- Gantt chart (frappe-gantt) ---------------------------
+# Projects-only bars: each project becomes one frappe-gantt "task" row, with
+# no per-task sub-bars. Progress is task-completion-derived (not manually
+# set) and drives which custom_class the bar gets, so the front end can
+# colour bars by how done the project is purely through CSS - see
+# GANTT_PROGRESS_CLASS_THRESHOLDS-equivalent buckets below and
+# web/gantt.html's stylesheet for the actual colours.
+
+def _project_progress(project: dict) -> int:
+    """Percent (0-100) of the project's non-archived tasks that are done.
+    A project with zero non-archived tasks is 0%, not undefined - avoids
+    a division-by-zero special case rippling into gantt_rows()."""
+    tasks = [t for t in project["tasks"].values() if not t["archived"]]
+    if not tasks:
+        return 0
+    done = sum(1 for t in tasks if t["status"] == "done")
+    return round(done / len(tasks) * 100)
+
+
+def _gantt_bar_class(progress: int, status: str) -> str:
+    """Bucketed CSS class name for the bar colour. Project status wins over
+    progress for 'paused' (a stalled project should read as stalled even if
+    it's half-done); otherwise progress alone decides the bucket."""
+    if status == "paused":
+        return "gantt-bar-paused"
+    if progress >= 100:
+        return "gantt-bar-done"
+    if progress >= 50:
+        return "gantt-bar-high"
+    if progress >= 1:
+        return "gantt-bar-mid"
+    return "gantt-bar-low"
+
+
+def gantt_rows(state: dict) -> list:
+    """What the /gantt endpoint hands the front end - already shaped as
+    frappe-gantt Task objects ({id, name, start, end, progress,
+    custom_class}), so gantt.html can pass this list straight into `new
+    Gantt(...)` with no reshaping. Projects missing either gantt_start or
+    gantt_end are left out entirely rather than guessed at."""
+    rows = []
+    for project in get_projects(state):
+        if not (project.get("gantt_start") and project.get("gantt_end")):
+            continue
+        progress = _project_progress(project)
+        rows.append({
+            "id": project["id"],
+            "name": f"{project['short_code']} \u2014 {project['name']}",
+            "start": project["gantt_start"],
+            "end": project["gantt_end"],
+            "progress": progress,
+            "custom_class": _gantt_bar_class(progress, project["status"]),
+        })
+    return rows
 
 
 # --------------------------- read-only views ---------------------------
