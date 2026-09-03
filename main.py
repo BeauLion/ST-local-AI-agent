@@ -2207,6 +2207,19 @@ async def api_gantt():
     return {"rows": project_manager.gantt_rows(state)}
 
 
+@app.get("/gantt/{project_id}/children")
+async def api_gantt_children(project_id: str):
+    state = await asyncio.to_thread(project_manager._load)
+    project = state["projects"].get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    children = project_manager.get_child_projects(state, project)
+    return {"children": [
+        {"id": c["id"], "short_code": c["short_code"], "name": c["name"], "status": c["status"]}
+        for c in children
+    ]}
+
+
 @app.get("/gantt-chart")
 async def gantt_chart_page():
     html_path = Path(__file__).parent / "web" / "gantt.html"

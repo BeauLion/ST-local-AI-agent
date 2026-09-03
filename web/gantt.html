@@ -127,6 +127,8 @@
   .task-status.blocked { background: rgba(224,85,95,0.18); color: var(--danger); }
   .task-status.done { background: rgba(76,175,125,0.18); color: var(--ok); }
   .task-status.cancelled { background: rgba(154,156,163,0.12); color: var(--muted); }
+  .task-status.paused { background: rgba(154,156,163,0.18); color: var(--muted); }
+  .task-status.completed { background: rgba(76,175,125,0.18); color: var(--ok); }
 
   /* the chart itself grows to fit every rendered row; .gantt-container (inside)
      handles its own horizontal scrolling, so this wrapper just sizes/borders it */
@@ -277,6 +279,26 @@
 
   async function showProjectTasks(projectId) {
     taskSidebar.innerHTML = '<p class="hint">Loading tasks\u2026</p>';
+    try {
+      const childRes = await fetch(`/gantt/${projectId}/children`);
+      if (childRes.ok) {
+        const { children } = await childRes.json();
+        if (children.length) {
+          const parent = projectsById[projectId];
+          const header = parent
+            ? `<h3>${parent.short_code} <span class="proj-code">\u2014 ${parent.name}</span></h3>`
+            : "";
+          const items = children.map((c) => `<li>
+            <span class="task-title">${c.short_code} \u2014 ${c.name}</span>
+            <div class="task-meta"><span class="task-status ${c.status}">${c.status}</span></div>
+          </li>`).join("");
+          taskSidebar.innerHTML = header + '<p class="hint">Child projects</p>' + `<ul class="task-list">${items}</ul>`;
+          return;
+        }
+      }
+    } catch (e) {
+      // Children lookup failing shouldn't block the normal task view below.
+    }
     try {
       const res = await fetch(`/projects/${projectId}`);
       if (!res.ok) throw new Error("Could not load that project.");

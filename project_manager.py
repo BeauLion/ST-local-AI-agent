@@ -1026,20 +1026,98 @@ def _gantt_bar_class(progress: int, status: str) -> str:
     return "gantt-bar-low"
 
 
+_CHILD_PREFIX_RE = re.compile(r"^([A-Za-z0-9]+)-(.+)$")
+
+
+def _parent_short_code(name: str):
+    """If `name` looks like "PREFIX-Rest of the name" (no space before the
+    hyphen, distinguishing it from a plain " - " separator some project
+    names use), returns PREFIX uppercased. Otherwise None."""
+    match = _CHILD_PREFIX_RE.match(_normalize_text(name))
+    return match.group(1).upper() if match else None
+
+
+def find_parent_project(state: dict, project: dict):
+    """A project is a child of another when its name starts with that other
+    project's short_code as a "CODE-" prefix. Returns the parent project
+    dict, or None if `project` has no such prefix or no project's
+    short_code matches it."""
+    prefix = _parent_short_code(project["name"])
+    if not prefix or prefix == project["short_code"].upper():
+        return None
+    for other in state["projects"].values():
+        if other["id"] != project["id"] and other["short_code"].upper() == prefix:
+            return other
+    return None
+
+
+def get_child_projects(state: dict, project: dict) -> list:
+    """All projects whose name marks them as a child of `project` (see
+    find_parent_project), regardless of Gantt/status - used to list a
+    parent's children when its bar is clicked."""
+    children = []
+    for p in state["projects"].values():
+        if p["id"] == project["id"]:
+            continue
+        parent = find_parent_project(state, p)
+        if parent and parent["id"] == project["id"]:
+            children.append(p)
+    children.sort(key=lambda p: p["name"].lower())
+    return children
+
+
+def _gantt_display_name(project: dict) -> str:
+    """The project's name, stripped of its "CODE-" child-naming prefix (see
+    _parent_short_code) if present - Gantt bars should show the full
+    project name, not the shorthand parent-code notation baked into child
+    project names."""
+    match = _CHILD_PREFIX_RE.match(_normalize_text(project["name"]))
+    return match.group(2) if match else project["name"]
+
+
 def gantt_rows(state: dict) -> list:
     """What the /gantt endpoint hands the front end - already shaped as
     frappe-gantt Task objects ({id, name, start, end, progress,
     custom_class}), so gantt.html can pass this list straight into `new
     Gantt(...)` with no reshaping. Projects missing either gantt_start or
-    gantt_end are left out entirely rather than guessed at."""
-    rows = []
-    for project in get_projects(state):
-        if not (project.get("gantt_start") and project.get("gantt_end")):
+    gantt_end are left out entirely rather than guessed at.
+
+    Rows are ordered so a project's child projects (see
+    find_parent_project) immediately follow it, keeping the group visually
+    together on the chart - a child whose parent isn't itself on the chart
+    just falls back into normal (status, name) order."""
+    eligible = [
+        p for p in get_projects(state)
+        if p.get("gantt_start") and p.get("gantt_end")
+    ]
+    eligible_ids = {p["id"] for p in eligible}
+
+    children_of = {}
+    grouped_child_ids = set()
+    for p in eligible:
+        parent = find_parent_project(state, p)
+        if parent and parent["id"] in eligible_ids:
+            children_of.setdefault(parent["id"], []).append(p)
+            grouped_child_ids.add(p["id"])
+
+    ordered = []
+    seen = set()
+    for p in eligible:
+        if p["id"] in seen or p["id"] in grouped_child_ids:
             continue
+        ordered.append(p)
+        seen.add(p["id"])
+        for child in children_of.get(p["id"], []):
+            if child["id"] not in seen:
+                ordered.append(child)
+                seen.add(child["id"])
+
+    rows = []
+    for project in ordered:
         progress = _project_progress(project)
         rows.append({
             "id": project["id"],
-            "name": f"{project['short_code']} \u2014 {project['name']}",
+            "name": _gantt_display_name(project),
             "start": project["gantt_start"],
             "end": project["gantt_end"],
             "progress": progress,
