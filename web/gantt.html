@@ -85,13 +85,65 @@
   .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-top: 10px; flex-wrap: wrap; }
   .legend span { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  /* --- chart area: task sidebar (left) + resizable chart (right) --- */
+  .chart-area { display: flex; gap: 16px; align-items: stretch; }
+
+  .task-sidebar {
+    width: 260px;
+    flex: 0 0 260px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    overflow-y: auto;
+    background: var(--bg);
+  }
+  .task-sidebar h3 {
+    font-size: 12px;
+    margin: 0 0 4px;
+    color: var(--text);
+  }
+  .task-sidebar .proj-code { color: var(--muted); font-weight: normal; }
+  .task-sidebar .hint { color: var(--muted); font-size: 12px; }
+  .task-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .task-list li {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 12px;
+  }
+  .task-title { display: block; margin-bottom: 4px; }
+  .task-meta { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11px; }
+  .task-status {
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: .03em;
+    padding: 1px 6px;
+    border-radius: 4px;
+    display: inline-block;
+  }
+  .task-status.pending { background: rgba(154,156,163,0.18); color: var(--muted); }
+  .task-status.active { background: rgba(91,140,255,0.18); color: var(--accent); }
+  .task-status.blocked { background: rgba(224,85,95,0.18); color: var(--danger); }
+  .task-status.done { background: rgba(76,175,125,0.18); color: var(--ok); }
+  .task-status.cancelled { background: rgba(154,156,163,0.12); color: var(--muted); }
+
+  /* the chart itself grows to fit every rendered row; .gantt-container (inside)
+     handles its own horizontal scrolling, so this wrapper just sizes/borders it */
+  .chart-scroll {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Project Gantt Chart</h1>
-    <p class="sub">One bar per project. Bar colour reflects task-completion progress; set start/end dates below to add a project to the chart.</p>
+    <p class="sub">One bar per project. Bar colour reflects task-completion progress; click a bar to see its tasks.</p>
   </header>
 
   <div id="statusBox" class="status" hidden></div>
@@ -119,7 +171,14 @@
   <div class="panel">
     <h2>Chart</h2>
     <div id="ganttEmpty" hidden>No projects have both a start and end date set yet — use the form above to add one.</div>
-    <svg id="gantt"></svg>
+    <div class="chart-area" id="chartArea">
+      <div class="task-sidebar" id="taskSidebar">
+        <p class="hint">Click a bar to see that project's tasks here.</p>
+      </div>
+      <div class="chart-scroll" id="chartScroll">
+        <svg id="gantt"></svg>
+      </div>
+    </div>
     <div class="legend">
       <span><i class="swatch" style="background:#4a4d57"></i>Not started</span>
       <span><i class="swatch" style="background:#c9922c"></i>In progress</span>
@@ -138,6 +197,8 @@
   const startInput = document.getElementById("startInput");
   const endInput = document.getElementById("endInput");
   const ganttEmpty = document.getElementById("ganttEmpty");
+  const chartArea = document.getElementById("chartArea");
+  const taskSidebar = document.getElementById("taskSidebar");
   let ganttInstance = null;
   let projectsById = {};
 
@@ -146,6 +207,15 @@
     statusBox.className = "status " + (ok ? "ok" : "err");
     statusBox.hidden = false;
     setTimeout(() => { statusBox.hidden = true; }, 4000);
+  }
+
+  function formatDate(iso) {
+    if (!iso) return "";
+    // completed_at is a full UTC ISO timestamp; show just the date part
+    // in the browser's local time so it reads naturally next to the task.
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
 
   async function loadProjects() {
@@ -169,12 +239,43 @@
     endInput.value = (p && p.gantt_end) || "";
   }
 
+  async function showProjectTasks(projectId) {
+    taskSidebar.innerHTML = '<p class="hint">Loading tasks\u2026</p>';
+    try {
+      const res = await fetch(`/projects/${projectId}`);
+      if (!res.ok) throw new Error("Could not load that project.");
+      const project = await res.json();
+      const tasks = Object.values(project.tasks || {});
+      const header = `<h3>${project.short_code} <span class="proj-code">\u2014 ${project.name}</span></h3>`;
+      if (!tasks.length) {
+        taskSidebar.innerHTML = header + '<p class="hint">No tasks in this project.</p>';
+        return;
+      }
+      tasks.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+      const items = tasks.map((t) => {
+        const doneLine = t.status === "done" && t.completed_at
+          ? `<div class="task-meta"><span>Completed</span><span>${formatDate(t.completed_at)}</span></div>`
+          : "";
+        return `<li>
+          <span class="task-title">${t.title}</span>
+          <div class="task-meta">
+            <span class="task-status ${t.status}">${t.status}</span>
+          </div>
+          ${doneLine}
+        </li>`;
+      }).join("");
+      taskSidebar.innerHTML = header + `<ul class="task-list">${items}</ul>`;
+    } catch (e) {
+      taskSidebar.innerHTML = `<p class="hint">${e.message}</p>`;
+    }
+  }
+
   async function loadGantt() {
     const res = await fetch("/gantt");
     const data = await res.json();
     const rows = data.rows || [];
     ganttEmpty.hidden = rows.length > 0;
-    document.getElementById("gantt").style.display = rows.length ? "" : "none";
+    chartArea.style.display = rows.length ? "flex" : "none";
     if (!rows.length) return;
     if (ganttInstance) {
       ganttInstance.refresh(rows);
@@ -183,6 +284,7 @@
         view_mode: "Week",
         date_format: "YYYY-MM-DD",
         readonly: true,
+        on_click: (task) => showProjectTasks(task.id),
       });
     }
   }
