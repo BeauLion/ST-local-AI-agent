@@ -137,6 +137,28 @@
     border-radius: 6px;
     padding: 8px;
   }
+
+  .zoom-controls {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .zoom-controls button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .zoom-controls button:hover { filter: brightness(1.15); }
+  .zoom-controls button.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
 </style>
 </head>
 <body>
@@ -179,6 +201,10 @@
         <svg id="gantt"></svg>
       </div>
     </div>
+    <div class="zoom-controls">
+      <button type="button" id="zoomOutBtn" title="Month view">Zoom out</button>
+      <button type="button" id="zoomInBtn" title="Week view">Zoom in</button>
+    </div>
     <div class="legend">
       <span><i class="swatch" style="background:#4a4d57"></i>Not started</span>
       <span><i class="swatch" style="background:#c9922c"></i>In progress</span>
@@ -199,8 +225,18 @@
   const ganttEmpty = document.getElementById("ganttEmpty");
   const chartArea = document.getElementById("chartArea");
   const taskSidebar = document.getElementById("taskSidebar");
+  const zoomOutBtn = document.getElementById("zoomOutBtn");
+  const zoomInBtn = document.getElementById("zoomInBtn");
   let ganttInstance = null;
   let projectsById = {};
+  let currentViewMode = "Week";
+
+  function setViewMode(mode) {
+    currentViewMode = mode;
+    if (ganttInstance) ganttInstance.change_view_mode(mode);
+    zoomOutBtn.classList.toggle("active", mode === "Month");
+    zoomInBtn.classList.toggle("active", mode === "Week");
+  }
 
   function showStatus(message, ok) {
     statusBox.textContent = message;
@@ -281,7 +317,7 @@
       ganttInstance.refresh(rows);
     } else {
       ganttInstance = new Gantt("#gantt", rows, {
-        view_mode: "Week",
+        view_mode: currentViewMode,
         date_format: "YYYY-MM-DD",
         readonly: true,
         on_click: (task) => showProjectTasks(task.id),
@@ -290,6 +326,8 @@
   }
 
   projectSelect.addEventListener("change", fillDatesFromSelection);
+  zoomOutBtn.addEventListener("click", () => setViewMode("Month"));
+  zoomInBtn.addEventListener("click", () => setViewMode("Week"));
 
   document.getElementById("saveBtn").addEventListener("click", async () => {
     const projectId = projectSelect.value;
@@ -337,6 +375,8 @@
   });
 
   (async function init() {
+    zoomOutBtn.classList.toggle("active", currentViewMode === "Month");
+    zoomInBtn.classList.toggle("active", currentViewMode === "Week");
     await loadProjects();
     await loadGantt();
   })();
