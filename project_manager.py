@@ -1085,7 +1085,10 @@ def gantt_rows(state: dict) -> list:
     Rows are ordered so a project's child projects (see
     find_parent_project) immediately follow it, keeping the group visually
     together on the chart - a child whose parent isn't itself on the chart
-    just falls back into normal (status, name) order."""
+    just falls back into normal top-level order. Within that grouping,
+    top-level projects are ordered by start date relative to each other,
+    and each parent's children are separately ordered by start date
+    relative to each other."""
     eligible = [
         p for p in get_projects(state)
         if p.get("gantt_start") and p.get("gantt_end")
@@ -1100,17 +1103,16 @@ def gantt_rows(state: dict) -> list:
             children_of.setdefault(parent["id"], []).append(p)
             grouped_child_ids.add(p["id"])
 
+    for children in children_of.values():
+        children.sort(key=lambda p: (p["gantt_start"], p["name"].lower()))
+
+    top_level = [p for p in eligible if p["id"] not in grouped_child_ids]
+    top_level.sort(key=lambda p: (p["gantt_start"], p["name"].lower()))
+
     ordered = []
-    seen = set()
-    for p in eligible:
-        if p["id"] in seen or p["id"] in grouped_child_ids:
-            continue
+    for p in top_level:
         ordered.append(p)
-        seen.add(p["id"])
-        for child in children_of.get(p["id"], []):
-            if child["id"] not in seen:
-                ordered.append(child)
-                seen.add(child["id"])
+        ordered.extend(children_of.get(p["id"], []))
 
     rows = []
     for project in ordered:
