@@ -104,9 +104,8 @@
         let _ = n.getFullYear() - t.getFullYear(),
           g = n.getMonth() - t.getMonth();
         return (
-          (g += (o % 30) / 30),
+          (g += (n.getDate() - t.getDate()) / this.get_days_in_month(n)),
           (h = _ * 12 + g),
-          n.getDate() < t.getDate() && h--,
           (l = h / 12),
           e.endsWith("s") || (e += "s"),
           Math.round(
@@ -1495,12 +1494,7 @@
               class: l,
               append_to: this.layers.grid,
             }),
-            this.view_is("month")
-              ? (t += (d.get_days_in_month(h) * this.config.column_width) / 30)
-              : this.view_is("year")
-                ? (t +=
-                    (d.get_days_in_year(h) * this.config.column_width) / 365)
-                : (t += this.config.column_width));
+            (t += this.config.column_width));
         }
     }
     highlight_holidays() {
