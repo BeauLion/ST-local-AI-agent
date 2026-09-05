@@ -161,6 +161,30 @@
     color: white;
     border-color: var(--accent);
   }
+
+  /* floating date label shown while dragging a bar's edge handle */
+  .bar-drag-label {
+    position: fixed;
+    display: none;
+    background: var(--accent);
+    color: white;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 7px;
+    border-radius: 4px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 1000;
+  }
+  .bar-drag-label::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 4px solid transparent;
+    border-top-color: var(--accent);
+  }
 </style>
 </head>
 <body>
@@ -232,6 +256,8 @@
   let ganttInstance = null;
   let projectsById = {};
   let currentViewMode = "Week";
+  let activeDrag = null; // { taskId, side } while a bar's left/right handle is being dragged
+  let dragLabelEl = null;
 
   function setViewMode(mode) {
     currentViewMode = mode;
@@ -328,6 +354,84 @@
     }
   }
 
+  function toDateInputValue(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const d = String(date.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  function getDragLabel() {
+    if (!dragLabelEl) {
+      dragLabelEl = document.createElement("div");
+      dragLabelEl.className = "bar-drag-label";
+      document.body.appendChild(dragLabelEl);
+    }
+    return dragLabelEl;
+  }
+
+  function showDragLabel(handleEl, date) {
+    const label = getDragLabel();
+    label.textContent = date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    label.style.display = "block";
+    const handleRect = handleEl.getBoundingClientRect();
+    const labelRect = label.getBoundingClientRect();
+    label.style.left = `${handleRect.left + handleRect.width / 2 - labelRect.width / 2}px`;
+    label.style.top = `${handleRect.top - labelRect.height - 8}px`;
+  }
+
+  function hideDragLabel() {
+    if (dragLabelEl) dragLabelEl.style.display = "none";
+  }
+
+  // Track which handle (left/right border) started the current drag so
+  // on_date_change below knows which date to show and where to anchor the label.
+  document.addEventListener("mousedown", (e) => {
+    const handle = e.target.closest(".handle.left, .handle.right");
+    if (!handle) return;
+    const wrapper = handle.closest(".bar-wrapper");
+    if (!wrapper) return;
+    activeDrag = {
+      taskId: wrapper.getAttribute("data-id"),
+      side: handle.classList.contains("left") ? "left" : "right",
+    };
+  });
+  document.addEventListener("mouseup", () => {
+    activeDrag = null;
+    hideDragLabel();
+  });
+
+  // frappe-gantt fires its date_change event on every mousemove while a bar
+  // border is being dragged, not just once on release. Debounce so only the
+  // final position (settled once the mouse stops, i.e. on release) is saved.
+  const pendingBarSaves = {};
+  function saveBarDates(task, start, end) {
+    if (activeDrag && activeDrag.taskId === task.id) {
+      const wrapper = document.querySelector(`.bar-wrapper[data-id="${task.id}"]`);
+      const handleEl = wrapper && wrapper.querySelector(`.handle.${activeDrag.side}`);
+      if (handleEl) showDragLabel(handleEl, activeDrag.side === "left" ? start : end);
+    }
+    clearTimeout(pendingBarSaves[task.id]);
+    pendingBarSaves[task.id] = setTimeout(async () => {
+      try {
+        const res = await fetch(`/projects/${task.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            gantt_start: toDateInputValue(start),
+            gantt_end: toDateInputValue(end),
+          }),
+        });
+        if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+        showStatus("Saved.", true);
+        await loadProjects();
+      } catch (e) {
+        showStatus(e.message, false);
+        await loadGantt();
+      }
+    }, 300);
+  }
+
   async function loadGantt() {
     const res = await fetch("/gantt");
     const data = await res.json();
@@ -341,8 +445,9 @@
       ganttInstance = new Gantt("#gantt", rows, {
         view_mode: currentViewMode,
         date_format: "YYYY-MM-DD",
-        readonly: true,
+        readonly_progress: true,
         on_click: (task) => showProjectTasks(task.id),
+        on_date_change: (task, start, end) => saveBarDates(task, start, end),
       });
     }
   }
