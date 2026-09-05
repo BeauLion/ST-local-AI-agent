@@ -54,8 +54,34 @@
 
   #ganttEmpty { color: var(--muted); font-size: 13px; padding: 12px 0; }
 
+  /* --- collapsible panel header (used by the "Set project dates" panel) --- */
+  .panel-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    cursor: pointer;
+    text-align: left;
+  }
+  .panel-toggle .chevron {
+    display: inline-block;
+    font-size: 10px;
+    transition: transform 0.15s ease;
+  }
+  .panel-toggle[aria-expanded="false"] .chevron { transform: rotate(-90deg); }
+  .panel-toggle[aria-expanded="false"] { margin-bottom: 0; }
+
   /* --- date-setting form --- */
   .date-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  .date-form[hidden] { display: none; }
   .date-form .field { display: flex; flex-direction: column; gap: 4px; }
   .date-form label { font-size: 11px; color: var(--muted); }
   .date-form select, .date-form input {
@@ -203,14 +229,15 @@
 <div class="wrap">
   <header>
     <h1>Project Gantt Chart</h1>
-    <p class="sub">One bar per project. Bar colour reflects task-completion progress; click a bar to see its tasks.</p>
   </header>
 
   <div id="statusBox" class="status" hidden></div>
 
-  <div class="panel">
-    <h2>Set project dates</h2>
-    <div class="date-form">
+  <div class="panel" id="datesPanel">
+    <button type="button" class="panel-toggle" id="datesToggle" aria-expanded="true" aria-controls="datesBody">
+      <span class="chevron">&#9660;</span> Set project dates
+    </button>
+    <div class="date-form" id="datesBody">
       <div class="field">
         <label for="projectSelect">Project</label>
         <select id="projectSelect"></select>
@@ -265,6 +292,8 @@
   const taskSidebar = document.getElementById("taskSidebar");
   const zoomOutBtn = document.getElementById("zoomOutBtn");
   const zoomInBtn = document.getElementById("zoomInBtn");
+  const datesToggle = document.getElementById("datesToggle");
+  const datesBody = document.getElementById("datesBody");
   let ganttInstance = null;
   let projectsById = {};
   let currentViewMode = "Week";
@@ -469,6 +498,16 @@
     }
   }
 
+  function setDatesPanelCollapsed(collapsed) {
+    datesBody.hidden = collapsed;
+    datesToggle.setAttribute("aria-expanded", String(!collapsed));
+    try { localStorage.setItem("gantt.datesPanelCollapsed", collapsed ? "1" : "0"); } catch (e) {}
+  }
+
+  datesToggle.addEventListener("click", () => {
+    setDatesPanelCollapsed(!datesBody.hidden);
+  });
+
   projectSelect.addEventListener("change", fillDatesFromSelection);
   zoomOutBtn.addEventListener("click", () => setViewMode("Month"));
   zoomInBtn.addEventListener("click", () => setViewMode("Week"));
@@ -519,6 +558,9 @@
   });
 
   (async function init() {
+    let collapsed = false;
+    try { collapsed = localStorage.getItem("gantt.datesPanelCollapsed") === "1"; } catch (e) {}
+    setDatesPanelCollapsed(collapsed);
     zoomOutBtn.classList.toggle("active", currentViewMode === "Month");
     zoomInBtn.classList.toggle("active", currentViewMode === "Week");
     await loadProjects();
