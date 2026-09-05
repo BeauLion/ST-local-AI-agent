@@ -28,10 +28,16 @@
   header .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
 
   .status {
+    position: fixed; /* position of the status massages such as "saved" */
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
     padding: 10px 14px;
     border-radius: 6px;
     font-size: 13px;
-    margin-bottom: 16px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+    z-index: 2000;
+    background: var(--panel);
   }
   .status.ok { background: rgba(76,175,125,0.12); color: var(--ok); }
   .status.err { background: rgba(224,85,95,0.12); color: var(--danger); }
@@ -81,6 +87,12 @@
   .gantt-bar-high .bar-progress,
   .gantt-bar-done .bar-progress,
   .gantt-bar-paused .bar-progress { fill: rgba(255,255,255,0.35); }
+
+  /* thickened border on the bar clicked most recently, to show it's selected */
+  .bar-wrapper.selected .bar {
+    stroke: var(--accent);
+    stroke-width: 2.5;
+  }
 
   .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-top: 10px; flex-wrap: wrap; }
   .legend span { display: inline-flex; align-items: center; gap: 6px; }
@@ -446,7 +458,12 @@
         view_mode: currentViewMode,
         date_format: "YYYY-MM-DD",
         readonly_progress: true,
-        on_click: (task) => showProjectTasks(task.id),
+        on_click: (task) => {
+          document.querySelectorAll(".bar-wrapper.selected").forEach((el) => el.classList.remove("selected"));
+          const wrapper = document.querySelector(`.bar-wrapper[data-id="${task.id}"]`);
+          if (wrapper) wrapper.classList.add("selected");
+          showProjectTasks(task.id);
+        },
         on_date_change: (task, start, end) => saveBarDates(task, start, end),
       });
     }
