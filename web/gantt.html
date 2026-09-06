@@ -200,6 +200,68 @@
     border-color: var(--accent);
   }
 
+  /* --- project board (kanban) --- */
+  #boardPanel .hint { color: var(--muted); font-size: 12px; }
+  .board {
+    display: flex;
+    gap: 12px;
+    overflow-x: auto;
+  }
+  .board-col {
+    flex: 1 1 0;
+    min-width: 160px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .board-col.drag-over {
+    border-color: var(--accent);
+    background: rgba(91,140,255,0.06);
+  }
+  .board-col-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--muted);
+    padding: 2px 2px 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .board-col-count {
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 11px;
+  }
+  .board-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 40px;
+  }
+  .board-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 12px;
+    cursor: grab;
+  }
+  .board-card.dragging { opacity: 0.4; }
+  .board-card .card-title { display: block; margin-bottom: 4px; }
+  .board-card .card-priority {
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .03em;
+  }
+
   /* floating date label shown while dragging a bar's edge handle */
   .bar-drag-label {
     position: fixed;
@@ -278,6 +340,12 @@
       <span><i class="swatch" style="background:#6b6d76"></i>Paused</span>
     </div>
   </div>
+
+  <div class="panel" id="boardPanel">
+    <h2>Project Board</h2>
+    <p class="hint" id="boardHint">Select a project bar in the chart above to see its board here.</p>
+    <div class="board" id="board" hidden></div>
+  </div>
 </div>
 
 <script src="/vendor/frappe-gantt.umd.js"></script>
@@ -294,11 +362,21 @@
   const zoomInBtn = document.getElementById("zoomInBtn");
   const datesToggle = document.getElementById("datesToggle");
   const datesBody = document.getElementById("datesBody");
+  const board = document.getElementById("board");
+  const boardHint = document.getElementById("boardHint");
   let ganttInstance = null;
   let projectsById = {};
   let currentViewMode = "Week";
   let activeDrag = null; // { taskId, side } while a bar's left/right handle is being dragged
   let dragLabelEl = null;
+  let boardProjectId = null;
+  const TASK_STATUSES = [
+    { key: "pending", label: "Pending" },
+    { key: "active", label: "Active" },
+    { key: "blocked", label: "Blocked" },
+    { key: "done", label: "Done" },
+    { key: "cancelled", label: "Cancelled" },
+  ];
 
   function setViewMode(mode) {
     currentViewMode = mode;
@@ -393,6 +471,84 @@
     } catch (e) {
       taskSidebar.innerHTML = `<p class="hint">${e.message}</p>`;
     }
+  }
+
+  async function loadBoard(projectId) {
+    boardProjectId = projectId;
+    boardHint.hidden = false;
+    boardHint.textContent = "Loading board…";
+    board.hidden = true;
+    try {
+      const res = await fetch(`/projects/${projectId}`);
+      if (!res.ok) throw new Error("Could not load that project.");
+      const project = await res.json();
+      renderBoard(project);
+    } catch (e) {
+      boardHint.textContent = e.message;
+    }
+  }
+
+  function renderBoard(project) {
+    const tasks = Object.values(project.tasks || {});
+    tasks.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+    board.innerHTML = "";
+    for (const s of TASK_STATUSES) {
+      const col = document.createElement("div");
+      col.className = "board-col";
+      col.dataset.status = s.key;
+
+      const header = document.createElement("div");
+      header.className = "board-col-header";
+      const colTasks = tasks.filter((t) => t.status === s.key);
+      header.innerHTML = `<span>${s.label}</span><span class="board-col-count">${colTasks.length}</span>`;
+      col.appendChild(header);
+
+      const cards = document.createElement("div");
+      cards.className = "board-cards";
+      for (const t of colTasks) {
+        const card = document.createElement("div");
+        card.className = "board-card";
+        card.draggable = true;
+        card.dataset.taskId = t.id;
+        card.innerHTML = `<span class="card-title">${t.title}</span><span class="card-priority">${t.priority || ""}</span>`;
+        card.addEventListener("dragstart", (e) => {
+          card.classList.add("dragging");
+          e.dataTransfer.setData("text/plain", t.id);
+          e.dataTransfer.effectAllowed = "move";
+        });
+        card.addEventListener("dragend", () => card.classList.remove("dragging"));
+        cards.appendChild(card);
+      }
+      col.appendChild(cards);
+
+      col.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        col.classList.add("drag-over");
+      });
+      col.addEventListener("dragleave", () => col.classList.remove("drag-over"));
+      col.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        col.classList.remove("drag-over");
+        const taskId = e.dataTransfer.getData("text/plain");
+        const task = tasks.find((t) => t.id === taskId);
+        if (!task || task.status === s.key) return;
+        try {
+          const res = await fetch(`/projects/${boardProjectId}/tasks/${taskId}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: s.key }),
+          });
+          if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+          await loadBoard(boardProjectId);
+        } catch (err) {
+          showStatus(err.message, false);
+        }
+      });
+
+      board.appendChild(col);
+    }
+    boardHint.hidden = true;
+    board.hidden = false;
   }
 
   function toDateInputValue(date) {
@@ -492,6 +648,7 @@
           const wrapper = document.querySelector(`.bar-wrapper[data-id="${task.id}"]`);
           if (wrapper) wrapper.classList.add("selected");
           showProjectTasks(task.id);
+          loadBoard(task.id);
         },
         on_date_change: (task, start, end) => saveBarDates(task, start, end),
       });
