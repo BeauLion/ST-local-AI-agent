@@ -128,13 +128,45 @@
   .chart-area { display: flex; gap: 16px; align-items: stretch; }
 
   .task-sidebar {
+    position: relative;
     width: 260px;
     flex: 0 0 260px;
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 12px;
+    padding-top: 30px;
     overflow-y: auto;
     background: var(--bg);
+    transition: flex-basis 0.15s ease, width 0.15s ease, padding 0.15s ease;
+  }
+  .task-sidebar.collapsed {
+    width: 28px;
+    flex: 0 0 28px;
+    padding: 12px 0 0;
+    overflow: hidden;
+  }
+  .task-sidebar.collapsed .task-sidebar-content { display: none; }
+  .sidebar-toggle {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: var(--panel);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    width: 20px;
+    height: 20px;
+    line-height: 1;
+    font-size: 10px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .sidebar-toggle:hover { color: var(--text); }
+  .task-sidebar.collapsed .sidebar-toggle {
+    position: static;
+    margin: 0 auto;
   }
   .task-sidebar h3 {
     font-size: 12px;
@@ -246,6 +278,7 @@
     min-height: 40px;
   }
   .board-card {
+    position: relative;
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -254,12 +287,21 @@
     cursor: grab;
   }
   .board-card.dragging { opacity: 0.4; }
-  .board-card .card-title { display: block; margin-bottom: 4px; }
-  .board-card .card-priority {
+  .board-card .card-title { display: block; margin-bottom: 4px; padding-right: 14px; }
+  .board-card .card-note {
+    display: block;
     color: var(--muted);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: .03em;
+    font-size: 11px;
+    white-space: pre-wrap;
+  }
+  .board-card .card-priority-flag {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    color: var(--danger);
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
   }
 
   /* floating date label shown while dragging a bar's edge handle */
@@ -322,7 +364,10 @@
     <div id="ganttEmpty" hidden>No projects have both a start and end date set yet — use the form above to add one.</div>
     <div class="chart-area" id="chartArea">
       <div class="task-sidebar" id="taskSidebar">
-        <p class="hint">Click a bar to see that project's tasks here.</p>
+        <button type="button" class="sidebar-toggle" id="sidebarToggle" title="Collapse">&#9664;</button>
+        <div class="task-sidebar-content" id="taskSidebarContent">
+          <p class="hint">Click a bar to see that project's tasks here.</p>
+        </div>
       </div>
       <div class="chart-scroll" id="chartScroll">
         <svg id="gantt"></svg>
@@ -358,6 +403,8 @@
   const ganttEmpty = document.getElementById("ganttEmpty");
   const chartArea = document.getElementById("chartArea");
   const taskSidebar = document.getElementById("taskSidebar");
+  const taskSidebarContent = document.getElementById("taskSidebarContent");
+  const sidebarToggle = document.getElementById("sidebarToggle");
   const zoomOutBtn = document.getElementById("zoomOutBtn");
   const zoomInBtn = document.getElementById("zoomInBtn");
   const datesToggle = document.getElementById("datesToggle");
@@ -423,7 +470,7 @@
   }
 
   async function showProjectTasks(projectId) {
-    taskSidebar.innerHTML = '<p class="hint">Loading tasks\u2026</p>';
+    taskSidebarContent.innerHTML = '<p class="hint">Loading tasks\u2026</p>';
     try {
       const childRes = await fetch(`/gantt/${projectId}/children`);
       if (childRes.ok) {
@@ -437,7 +484,7 @@
             <span class="task-title">${c.short_code} \u2014 ${c.name}</span>
             <div class="task-meta"><span class="task-status ${c.status}">${c.status}</span></div>
           </li>`).join("");
-          taskSidebar.innerHTML = header + '<p class="hint">Child projects</p>' + `<ul class="task-list">${items}</ul>`;
+          taskSidebarContent.innerHTML = header + '<p class="hint">Child projects</p>' + `<ul class="task-list">${items}</ul>`;
           return;
         }
       }
@@ -451,7 +498,7 @@
       const tasks = Object.values(project.tasks || {});
       const header = `<h3>${project.short_code} <span class="proj-code">\u2014 ${project.name}</span></h3>`;
       if (!tasks.length) {
-        taskSidebar.innerHTML = header + '<p class="hint">No tasks in this project.</p>';
+        taskSidebarContent.innerHTML = header + '<p class="hint">No tasks in this project.</p>';
         return;
       }
       tasks.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
@@ -467,9 +514,9 @@
           ${doneLine}
         </li>`;
       }).join("");
-      taskSidebar.innerHTML = header + `<ul class="task-list">${items}</ul>`;
+      taskSidebarContent.innerHTML = header + `<ul class="task-list">${items}</ul>`;
     } catch (e) {
-      taskSidebar.innerHTML = `<p class="hint">${e.message}</p>`;
+      taskSidebarContent.innerHTML = `<p class="hint">${e.message}</p>`;
     }
   }
 
@@ -510,7 +557,9 @@
         card.className = "board-card";
         card.draggable = true;
         card.dataset.taskId = t.id;
-        card.innerHTML = `<span class="card-title">${t.title}</span><span class="card-priority">${t.priority || ""}</span>`;
+        const flag = t.priority === "high" ? '<span class="card-priority-flag" title="High priority">&#10071;</span>' : "";
+        const note = t.notes ? `<span class="card-note">${t.notes}</span>` : "";
+        card.innerHTML = `${flag}<span class="card-title">${t.title}</span>${note}`;
         card.addEventListener("dragstart", (e) => {
           card.classList.add("dragging");
           e.dataTransfer.setData("text/plain", t.id);
@@ -665,6 +714,17 @@
     setDatesPanelCollapsed(!datesBody.hidden);
   });
 
+  function setSidebarCollapsed(collapsed) {
+    taskSidebar.classList.toggle("collapsed", collapsed);
+    sidebarToggle.textContent = collapsed ? "▶" : "◀";
+    sidebarToggle.title = collapsed ? "Expand" : "Collapse";
+    try { localStorage.setItem("gantt.sidebarCollapsed", collapsed ? "1" : "0"); } catch (e) {}
+  }
+
+  sidebarToggle.addEventListener("click", () => {
+    setSidebarCollapsed(!taskSidebar.classList.contains("collapsed"));
+  });
+
   projectSelect.addEventListener("change", fillDatesFromSelection);
   zoomOutBtn.addEventListener("click", () => setViewMode("Month"));
   zoomInBtn.addEventListener("click", () => setViewMode("Week"));
@@ -718,6 +778,9 @@
     let collapsed = false;
     try { collapsed = localStorage.getItem("gantt.datesPanelCollapsed") === "1"; } catch (e) {}
     setDatesPanelCollapsed(collapsed);
+    let sidebarCollapsed = false;
+    try { sidebarCollapsed = localStorage.getItem("gantt.sidebarCollapsed") === "1"; } catch (e) {}
+    setSidebarCollapsed(sidebarCollapsed);
     zoomOutBtn.classList.toggle("active", currentViewMode === "Month");
     zoomInBtn.classList.toggle("active", currentViewMode === "Week");
     await loadProjects();
