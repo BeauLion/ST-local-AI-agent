@@ -262,6 +262,80 @@
     border-color: var(--ok);
     color: #fff;
   }
+  .board-panel-header .board-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .board-add-toggle {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+  }
+  .board-add-toggle:hover { color: var(--text); border-color: var(--accent); }
+
+  /* --- new task modal --- */
+  .task-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 3000;
+  }
+  .task-modal-overlay[hidden] { display: none; }
+  .task-modal {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    width: 380px;
+    max-width: calc(100vw - 32px);
+  }
+  .task-modal h3 { margin: 0 0 14px; font-size: 15px; }
+  .task-modal .field { margin-bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .task-modal label { font-size: 12px; color: var(--muted); }
+  .task-modal input[type="text"],
+  .task-modal select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 13px;
+  }
+  .task-modal .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .task-modal button {
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .task-modal button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .task-modal button:hover { opacity: 0.9; }
   .board {
     display: flex;
     gap: 12px;
@@ -499,10 +573,35 @@
   <div class="panel" id="boardPanel">
     <div class="board-panel-header">
       <h2>Project Board</h2>
-      <button type="button" class="board-edit-toggle" id="boardEditToggle" title="Edit tasks" aria-pressed="false">&#9998;</button>
+      <div class="board-header-actions">
+        <button type="button" class="board-add-toggle" id="boardAddToggle" title="Add task">&#43;</button>
+        <button type="button" class="board-edit-toggle" id="boardEditToggle" title="Edit tasks" aria-pressed="false">&#9998;</button>
+      </div>
     </div>
     <p class="hint" id="boardHint">Select a project bar in the chart above to see its board here.</p>
     <div class="board" id="board" hidden></div>
+  </div>
+</div>
+
+<div class="task-modal-overlay" id="taskModalOverlay" hidden>
+  <div class="task-modal">
+    <h3>New Task</h3>
+    <div class="field">
+      <label for="newTaskProject">Project</label>
+      <input type="text" id="newTaskProject" disabled>
+    </div>
+    <div class="field">
+      <label for="newTaskTitle">Title</label>
+      <input type="text" id="newTaskTitle" placeholder="Task title">
+    </div>
+    <div class="field">
+      <label for="newTaskStatus">Status</label>
+      <select id="newTaskStatus"></select>
+    </div>
+    <div class="modal-actions">
+      <button type="button" id="newTaskCancelBtn">Cancel</button>
+      <button type="button" class="primary" id="newTaskCreateBtn">Create</button>
+    </div>
   </div>
 </div>
 
@@ -728,6 +827,73 @@
   }
 
   boardEditToggle.addEventListener("click", () => setBoardEditMode(!boardEditMode));
+
+  const boardAddToggle = document.getElementById("boardAddToggle");
+  const taskModalOverlay = document.getElementById("taskModalOverlay");
+  const newTaskProject = document.getElementById("newTaskProject");
+  const newTaskTitle = document.getElementById("newTaskTitle");
+  const newTaskStatus = document.getElementById("newTaskStatus");
+  const newTaskCancelBtn = document.getElementById("newTaskCancelBtn");
+  const newTaskCreateBtn = document.getElementById("newTaskCreateBtn");
+  for (const s of TASK_STATUSES) {
+    const opt = document.createElement("option");
+    opt.value = s.key;
+    opt.textContent = s.label;
+    newTaskStatus.appendChild(opt);
+  }
+
+  function openTaskModal() {
+    if (!boardProjectId) {
+      showStatus("Select a project on the board first.", false);
+      return;
+    }
+    const project = projectsById[boardProjectId];
+    newTaskProject.value = project ? `${project.short_code} — ${project.name}` : boardProjectId;
+    newTaskTitle.value = "";
+    newTaskStatus.value = "pending";
+    taskModalOverlay.hidden = false;
+    newTaskTitle.focus();
+  }
+
+  function closeTaskModal() {
+    taskModalOverlay.hidden = true;
+  }
+
+  boardAddToggle.addEventListener("click", openTaskModal);
+  newTaskCancelBtn.addEventListener("click", closeTaskModal);
+  taskModalOverlay.addEventListener("click", (e) => {
+    if (e.target === taskModalOverlay) closeTaskModal();
+  });
+
+  newTaskCreateBtn.addEventListener("click", async () => {
+    const title = newTaskTitle.value.trim();
+    if (!title) {
+      showStatus("Enter a task title.", false);
+      return;
+    }
+    try {
+      const res = await fetch(`/projects/${boardProjectId}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+      const task = await res.json();
+      if (newTaskStatus.value !== "pending") {
+        const patchRes = await fetch(`/projects/${boardProjectId}/tasks/${task.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: newTaskStatus.value }),
+        });
+        if (!patchRes.ok) throw new Error((await patchRes.json()).detail || "Request failed");
+      }
+      closeTaskModal();
+      showStatus("Task created.", true);
+      await loadBoard(boardProjectId);
+    } catch (err) {
+      showStatus(err.message, false);
+    }
+  });
 
   function renderBoard(project) {
     const tasks = Object.values(project.tasks || {});
