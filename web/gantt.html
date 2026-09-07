@@ -234,6 +234,34 @@
 
   /* --- project board (kanban) --- */
   #boardPanel .hint { color: var(--muted); font-size: 12px; }
+  .board-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .board-panel-header h2 { margin: 0; }
+  .board-edit-toggle {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .board-edit-toggle:hover { color: var(--text); }
+  .board-edit-toggle.active {
+    background: var(--ok);
+    border-color: var(--ok);
+    color: #fff;
+  }
   .board {
     display: flex;
     gap: 12px;
@@ -302,6 +330,29 @@
     font-size: 12px;
     font-weight: 700;
     line-height: 1;
+  }
+  .board-card.editing { cursor: default; }
+  .board-card .card-title-input,
+  .board-card .card-note-input {
+    display: block;
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 12px;
+    font-family: inherit;
+    margin-bottom: 6px;
+    box-sizing: border-box;
+  }
+  .board-card .card-note-input { resize: vertical; min-height: 40px; }
+  .board-card .card-priority-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--muted);
   }
 
   /* floating date label shown while dragging a bar's edge handle */
@@ -387,7 +438,10 @@
   </div>
 
   <div class="panel" id="boardPanel">
-    <h2>Project Board</h2>
+    <div class="board-panel-header">
+      <h2>Project Board</h2>
+      <button type="button" class="board-edit-toggle" id="boardEditToggle" title="Edit tasks" aria-pressed="false">&#9998;</button>
+    </div>
     <p class="hint" id="boardHint">Select a project bar in the chart above to see its board here.</p>
     <div class="board" id="board" hidden></div>
   </div>
@@ -411,12 +465,14 @@
   const datesBody = document.getElementById("datesBody");
   const board = document.getElementById("board");
   const boardHint = document.getElementById("boardHint");
+  const boardEditToggle = document.getElementById("boardEditToggle");
   let ganttInstance = null;
   let projectsById = {};
   let currentViewMode = "Week";
   let activeDrag = null; // { taskId, side } while a bar's left/right handle is being dragged
   let dragLabelEl = null;
   let boardProjectId = null;
+  let boardEditMode = false;
   const TASK_STATUSES = [
     { key: "pending", label: "Pending" },
     { key: "active", label: "Active" },
@@ -535,6 +591,30 @@
     }
   }
 
+  async function saveTaskField(taskId, patch) {
+    try {
+      const res = await fetch(`/projects/${boardProjectId}/tasks/${taskId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+      showStatus("Saved.", true);
+    } catch (err) {
+      showStatus(err.message, false);
+    }
+  }
+
+  function setBoardEditMode(enabled) {
+    boardEditMode = enabled;
+    boardEditToggle.classList.toggle("active", enabled);
+    boardEditToggle.setAttribute("aria-pressed", String(enabled));
+    boardEditToggle.title = enabled ? "Editing tasks (click to lock)" : "Edit tasks";
+    if (boardProjectId) loadBoard(boardProjectId);
+  }
+
+  boardEditToggle.addEventListener("click", () => setBoardEditMode(!boardEditMode));
+
   function renderBoard(project) {
     const tasks = Object.values(project.tasks || {});
     tasks.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
@@ -555,27 +635,62 @@
       for (const t of colTasks) {
         const card = document.createElement("div");
         card.className = "board-card";
-        card.draggable = true;
         card.dataset.taskId = t.id;
-        const flag = t.priority === "high" ? '<span class="card-priority-flag" title="High priority">&#10071;</span>' : "";
-        const note = t.notes ? `<span class="card-note">${t.notes}</span>` : "";
-        card.innerHTML = `${flag}<span class="card-title">${t.title}</span>${note}`;
-        card.addEventListener("dragstart", (e) => {
-          card.classList.add("dragging");
-          e.dataTransfer.setData("text/plain", t.id);
-          e.dataTransfer.effectAllowed = "move";
-        });
-        card.addEventListener("dragend", () => card.classList.remove("dragging"));
+
+        if (boardEditMode) {
+          card.classList.add("editing");
+          card.draggable = false;
+
+          const titleInput = document.createElement("input");
+          titleInput.type = "text";
+          titleInput.className = "card-title-input";
+          titleInput.value = t.title;
+          titleInput.addEventListener("change", () => saveTaskField(t.id, { title: titleInput.value }));
+
+          const notesInput = document.createElement("textarea");
+          notesInput.className = "card-note-input";
+          notesInput.placeholder = "Notes";
+          notesInput.value = t.notes || "";
+          notesInput.addEventListener("change", () => saveTaskField(t.id, { notes: notesInput.value }));
+
+          const priorityLabel = document.createElement("label");
+          priorityLabel.className = "card-priority-toggle";
+          const priorityCheckbox = document.createElement("input");
+          priorityCheckbox.type = "checkbox";
+          priorityCheckbox.checked = t.priority === "high";
+          priorityCheckbox.addEventListener("change", () => {
+            saveTaskField(t.id, { priority: priorityCheckbox.checked ? "high" : "normal" });
+          });
+          priorityLabel.appendChild(priorityCheckbox);
+          priorityLabel.appendChild(document.createTextNode("High priority"));
+
+          card.appendChild(titleInput);
+          card.appendChild(notesInput);
+          card.appendChild(priorityLabel);
+        } else {
+          card.draggable = true;
+          const flag = t.priority === "high" ? '<span class="card-priority-flag" title="High priority">&#10071;</span>' : "";
+          const note = t.notes ? `<span class="card-note">${t.notes}</span>` : "";
+          card.innerHTML = `${flag}<span class="card-title">${t.title}</span>${note}`;
+          card.addEventListener("dragstart", (e) => {
+            card.classList.add("dragging");
+            e.dataTransfer.setData("text/plain", t.id);
+            e.dataTransfer.effectAllowed = "move";
+          });
+          card.addEventListener("dragend", () => card.classList.remove("dragging"));
+        }
         cards.appendChild(card);
       }
       col.appendChild(cards);
 
       col.addEventListener("dragover", (e) => {
+        if (boardEditMode) return;
         e.preventDefault();
         col.classList.add("drag-over");
       });
       col.addEventListener("dragleave", () => col.classList.remove("drag-over"));
       col.addEventListener("drop", async (e) => {
+        if (boardEditMode) return;
         e.preventDefault();
         col.classList.remove("drag-over");
         const taskId = e.dataTransfer.getData("text/plain");
