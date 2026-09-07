@@ -667,10 +667,28 @@ def project_manager_create_task(args: dict) -> str:
         project = project_manager.resolve_project(state, args.get("project"))
         task = project_manager.create_task(
             project["id"], args.get("title", ""), notes=args.get("notes", ""),
-            deadline=args.get("deadline", ""),
+            deadline=args.get("deadline", ""), duration=args.get("duration", ""),
+            effort=args.get("effort", ""), when=args.get("when", ""),
         )
         suffix = f" (due {task['deadline']})" if task["deadline"] else ""
         return f"Created task {task['short_id']}: {task['title']}{suffix}"
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_update_task_details(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        task = project_manager.get_task(project, args.get("task"))
+        if not task:
+            return "Error: Task not found or ambiguous. Call project_manager_get_overview and use an exact task ID."
+        updated = project_manager.update_task_details(
+            project["id"], task["id"],
+            title=args.get("title"), priority=args.get("priority"), deadline=args.get("deadline"),
+            duration=args.get("duration"), effort=args.get("effort"), when=args.get("when"),
+        )
+        return f"Updated {updated['short_id']} (“{updated['title']}”)."
     except ProjectManagerError as e:
         return f"Error: {e}"
 
@@ -1295,10 +1313,34 @@ TOOLS = [
                 "properties": {
                     "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "title": {"type": "string", "description": "Short, concrete, verb-led task title."},
-                    "notes": {"type": "string", "description": "Optional. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task, put recognized tag lines at the very top, one per line: 'dur: 45m' (also '1h', '1h30m', '90'), 'effort: low'/'medium'/'high', 'when: morning'/'afternoon'/'evening' (optionally + 'weekday'/'weekend'). Any text after the tag lines is kept as freeform notes."},
+                    "notes": {"type": "string", "description": "Optional freeform notes."},
                     "deadline": {"type": "string", "description": "Optional. When the task is due, as 'YYYY-MM-DD' (date only) or 'YYYY-MM-DDTHH:MM' (date and time). Never a time alone - always include the date. Only set this when the user gives an actual deadline, not a vague timeframe."},
+                    "duration": {"type": "string", "description": "Optional duration estimate, e.g. '45m', '1h30m', or '90'. Only set this when the user gives an actual estimate."},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high"], "description": "Optional effort level."},
+                    "when": {"type": "string", "description": "Optional preferred time window: 'morning'/'afternoon'/'evening', optionally followed by 'weekday'/'weekend' (e.g. 'afternoon weekend')."},
                 },
                 "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_update_task_details",
+            "description": "Change an existing task's title, priority, deadline, duration estimate, effort level, or preferred time window. Only set fields the user explicitly gives a new value for - omit everything else. For notes, use project_manager_update_task_notes instead; for status, use project_manager_update_task_status instead.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
+                    "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
+                    "title": {"type": "string", "description": "New title."},
+                    "priority": {"type": "string", "enum": ["low", "normal", "high"]},
+                    "deadline": {"type": "string", "description": "New deadline, 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM'. Pass an empty string to clear it."},
+                    "duration": {"type": "string", "description": "New duration estimate, e.g. '45m', '1h30m', or '90'. Pass an empty string to clear it."},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high"], "description": "New effort level. Pass an empty string to clear it."},
+                    "when": {"type": "string", "description": "New preferred time window, e.g. 'afternoon weekend'. Pass an empty string to clear it."},
+                },
+                "required": ["task"],
             },
         },
     },
@@ -1322,7 +1364,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "project_manager_update_task_notes",
-            "description": "Replace, append to, or clear the notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task (not just when asked), put recognized tag lines at the very top of the text, one per line: 'dur: 45m' (also accepts '1h', '1h30m', '90'), 'effort: low' / 'effort: medium' / 'effort: high', and 'when: morning' / 'afternoon' / 'evening', optionally followed by 'weekday' or 'weekend' (e.g. 'when: afternoon weekend'). Any text after the tag lines is kept as freeform notes. Appending new tag lines only updates those specific tags and leaves the rest of the note (including other existing tags) intact - no need to replace the whole note to change one tag.",
+            "description": "Replace, append to, or clear the freeform notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten. For a duration estimate, effort level, deadline, or preferred time window, use project_manager_update_task_details instead - those are separate structured fields, not part of notes.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1364,15 +1406,18 @@ TOOLS = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "type": {"type": "string", "enum": ["create_task", "update_task_status", "update_task_notes"]},
-                                "title": {"type": "string", "description": "For create_task."},
-                                "priority": {"type": "string", "enum": ["low", "normal", "high"]},
-                                "notes": {"type": "string", "description": "For create_task. Optional tag lines at the top ('dur: 45m', 'effort: medium', 'when: afternoon weekend') show up automatically next to the task - see project_manager_update_task_notes for the exact syntax."},
-                                "deadline": {"type": "string", "description": "For create_task. Optional, 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM' - never a time alone."},
-                                "task": {"type": "string", "description": "For status or note updates: task ID, short ID, or unambiguous title."},
+                                "type": {"type": "string", "enum": ["create_task", "update_task_details", "update_task_status", "update_task_notes"]},
+                                "title": {"type": "string", "description": "For create_task (required there) or update_task_details (new title)."},
+                                "priority": {"type": "string", "enum": ["low", "normal", "high"], "description": "For create_task or update_task_details."},
+                                "notes": {"type": "string", "description": "For create_task only. Optional freeform notes."},
+                                "deadline": {"type": "string", "description": "For create_task or update_task_details. 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM' - never a time alone. For update_task_details, an empty string clears it."},
+                                "duration": {"type": "string", "description": "For create_task or update_task_details. Duration estimate, e.g. '45m', '1h30m', or '90'. For update_task_details, an empty string clears it."},
+                                "effort": {"type": "string", "enum": ["low", "medium", "high"], "description": "For create_task or update_task_details. For update_task_details, an empty string clears it."},
+                                "when": {"type": "string", "description": "For create_task or update_task_details. Preferred time window, e.g. 'afternoon weekend'. For update_task_details, an empty string clears it."},
+                                "task": {"type": "string", "description": "For status, note, or detail updates: task ID, short ID, or unambiguous title."},
                                 "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                                 "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
-                                "text": {"type": "string", "description": "For update_task_notes. Same 'dur:'/'effort:'/'when:' tag syntax as project_manager_update_task_notes applies here."},
+                                "text": {"type": "string", "description": "For update_task_notes. Freeform note text."},
                             },
                             "required": ["type"],
                         },
@@ -1634,6 +1679,7 @@ TOOL_FUNCTIONS = {
     "calendar_check_availability": calendar_check_availability,
     "project_manager_get_overview": project_manager_get_overview,
     "project_manager_create_task": project_manager_create_task,
+    "project_manager_update_task_details": project_manager_update_task_details,
     "project_manager_update_task_status": project_manager_update_task_status,
     "project_manager_update_task_notes": project_manager_update_task_notes,
     "project_manager_set_all_tasks_status": project_manager_set_all_tasks_status,
@@ -1668,6 +1714,7 @@ TOOL_GROUPS = {
     "calendar_delete_event": "calendar", "calendar_confirm_pending": "calendar",
     "calendar_cancel_pending": "calendar", "calendar_check_availability": "calendar",
     "project_manager_get_overview": "project", "project_manager_create_task": "project",
+    "project_manager_update_task_details": "project",
     "project_manager_update_task_status": "project", "project_manager_update_task_notes": "project",
     "project_manager_set_all_tasks_status": "project", "project_manager_batch_update": "project",
     "project_manager_set_gantt_dates": "project",
@@ -2088,7 +2135,8 @@ async def api_create_task(project_id: str, request: Request):
             project_manager.create_task,
             project_id, body.get("title", ""),
             priority=body.get("priority", "normal"), notes=body.get("notes", ""),
-            deadline=body.get("deadline", ""),
+            deadline=body.get("deadline", ""), duration=body.get("duration", ""),
+            effort=body.get("effort", ""), when=body.get("when", ""),
         )
     except ProjectManagerError as e:
         _pm_error(e)
@@ -2102,11 +2150,12 @@ async def api_update_task(project_id: str, task_id: str, request: Request):
         task = None
         if "status" in body:
             task, _flag = await asyncio.to_thread(project_manager.set_task_status, project_id, task_id, body["status"])
-        if any(k in body for k in ("title", "priority", "notes", "deadline")):
+        if any(k in body for k in ("title", "priority", "notes", "deadline", "duration", "effort", "when")):
             task = await asyncio.to_thread(
                 project_manager.update_task_details, project_id, task_id,
                 title=body.get("title"), priority=body.get("priority"), notes=body.get("notes"),
-                deadline=body.get("deadline"),
+                deadline=body.get("deadline"), duration=body.get("duration"),
+                effort=body.get("effort"), when=body.get("when"),
             )
         if "notes_mode" in body:
             task = await asyncio.to_thread(

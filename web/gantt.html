@@ -328,6 +328,12 @@
     font-size: 11px;
     margin-bottom: 4px;
   }
+  .board-card .card-properties {
+    display: block;
+    color: var(--muted);
+    font-size: 11px;
+    margin-bottom: 4px;
+  }
   .board-card .card-priority-flag {
     position: absolute;
     top: 6px;
@@ -370,6 +376,36 @@
   }
   .board-card .card-deadline-date-input { flex: 1 1 60%; }
   .board-card .card-deadline-time-input { flex: 1 1 40%; }
+  .board-card .card-duration-input,
+  .board-card .card-effort-select {
+    display: block;
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 11px;
+    font-family: inherit;
+    margin-bottom: 6px;
+    box-sizing: border-box;
+  }
+  .board-card .card-when-wrap {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .board-card .card-when-wrap select {
+    flex: 1 1 50%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 11px;
+    font-family: inherit;
+    box-sizing: border-box;
+  }
   .board-card .card-priority-toggle {
     display: flex;
     align-items: center;
@@ -550,6 +586,29 @@
     return date.toLocaleString(undefined, opts);
   }
 
+  function formatDurationInput(minutes) {
+    // Mirrors project_manager._format_duration_tag's "1h30m"/"2h"/"45m"
+    // shape - the edit-mode duration input round-trips through this same
+    // compact text, and the backend parser (_parse_task_duration, via
+    // duration_manager.parse_duration_minutes) accepts it back unchanged.
+    const total = Math.round(minutes);
+    const hours = Math.floor(total / 60);
+    const mins = total % 60;
+    if (hours && mins) return `${hours}h${mins}m`;
+    if (hours) return `${hours}h`;
+    return `${mins}m`;
+  }
+
+  function formatTaskProperties(t) {
+    // Client-side mirror of project_manager._format_task_properties_inline
+    // for the board card's view-mode badge.
+    const parts = [];
+    if (t.duration_minutes != null) parts.push(`~${formatDurationInput(t.duration_minutes)}`);
+    if (t.effort) parts.push(`${t.effort} effort`);
+    if (t.when) parts.push(t.when);
+    return parts.join(" · ");
+  }
+
   async function loadProjects() {
     const res = await fetch("/projects");
     const data = await res.json();
@@ -611,12 +670,17 @@
         const deadlineLine = t.deadline
           ? `<div class="task-meta"><span>Due</span><span>${formatDeadline(t.deadline)}</span></div>`
           : "";
+        const properties = formatTaskProperties(t);
+        const propertiesLine = properties
+          ? `<div class="task-meta"><span>${properties}</span></div>`
+          : "";
         return `<li>
           <span class="task-title">${t.title}</span>
           <div class="task-meta">
             <span class="task-status ${t.status}">${t.status}</span>
           </div>
           ${deadlineLine}
+          ${propertiesLine}
           ${doneLine}
         </li>`;
       }).join("");
@@ -751,16 +815,81 @@
           deadlineWrap.appendChild(deadlineDateInput);
           deadlineWrap.appendChild(deadlineTimeInput);
 
+          // Duration: free text, same shapes project_manager._parse_task_duration
+          // accepts ("45m", "1h30m", "90", ...). Empty clears it.
+          const durationInput = document.createElement("input");
+          durationInput.type = "text";
+          durationInput.className = "card-duration-input";
+          durationInput.placeholder = "Duration (e.g. 45m)";
+          durationInput.value = t.duration_minutes != null ? formatDurationInput(t.duration_minutes) : "";
+          durationInput.addEventListener("change", () => saveTaskField(t.id, { duration: durationInput.value }));
+
+          // Effort: select, empty option clears it.
+          const effortSelect = document.createElement("select");
+          effortSelect.className = "card-effort-select";
+          for (const [value, label] of [["", "Effort (unset)"], ["low", "Low effort"], ["medium", "Medium effort"], ["high", "High effort"]]) {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            effortSelect.appendChild(opt);
+          }
+          effortSelect.value = t.effort || "";
+          effortSelect.addEventListener("change", () => saveTaskField(t.id, { effort: effortSelect.value }));
+
+          // When: time-of-day + optional weekday/weekend modifier, combined
+          // into the single canonical string project_manager._parse_task_when
+          // expects (e.g. "afternoon weekend"). Clearing the time word
+          // clears the whole field.
+          const whenWrap = document.createElement("div");
+          whenWrap.className = "card-when-wrap";
+          const [whenTimePart, whenModifierPart] = (t.when || "").split(" ");
+          const whenTimeSelect = document.createElement("select");
+          whenTimeSelect.className = "card-when-time-select";
+          for (const [value, label] of [["", "When (unset)"], ["morning", "Morning"], ["afternoon", "Afternoon"], ["evening", "Evening"]]) {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            whenTimeSelect.appendChild(opt);
+          }
+          whenTimeSelect.value = whenTimePart || "";
+          const whenModifierSelect = document.createElement("select");
+          whenModifierSelect.className = "card-when-modifier-select";
+          for (const [value, label] of [["", "Any day"], ["weekday", "Weekday"], ["weekend", "Weekend"]]) {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            whenModifierSelect.appendChild(opt);
+          }
+          whenModifierSelect.value = whenModifierPart || "";
+          const saveWhen = () => {
+            if (!whenTimeSelect.value) {
+              whenModifierSelect.value = "";
+              saveTaskField(t.id, { when: "" });
+              return;
+            }
+            const when = whenModifierSelect.value ? `${whenTimeSelect.value} ${whenModifierSelect.value}` : whenTimeSelect.value;
+            saveTaskField(t.id, { when });
+          };
+          whenTimeSelect.addEventListener("change", saveWhen);
+          whenModifierSelect.addEventListener("change", saveWhen);
+          whenWrap.appendChild(whenTimeSelect);
+          whenWrap.appendChild(whenModifierSelect);
+
           card.appendChild(titleInput);
           card.appendChild(notesInput);
           card.appendChild(deadlineWrap);
+          card.appendChild(durationInput);
+          card.appendChild(effortSelect);
+          card.appendChild(whenWrap);
           card.appendChild(priorityLabel);
         } else {
           card.draggable = true;
           const flag = t.priority === "high" ? '<span class="card-priority-flag" title="High priority">&#10071;</span>' : "";
           const note = t.notes ? `<span class="card-note">${t.notes}</span>` : "";
           const deadline = t.deadline ? `<span class="card-deadline">Due ${formatDeadline(t.deadline)}</span>` : "";
-          card.innerHTML = `${flag}<span class="card-title">${t.title}</span>${deadline}${note}`;
+          const properties = formatTaskProperties(t);
+          const propertiesLine = properties ? `<span class="card-properties">${properties}</span>` : "";
+          card.innerHTML = `${flag}<span class="card-title">${t.title}</span>${deadline}${propertiesLine}${note}`;
           card.addEventListener("dragstart", (e) => {
             card.classList.add("dragging");
             e.dataTransfer.setData("text/plain", t.id);

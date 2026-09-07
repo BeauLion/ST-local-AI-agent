@@ -50,6 +50,31 @@ def test_overview_next_action_is_none_when_empty_string(project):
     assert overview["projects"][0]["next_action"] is None  # "" coerced to None, not shown as empty string
 
 
+def test_overview_task_includes_deadline_duration_effort_when(project):
+    pm.create_task(
+        project["id"], "Loaded task", deadline="2026-09-10",
+        duration="45m", effort="medium", when="afternoon weekend",
+    )
+    state = pm._load()
+    overview = pm.project_overview(state)
+    task = overview["projects"][0]["tasks"][0]
+    assert task["deadline"] == "2026-09-10"
+    assert task["duration_minutes"] == 45.0
+    assert task["effort"] == "medium"
+    assert task["when"] == "afternoon weekend"
+
+
+def test_overview_task_unset_fields_are_none(project):
+    pm.create_task(project["id"], "Bare task")
+    state = pm._load()
+    overview = pm.project_overview(state)
+    task = overview["projects"][0]["tasks"][0]
+    assert task["deadline"] is None
+    assert task["duration_minutes"] is None
+    assert task["effort"] is None
+    assert task["when"] is None
+
+
 # ---------------------------------------------------------------------------
 # build_context_text - no focused project
 # ---------------------------------------------------------------------------
@@ -138,24 +163,46 @@ def test_context_text_truncates_to_max_tasks_in_context(project):
 
 
 # ---------------------------------------------------------------------------
-# build_context_text - note tags shown inline
+# build_context_text - deadline/duration/effort/when shown inline
 # ---------------------------------------------------------------------------
+# Scoped to the task's own bullet line, not "in text" anywhere - the
+# trailing instructions paragraph below also contains an example string
+# like "~45m · medium effort", so a bare substring check would pass
+# even if the per-task rendering were broken.
 
-def test_context_text_shows_inline_tags_for_a_tagged_task(project, fake_duration):
-    pm.create_task(project["id"], "Tagged task", notes="dur: 45m\neffort: medium\nSome prose")
+def _bullet_line_for(text: str, title: str) -> str:
+    lines = [l for l in text.split("\n") if l.startswith("- ") and title in l]
+    assert len(lines) == 1
+    return lines[0]
+
+
+def test_context_text_shows_inline_properties_for_a_task_with_all_fields_set(project, fake_duration):
+    pm.create_task(
+        project["id"], "Loaded task", deadline="2026-09-10",
+        duration="45m", effort="medium", when="afternoon weekend",
+    )
     state = pm._load()
     text = pm.build_context_text(state)
-    assert "~45m" in text
-    assert "medium effort" in text
+    line = _bullet_line_for(text, "Loaded task")
+    assert "due 2026-09-10" in line
+    assert "~45m" in line
+    assert "medium effort" in line
+    assert "afternoon weekend" in line
 
 
-def test_context_text_shows_no_bracket_suffix_for_untagged_task(project):
-    pm.create_task(project["id"], "Plain task", notes="Just prose, no tags")
+def test_context_text_shows_only_the_fields_that_are_set(project):
+    pm.create_task(project["id"], "Partial task", effort="high")
     state = pm._load()
     text = pm.build_context_text(state)
-    # Only the task's own BULLET line matters here - "Next action: Plain
-    # task" also legitimately contains the title and isn't what this
-    # test is checking.
-    bullet_lines = [l for l in text.split("\n") if l.startswith("- ") and "Plain task" in l]
-    assert len(bullet_lines) == 1
-    assert bullet_lines[0].rstrip().endswith("Plain task")  # no trailing "[...]" tag suffix
+    line = _bullet_line_for(text, "Partial task")
+    assert "high effort" in line
+    assert "due" not in line
+    assert "~" not in line
+
+
+def test_context_text_shows_no_bracket_suffix_for_a_task_with_nothing_set(project):
+    pm.create_task(project["id"], "Plain task", notes="Just prose, no properties")
+    state = pm._load()
+    text = pm.build_context_text(state)
+    line = _bullet_line_for(text, "Plain task")
+    assert line.rstrip().endswith("Plain task")  # no trailing "[...]" suffix

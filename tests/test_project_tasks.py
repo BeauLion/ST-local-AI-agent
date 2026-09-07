@@ -84,6 +84,45 @@ def test_create_task_does_not_call_duration_manager(project, fake_duration):
     assert fake_duration.calls == []
 
 
+def test_create_task_defaults_have_no_deadline_duration_effort_when(project):
+    task = pm.create_task(project["id"], "Write intro")
+    assert task["deadline"] == ""
+    assert task["duration_minutes"] is None
+    assert task["effort"] == ""
+    assert task["when"] == ""
+
+
+def test_create_task_accepts_deadline_duration_effort_when(project):
+    task = pm.create_task(
+        project["id"], "Write intro", deadline="2026-09-10",
+        duration="45m", effort="hi", when="afternoon weekend",
+    )
+    assert task["deadline"] == "2026-09-10"
+    assert task["duration_minutes"] == 45.0
+    assert task["effort"] == "high"  # alias resolved to canonical form
+    assert task["when"] == "afternoon weekend"
+
+
+def test_create_task_rejects_unparseable_duration(project):
+    with pytest.raises(ProjectManagerError, match="Duration must be"):
+        pm.create_task(project["id"], "Write intro", duration="not-a-duration")
+
+
+def test_create_task_rejects_unrecognized_effort(project):
+    with pytest.raises(ProjectManagerError, match="Effort must be"):
+        pm.create_task(project["id"], "Write intro", effort="urgent")
+
+
+def test_create_task_rejects_unrecognized_when(project):
+    with pytest.raises(ProjectManagerError, match="When must be"):
+        pm.create_task(project["id"], "Write intro", when="someday")
+
+
+def test_create_task_rejects_deadline_with_time_but_no_date(project):
+    with pytest.raises(ProjectManagerError, match="Deadline"):
+        pm.create_task(project["id"], "Write intro", deadline="14:30")
+
+
 # ---------------------------------------------------------------------------
 # set_task_status - basic transitions
 # ---------------------------------------------------------------------------
@@ -241,6 +280,66 @@ def test_update_task_details_invalid_priority_falls_back_to_normal(project):
     assert state["projects"][project["id"]]["tasks"][task["id"]]["priority"] == "normal"
 
 
+def test_update_task_details_sets_deadline_duration_effort_when(project):
+    task = pm.create_task(project["id"], "Write intro")
+    updated = pm.update_task_details(
+        project["id"], task["id"], deadline="2026-09-10",
+        duration="1h30m", effort="lo", when="morning",
+    )
+    assert updated["deadline"] == "2026-09-10"
+    assert updated["duration_minutes"] == 90.0
+    assert updated["effort"] == "low"
+    assert updated["when"] == "morning"
+
+
+def test_update_task_details_clears_deadline_duration_effort_when_with_empty_string(project):
+    task = pm.create_task(
+        project["id"], "Write intro", deadline="2026-09-10",
+        duration="45m", effort="high", when="evening",
+    )
+    updated = pm.update_task_details(
+        project["id"], task["id"], deadline="", duration="", effort="", when="",
+    )
+    assert updated["deadline"] == ""
+    assert updated["duration_minutes"] is None
+    assert updated["effort"] == ""
+    assert updated["when"] == ""
+
+
+def test_update_task_details_omitted_fields_stay_untouched(project):
+    task = pm.create_task(
+        project["id"], "Write intro", deadline="2026-09-10",
+        duration="45m", effort="high", when="evening",
+    )
+    pm.update_task_details(project["id"], task["id"], title="Renamed")
+
+    state = pm._load()
+    stored = state["projects"][project["id"]]["tasks"][task["id"]]
+    assert stored["title"] == "Renamed"
+    assert stored["deadline"] == "2026-09-10"
+    assert stored["duration_minutes"] == 45.0
+    assert stored["effort"] == "high"
+    assert stored["when"] == "evening"
+
+
+def test_update_task_details_rejects_unparseable_duration(project):
+    task = pm.create_task(project["id"], "Write intro")
+    with pytest.raises(ProjectManagerError, match="Duration must be"):
+        pm.update_task_details(project["id"], task["id"], duration="not-a-duration")
+
+
+def test_update_task_details_rejects_unrecognized_effort(project):
+    task = pm.create_task(project["id"], "Write intro")
+    with pytest.raises(ProjectManagerError, match="Effort must be"):
+        pm.update_task_details(project["id"], task["id"], effort="urgent")
+
+
+def test_update_task_details_rejects_unrecognized_when(project):
+    task = pm.create_task(project["id"], "Write intro")
+    with pytest.raises(ProjectManagerError, match="When must be"):
+        pm.update_task_details(project["id"], task["id"], when="someday")
+
+
 # ---------------------------------------------------------------------------
 # update_task_notes
 # ---------------------------------------------------------------------------
@@ -276,6 +375,32 @@ def test_update_task_notes_requires_text_for_replace(project):
 def test_update_task_notes_does_not_require_text_for_clear(project):
     task = pm.create_task(project["id"], "Write intro", notes="Old")
     pm.update_task_notes(project["id"], task["id"], "clear")  # no text arg - should not raise
+
+
+# ---------------------------------------------------------------------------
+# _compute_next_notes - replace / clear / append modes
+# ---------------------------------------------------------------------------
+
+def test_compute_next_notes_clear_mode_always_returns_empty_string():
+    assert pm._compute_next_notes("Old notes.", "clear", "ignored") == ""
+
+
+def test_compute_next_notes_replace_mode_ignores_current_and_uses_text_verbatim():
+    assert pm._compute_next_notes("Old notes.", "replace", "New notes.") == "New notes."
+
+
+def test_compute_next_notes_replace_mode_with_none_text_becomes_empty_string():
+    assert pm._compute_next_notes("Old notes.", "replace", None) == ""
+
+
+def test_compute_next_notes_append_mode_joins_current_and_text_with_a_newline():
+    result = pm._compute_next_notes("First line.", "append", "Second line.")
+    assert result == "First line.\nSecond line."
+
+
+def test_compute_next_notes_append_mode_with_empty_current_is_just_the_new_text():
+    result = pm._compute_next_notes("", "append", "New text.")
+    assert result == "New text."
 
 
 # ---------------------------------------------------------------------------

@@ -107,6 +107,93 @@ def test_batch_create_task_rejects_duplicate_within_the_same_batch(project):
         pm.batch_update(project["id"], ops)
 
 
+def test_batch_create_task_accepts_deadline_duration_effort_when(project):
+    ops = [{
+        "type": "create_task", "title": "Loaded task", "deadline": "2026-09-10",
+        "duration": "45m", "effort": "medium", "when": "afternoon weekend",
+    }]
+    pm.batch_update(project["id"], ops)
+
+    state = pm._load()
+    task = next(t for t in state["projects"][project["id"]]["tasks"].values() if t["title"] == "Loaded task")
+    assert task["deadline"] == "2026-09-10"
+    assert task["duration_minutes"] == 45.0
+    assert task["effort"] == "medium"
+    assert task["when"] == "afternoon weekend"
+
+
+def test_batch_create_task_rejects_unparseable_duration(project):
+    ops = [{"type": "create_task", "title": "Bad task", "duration": "not-a-duration"}]
+    with pytest.raises(ProjectManagerError, match="Duration must be"):
+        pm.batch_update(project["id"], ops)
+
+
+# ---------------------------------------------------------------------------
+# batch_update - update_task_details operations
+# ---------------------------------------------------------------------------
+
+def test_batch_updates_task_details(project):
+    task = pm.create_task(project["id"], "A task")
+    ops = [{"type": "update_task_details", "task": task["id"], "effort": "high", "duration": "30m"}]
+
+    pm.batch_update(project["id"], ops)
+
+    state = pm._load()
+    stored = state["projects"][project["id"]]["tasks"][task["id"]]
+    assert stored["effort"] == "high"
+    assert stored["duration_minutes"] == 30.0
+
+
+def test_batch_update_task_details_leaves_omitted_fields_untouched(project):
+    task = pm.create_task(project["id"], "A task", effort="low", when="morning")
+    ops = [{"type": "update_task_details", "task": task["id"], "effort": "high"}]
+
+    pm.batch_update(project["id"], ops)
+
+    state = pm._load()
+    stored = state["projects"][project["id"]]["tasks"][task["id"]]
+    assert stored["effort"] == "high"
+    assert stored["when"] == "morning"  # untouched
+
+
+def test_batch_update_task_details_clears_a_field_with_empty_string(project):
+    task = pm.create_task(project["id"], "A task", deadline="2026-09-10")
+    ops = [{"type": "update_task_details", "task": task["id"], "deadline": ""}]
+
+    pm.batch_update(project["id"], ops)
+
+    state = pm._load()
+    assert state["projects"][project["id"]]["tasks"][task["id"]]["deadline"] == ""
+
+
+def test_batch_update_task_details_no_op_is_silently_dropped(project):
+    task = pm.create_task(project["id"], "A task", effort="high")
+    ops = [{"type": "update_task_details", "task": task["id"], "effort": "high"}]
+
+    descriptions, flags = pm.batch_update(project["id"], ops)
+    assert descriptions == []
+
+
+def test_batch_update_task_details_requires_at_least_one_field(project):
+    task = pm.create_task(project["id"], "A task")
+    ops = [{"type": "update_task_details", "task": task["id"]}]
+    with pytest.raises(ProjectManagerError, match="requires at least one field"):
+        pm.batch_update(project["id"], ops)
+
+
+def test_batch_update_task_details_unknown_task_raises(project):
+    ops = [{"type": "update_task_details", "task": "nonexistent task", "effort": "high"}]
+    with pytest.raises(ProjectManagerError, match="Task not found or ambiguous"):
+        pm.batch_update(project["id"], ops)
+
+
+def test_batch_update_task_details_rejects_unparseable_duration(project):
+    task = pm.create_task(project["id"], "A task")
+    ops = [{"type": "update_task_details", "task": task["id"], "duration": "not-a-duration"}]
+    with pytest.raises(ProjectManagerError, match="Duration must be"):
+        pm.batch_update(project["id"], ops)
+
+
 # ---------------------------------------------------------------------------
 # batch_update - update_task_status operations
 # ---------------------------------------------------------------------------
