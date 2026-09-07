@@ -322,6 +322,12 @@
     font-size: 11px;
     white-space: pre-wrap;
   }
+  .board-card .card-deadline {
+    display: block;
+    color: var(--accent);
+    font-size: 11px;
+    margin-bottom: 4px;
+  }
   .board-card .card-priority-flag {
     position: absolute;
     top: 6px;
@@ -347,6 +353,23 @@
     box-sizing: border-box;
   }
   .board-card .card-note-input { resize: vertical; min-height: 40px; }
+  .board-card .card-deadline-wrap {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .board-card .card-deadline-wrap input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 11px;
+    font-family: inherit;
+    box-sizing: border-box;
+  }
+  .board-card .card-deadline-date-input { flex: 1 1 60%; }
+  .board-card .card-deadline-time-input { flex: 1 1 40%; }
   .board-card .card-priority-toggle {
     display: flex;
     align-items: center;
@@ -504,6 +527,29 @@
     return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
 
+  function formatDeadline(value) {
+    if (!value) return "";
+    // "YYYY-MM-DD" (date only) or "YYYY-MM-DDTHH:MM" (date+time), matching
+    // the <input type="date"|"datetime-local"> value format - see
+    // project_manager._parse_task_deadline. Built as local-time components
+    // rather than `new Date(value)` directly: a bare "YYYY-MM-DD" string
+    // parses as UTC midnight per spec, which can render as the previous day
+    // in negative-UTC-offset timezones.
+    const hasTime = value.includes("T");
+    const [datePart, timePart] = value.split("T");
+    const [y, m, d] = datePart.split("-").map(Number);
+    const date = hasTime
+      ? new Date(y, m - 1, d, ...timePart.split(":").map(Number))
+      : new Date(y, m - 1, d);
+    if (isNaN(date.getTime())) return value;
+    const opts = { year: "numeric", month: "short", day: "numeric" };
+    if (hasTime) {
+      opts.hour = "numeric";
+      opts.minute = "2-digit";
+    }
+    return date.toLocaleString(undefined, opts);
+  }
+
   async function loadProjects() {
     const res = await fetch("/projects");
     const data = await res.json();
@@ -562,11 +608,15 @@
         const doneLine = t.status === "done" && t.completed_at
           ? `<div class="task-meta"><span>Completed</span><span>${formatDate(t.completed_at)}</span></div>`
           : "";
+        const deadlineLine = t.deadline
+          ? `<div class="task-meta"><span>Due</span><span>${formatDeadline(t.deadline)}</span></div>`
+          : "";
         return `<li>
           <span class="task-title">${t.title}</span>
           <div class="task-meta">
             <span class="task-status ${t.status}">${t.status}</span>
           </div>
+          ${deadlineLine}
           ${doneLine}
         </li>`;
       }).join("");
@@ -664,14 +714,53 @@
           priorityLabel.appendChild(priorityCheckbox);
           priorityLabel.appendChild(document.createTextNode("High priority"));
 
+          // Deadline: separate date + time inputs (rather than a single
+          // datetime-local field) so a date-only deadline stays possible -
+          // datetime-local always requires both. Matches the backend's
+          // "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM" shape (project_manager.
+          // _parse_task_deadline): time is only combined in when present,
+          // and clearing the date clears the whole deadline.
+          const deadlineWrap = document.createElement("div");
+          deadlineWrap.className = "card-deadline-wrap";
+          const deadlineDateInput = document.createElement("input");
+          deadlineDateInput.type = "date";
+          deadlineDateInput.className = "card-deadline-date-input";
+          deadlineDateInput.title = "Deadline date";
+          const deadlineTimeInput = document.createElement("input");
+          deadlineTimeInput.type = "time";
+          deadlineTimeInput.className = "card-deadline-time-input";
+          deadlineTimeInput.title = "Deadline time (optional)";
+          if (t.deadline) {
+            const [datePart, timePart] = t.deadline.split("T");
+            deadlineDateInput.value = datePart;
+            if (timePart) deadlineTimeInput.value = timePart;
+          }
+          const saveDeadline = () => {
+            if (!deadlineDateInput.value) {
+              deadlineTimeInput.value = "";
+              saveTaskField(t.id, { deadline: "" });
+              return;
+            }
+            const deadline = deadlineTimeInput.value
+              ? `${deadlineDateInput.value}T${deadlineTimeInput.value}`
+              : deadlineDateInput.value;
+            saveTaskField(t.id, { deadline });
+          };
+          deadlineDateInput.addEventListener("change", saveDeadline);
+          deadlineTimeInput.addEventListener("change", saveDeadline);
+          deadlineWrap.appendChild(deadlineDateInput);
+          deadlineWrap.appendChild(deadlineTimeInput);
+
           card.appendChild(titleInput);
           card.appendChild(notesInput);
+          card.appendChild(deadlineWrap);
           card.appendChild(priorityLabel);
         } else {
           card.draggable = true;
           const flag = t.priority === "high" ? '<span class="card-priority-flag" title="High priority">&#10071;</span>' : "";
           const note = t.notes ? `<span class="card-note">${t.notes}</span>` : "";
-          card.innerHTML = `${flag}<span class="card-title">${t.title}</span>${note}`;
+          const deadline = t.deadline ? `<span class="card-deadline">Due ${formatDeadline(t.deadline)}</span>` : "";
+          card.innerHTML = `${flag}<span class="card-title">${t.title}</span>${deadline}${note}`;
           card.addEventListener("dragstart", (e) => {
             card.classList.add("dragging");
             e.dataTransfer.setData("text/plain", t.id);

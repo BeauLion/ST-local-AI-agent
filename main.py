@@ -666,9 +666,11 @@ def project_manager_create_task(args: dict) -> str:
         state = project_manager._load()
         project = project_manager.resolve_project(state, args.get("project"))
         task = project_manager.create_task(
-            project["id"], args.get("title", ""), notes=args.get("notes", "")
+            project["id"], args.get("title", ""), notes=args.get("notes", ""),
+            deadline=args.get("deadline", ""),
         )
-        return f"Created task {task['short_id']}: {task['title']}"
+        suffix = f" (due {task['deadline']})" if task["deadline"] else ""
+        return f"Created task {task['short_id']}: {task['title']}{suffix}"
     except ProjectManagerError as e:
         return f"Error: {e}"
 
@@ -1294,6 +1296,7 @@ TOOLS = [
                     "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "title": {"type": "string", "description": "Short, concrete, verb-led task title."},
                     "notes": {"type": "string", "description": "Optional. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task, put recognized tag lines at the very top, one per line: 'dur: 45m' (also '1h', '1h30m', '90'), 'effort: low'/'medium'/'high', 'when: morning'/'afternoon'/'evening' (optionally + 'weekday'/'weekend'). Any text after the tag lines is kept as freeform notes."},
+                    "deadline": {"type": "string", "description": "Optional. When the task is due, as 'YYYY-MM-DD' (date only) or 'YYYY-MM-DDTHH:MM' (date and time). Never a time alone - always include the date. Only set this when the user gives an actual deadline, not a vague timeframe."},
                 },
                 "required": ["title"],
             },
@@ -1365,6 +1368,7 @@ TOOLS = [
                                 "title": {"type": "string", "description": "For create_task."},
                                 "priority": {"type": "string", "enum": ["low", "normal", "high"]},
                                 "notes": {"type": "string", "description": "For create_task. Optional tag lines at the top ('dur: 45m', 'effort: medium', 'when: afternoon weekend') show up automatically next to the task - see project_manager_update_task_notes for the exact syntax."},
+                                "deadline": {"type": "string", "description": "For create_task. Optional, 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM' - never a time alone."},
                                 "task": {"type": "string", "description": "For status or note updates: task ID, short ID, or unambiguous title."},
                                 "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                                 "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
@@ -2084,6 +2088,7 @@ async def api_create_task(project_id: str, request: Request):
             project_manager.create_task,
             project_id, body.get("title", ""),
             priority=body.get("priority", "normal"), notes=body.get("notes", ""),
+            deadline=body.get("deadline", ""),
         )
     except ProjectManagerError as e:
         _pm_error(e)
@@ -2096,11 +2101,12 @@ async def api_update_task(project_id: str, task_id: str, request: Request):
     try:
         task = None
         if "status" in body:
-            task = await asyncio.to_thread(project_manager.set_task_status, project_id, task_id, body["status"])
-        if any(k in body for k in ("title", "priority", "notes")):
+            task, _flag = await asyncio.to_thread(project_manager.set_task_status, project_id, task_id, body["status"])
+        if any(k in body for k in ("title", "priority", "notes", "deadline")):
             task = await asyncio.to_thread(
                 project_manager.update_task_details, project_id, task_id,
                 title=body.get("title"), priority=body.get("priority"), notes=body.get("notes"),
+                deadline=body.get("deadline"),
             )
         if "notes_mode" in body:
             task = await asyncio.to_thread(

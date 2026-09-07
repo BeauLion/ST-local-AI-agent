@@ -89,6 +89,12 @@ def _load() -> dict:
     for project in state["projects"].values():
         project.setdefault("gantt_start", None)
         project.setdefault("gantt_end", None)
+        # Migration: tasks saved before deadline support won't have this key.
+        # "" (not None) is the canonical "no deadline" value - see
+        # _parse_task_deadline - so update_task_details can tell "field
+        # omitted" (None) apart from "field explicitly cleared" ("").
+        for task in project["tasks"].values():
+            task.setdefault("deadline", "")
     return state
 
 
@@ -476,6 +482,37 @@ def _parse_gantt_date(value, label: str):
     return text
 
 
+_TASK_DEADLINE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TASK_DEADLINE_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
+
+
+def _parse_task_deadline(value, label: str = "Deadline") -> str:
+    """Returns a canonical 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM' string, or ""
+    if `value` is empty/None - "" (not None) is the stored "no deadline"
+    value, matching how notes defaults to "" rather than null. Accepts a
+    date-only value or a date+time value (ISO 'T' separator, minute
+    precision, no seconds - matching an HTML <input type="datetime-local">
+    value exactly). A time with no date is never valid - there's nothing to
+    fall back to, unlike start/end Gantt dates which can be set one at a
+    time - so date-only or date+time are the only two accepted shapes."""
+    if value in (None, ""):
+        return ""
+    text = _normalize_text(value)
+    if _TASK_DEADLINE_DATETIME_RE.match(text):
+        try:
+            datetime.strptime(text, "%Y-%m-%dT%H:%M")
+        except ValueError as exc:
+            raise ProjectManagerError(f"{label} is not a valid date/time.") from exc
+        return text
+    if _TASK_DEADLINE_DATE_RE.match(text):
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ProjectManagerError(f"{label} is not a valid date.") from exc
+        return text
+    raise ProjectManagerError(f"{label} must be in YYYY-MM-DD or YYYY-MM-DDTHH:MM format.")
+
+
 def set_project_gantt_dates(project_id: str, start=None, end=None, *, clear: bool = False) -> dict:
     """Sets the project's Gantt bar start/end dates. Pass clear=True to wipe
     both back to None (removes the project from gantt_rows() output)
@@ -528,6 +565,7 @@ class _CreateTaskInput(BaseModel):
     title: str
     priority: str = "normal"
     notes: str = ""
+    deadline: str = ""
 
     clean_title: str = None  # computed
 
@@ -541,15 +579,20 @@ class _CreateTaskInput(BaseModel):
     def _coerce_and_truncate_notes(cls, v) -> str:
         return str(v or "")[:MAX_TASK_NOTE_LENGTH]
 
+    @field_validator("deadline")
+    @classmethod
+    def _validate_deadline(cls, v) -> str:
+        return _parse_task_deadline(v, "Deadline")
+
     @model_validator(mode="after")
     def _require_title(self) -> "_CreateTaskInput":
         self.clean_title = _require_length(self.title, "Task title", MAX_TASK_TITLE_LENGTH)
         return self
 
 
-def create_task(project_id: str, title: str, *, priority="normal", notes="") -> dict:
-    data = _CreateTaskInput(title=title, priority=priority, notes=notes)
-    clean_title, priority, notes = data.clean_title, data.priority, data.notes
+def create_task(project_id: str, title: str, *, priority="normal", notes="", deadline="") -> dict:
+    data = _CreateTaskInput(title=title, priority=priority, notes=notes, deadline=deadline)
+    clean_title, priority, notes, deadline = data.clean_title, data.priority, data.notes, data.deadline
     with _lock:
         state = _load()
         project = state["projects"].get(project_id)
@@ -578,6 +621,7 @@ def create_task(project_id: str, title: str, *, priority="normal", notes="") -> 
             "archived_at": None,
             "priority": priority,
             "notes": notes,
+            "deadline": deadline,
             "sort_order": len(project["tasks"]),
         }
         project["tasks"][task_id] = task
@@ -640,6 +684,7 @@ class _UpdateTaskDetailsInput(BaseModel):
     title: str | None = None
     priority: str | None = None
     notes: str | None = None
+    deadline: str | None = None
 
     @field_validator("title")
     @classmethod
@@ -662,9 +707,20 @@ class _UpdateTaskDetailsInput(BaseModel):
             return v
         return str(v or "")[:MAX_TASK_NOTE_LENGTH]
 
+    @field_validator("deadline")
+    @classmethod
+    def _validate_deadline_when_given(cls, v):
+        # "" is a meaningful given value here (explicitly clear the
+        # deadline) distinct from None (field omitted) - only None short-
+        # circuits the parser, same "is not None" convention as the rest
+        # of this model.
+        if v is None:
+            return v
+        return _parse_task_deadline(v, "Deadline")
 
-def update_task_details(project_id: str, task_id: str, *, title=None, priority=None, notes=None) -> dict:
-    data = _UpdateTaskDetailsInput(title=title, priority=priority, notes=notes)
+
+def update_task_details(project_id: str, task_id: str, *, title=None, priority=None, notes=None, deadline=None) -> dict:
+    data = _UpdateTaskDetailsInput(title=title, priority=priority, notes=notes, deadline=deadline)
     with _lock:
         state = _load()
         project = state["projects"].get(project_id)
@@ -677,6 +733,8 @@ def update_task_details(project_id: str, task_id: str, *, title=None, priority=N
             task["priority"] = data.priority
         if data.notes is not None:
             task["notes"] = data.notes
+        if data.deadline is not None:
+            task["deadline"] = data.deadline
         task["updated_at"] = _now()
         project["updated_at"] = _now()
         _recalculate_next_action(project)
@@ -756,6 +814,7 @@ class _CreateTaskOperationFields(BaseModel):
     title: str | None = None
     priority: str | None = None
     notes: str | None = None
+    deadline: str | None = None
     clean_title: str = None  # computed
 
     @field_validator("priority")
@@ -767,6 +826,11 @@ class _CreateTaskOperationFields(BaseModel):
     @classmethod
     def _coerce_and_truncate_notes(cls, v) -> str:
         return str(v or "")[:MAX_TASK_NOTE_LENGTH]
+
+    @field_validator("deadline")
+    @classmethod
+    def _validate_deadline(cls, v) -> str:
+        return _parse_task_deadline(v, "Deadline")
 
     @model_validator(mode="after")
     def _require_title(self) -> "_CreateTaskOperationFields":
@@ -815,8 +879,12 @@ def _normalize_batch_operation(operation: dict, project: dict) -> dict:
     if op_type == "create_task":
         fields = _CreateTaskOperationFields(
             title=operation.get("title"), priority=operation.get("priority"), notes=operation.get("notes"),
+            deadline=operation.get("deadline"),
         )
-        return {"type": op_type, "title": fields.clean_title, "priority": fields.priority, "notes": fields.notes}
+        return {
+            "type": op_type, "title": fields.clean_title, "priority": fields.priority,
+            "notes": fields.notes, "deadline": fields.deadline,
+        }
 
     if op_type == "update_task_status":
         fields = _UpdateTaskStatusOperationFields(status=operation.get("status"))
@@ -907,6 +975,7 @@ def _apply_operation_to_project(project: dict, operation: dict):
             "archived": False, "archived_at": None,
             "priority": operation.get("priority", "normal"),
             "notes": operation.get("notes", ""),
+            "deadline": operation.get("deadline", ""),
             "sort_order": len(project["tasks"]),
         }
         return None
@@ -1142,7 +1211,10 @@ def project_overview(state: dict) -> dict:
                 "status": p["status"],
                 "next_action": p["next_action"] or None,
                 "tasks": [
-                    {"id": t["id"], "short_id": t["short_id"], "title": t["title"], "status": t["status"]}
+                    {
+                        "id": t["id"], "short_id": t["short_id"], "title": t["title"], "status": t["status"],
+                        "deadline": t.get("deadline") or None,
+                    }
                     for t in p["tasks"].values()
                 ],
             }
@@ -1175,8 +1247,13 @@ def build_context_text(state: dict) -> str:
         lines.append("Tasks:")
         for t in selected:
             tags, _ = _parse_note_tags(t.get("notes", ""))
+            bracket_parts = []
+            if t.get("deadline"):
+                bracket_parts.append(f"due {t['deadline']}")
             tag_str = _format_tags_inline(tags)
-            suffix = f"  [{tag_str}]" if tag_str else ""
+            if tag_str:
+                bracket_parts.append(tag_str)
+            suffix = f"  [{' · '.join(bracket_parts)}]" if bracket_parts else ""
             lines.append(f"- {symbols[t['status']]} {t['short_id']} {t['title']}{suffix}")
     else:
         lines.append("Tasks: none")
@@ -1189,8 +1266,9 @@ def build_context_text(state: dict) -> str:
         "project_manager_set_all_tasks_status exactly once; do not enumerate tasks first. "
         "Completing all tasks does not complete the project - only change project status when the "
         "user explicitly requests that project-level change. Keep planning responses concise and "
-        "prioritize one next action. Bracketed tags after a task (e.g. '~45m \u00b7 medium effort \u00b7 "
-        "afternoon weekend') are user-set duration/effort/timing properties parsed from that task's "
-        "notes - factor them into prioritization and scheduling suggestions."
+        "prioritize one next action. Bracketed tags after a task (e.g. 'due 2026-09-10 \u00b7 ~45m \u00b7 "
+        "medium effort \u00b7 afternoon weekend') show that task's deadline (if set) followed by any "
+        "duration/effort/timing properties parsed from its notes - factor them into prioritization "
+        "and scheduling suggestions."
     )
     return "\n".join(lines)
