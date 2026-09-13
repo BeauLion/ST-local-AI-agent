@@ -28,10 +28,10 @@ import numpy as np
 from pydantic import BaseModel, model_validator
 
 import memory
+import runtime_settings
 from config import (
     DURATION_CANONICAL_CATEGORIES,
     DURATION_CATEGORY_ALIASES,
-    DURATION_CATEGORY_SIMILARITY_THRESHOLD,
     DURATION_DATA_DIR,
     MIN_ENTRIES_FOR_CONFIDENT_ESTIMATE,
     MIN_ENTRIES_FOR_ESTIMATE,
@@ -237,7 +237,7 @@ def resolve_category(text: str, *, state: dict | None = None) -> str | None:
         if score > best_score:
             best_category, best_score = category, score
 
-    if best_category is not None and best_score >= DURATION_CATEGORY_SIMILARITY_THRESHOLD:
+    if best_category is not None and best_score >= runtime_settings.get("DURATION_CATEGORY_SIMILARITY_THRESHOLD"):
         return best_category
     return None
 

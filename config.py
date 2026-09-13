@@ -67,20 +67,34 @@ LLAMA_MD = "./llama.cpp/mtp-gemma-4-12B-it.gguf"
 LLAMA_SPEC_TYPE = "draft-mtp"
 #LLAMA_MMPROJ = "./llama.cpp/mmproj-Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf"
 
-def build_llama_server_command() -> list[str]:
+def build_llama_server_command(
+    *,
+    model_repo: str | None = None,
+    ngl: int | None = None,
+    context: int | None = None,
+    md: str | None = None,
+    spec_type: str | None = None,
+) -> list[str]:
     """
     Builds the full llama-server launch command as a list of arguments,
     ready to pass to subprocess.Popen(). Mirrors exactly what you'd type
     by hand in PowerShell, just assembled from the settings above.
+
+    The keyword overrides let model_manager.py launch llama-server with a
+    different model/ngl/context without touching the module-level
+    constants above - those still define what boots on a fresh start.py
+    run (see model_manager.py's persisted model_state.json for what
+    ACTUALLY boots after you've swapped at least once) and what "reset to
+    defaults" resets to.
     """
     cmd = [
         LLAMA_SERVER_EXE,
-        "-hf", LLAMA_MODEL_REPO,
-        "-md", LLAMA_MD,
-        "--spec-type", LLAMA_SPEC_TYPE,
+        "-hf", model_repo or LLAMA_MODEL_REPO,
+        "-md", md or LLAMA_MD,
+        "--spec-type", spec_type or LLAMA_SPEC_TYPE,
         #"--mmproj", LLAMA_MMPROJ,
-        "-ngl", str(LLAMA_NGL),
-        "-c", str(LLAMA_CONTEXT),
+        "-ngl", str(ngl if ngl is not None else LLAMA_NGL),
+        "-c", str(context if context is not None else LLAMA_CONTEXT),
         "--temp", str(LLAMA_TEMP),
         "--host", LLAMA_SERVER_HOST,
         "--port", str(LLAMA_SERVER_PORT),
@@ -95,6 +109,30 @@ def build_llama_server_command() -> list[str]:
     if LLAMA_USE_JINJA:
         cmd.append("--jinja")
     return cmd
+
+
+# Optional one-tap swap targets for the settings panel's Model tab, so you
+# don't have to type a full -hf repo string on your phone. Purely
+# optional - the panel also has free-text fields for repo/ngl/context for
+# anything not listed here. Omitted ngl/context/md/spec_type per preset
+# fall back to whatever's CURRENTLY running, not to the defaults above.
+MODEL_PRESETS = [
+    # {"label": "Gemma 4 12B (current default)", "repo": LLAMA_MODEL_REPO,
+    #  "ngl": LLAMA_NGL, "context": LLAMA_CONTEXT, "md": LLAMA_MD, "spec_type": LLAMA_SPEC_TYPE},
+    # {"label": "Qwen3 14B", "repo": "Qwen/Qwen3-14B-GGUF:Q4_K_M", "ngl": 99, "context": 32768},
+]
+
+# How long (seconds) a model swap waits for llama-server's /health to
+# return 200 before giving up (and, for a swap, rolling back to the
+# previous model). Bigger models or a cold Hugging Face download need
+# more time than swapping between two already-cached GGUFs - tune this up
+# if you hit false-positive rollbacks on a fresh model you haven't run
+# before.
+LLAMA_SWAP_TIMEOUT_SECONDS = 180
+
+# How long (seconds) to wait for the OLD llama-server process to exit
+# cleanly (SIGTERM) before force-killing it, when starting up or swapping.
+LLAMA_STOP_TIMEOUT_SECONDS = 15
 
 
 # ─────────────────────────────────────────────────────────────
@@ -247,20 +285,19 @@ PROJECT_STATUSES = ("active", "paused", "completed")
 TASK_STATUSES = ("pending", "active", "blocked", "done", "cancelled")
 TASK_PRIORITIES = ("low", "normal", "high")
 
-# Lightweight "key: value" tag syntax recognized only at the very top of a
-# task's notes (front-matter style - stops at the first unrecognized line)
-# and rendered compactly next to the task in the project context block.
-# See project_manager.py's _parse_note_tags()/_format_tags_inline().
-# Recognized keys: "dur" (reuses duration_manager.parse_duration_minutes),
-# "effort" (below), and "when" (TASK_NOTE_WHEN_TIMES, optionally followed
-# by a TASK_NOTE_WHEN_MODIFIERS word, e.g. "when: afternoon weekend").
-TASK_NOTE_EFFORT_ALIASES = {
+# First-class task scheduling fields, rendered compactly next to the task in
+# the project context block. See project_manager.py's
+# _parse_task_effort()/_parse_task_when()/_format_task_properties_inline().
+# "duration_minutes" reuses duration_manager.parse_duration_minutes; "effort"
+# resolves via TASK_EFFORT_ALIASES below; "when" is a TASK_WHEN_TIMES word
+# optionally followed by a TASK_WHEN_MODIFIERS word (e.g. "afternoon weekend").
+TASK_EFFORT_ALIASES = {
     "low": "low", "lo": "low",
     "medium": "medium", "med": "medium", "normal": "medium",
     "high": "high", "hi": "high",
 }
-TASK_NOTE_WHEN_TIMES = ("morning", "afternoon", "evening")
-TASK_NOTE_WHEN_MODIFIERS = ("weekday", "weekend")
+TASK_WHEN_TIMES = ("morning", "afternoon", "evening")
+TASK_WHEN_MODIFIERS = ("weekday", "weekend")
 
 # localhost is always allowed below. Anything else (Tailscale IPs, LAN IPs,
 # etc.) goes in .env as EXTRA_CORS_ORIGINS - a comma-separated list - so
@@ -289,11 +326,22 @@ CALENDAR_TIMEZONE = "Europe/Amsterdam"
 # Per-request timeout (seconds) for all CalDAV calls to iCloud. Previously
 # unset, which let a single stalled request hang on whatever the caldav
 # library's internal default is (~120s) with no way to recover from it.
-CALDAV_TIMEOUT_SECONDS = 45
+CALDAV_TIMEOUT_SECONDS = 30
+
+# When True, every raw HTTP request calendar_manager sends to the CalDAV
+# server (PROPFIND/REPORT/PUT/DELETE - method, URL, headers, body) is
+# written via console_log.alog(), which main.py already flushes into the
+# per-iteration prompt log - so these show up in prompt_log_viewer.html
+# with no extra plumbing. Independent of PROMPT_LOG_ENABLED: that flag
+# turns the whole prompt-log file off, this one just controls whether
+# CalDAV traffic specifically gets added to the console buffer (REPORT
+# bodies especially can be sizeable, so this can be flipped off without
+# losing the rest of the log).
+CALDAV_LOG_RAW_REQUESTS = False
 
 # Extra attempts (beyond the first) confirm_pending() makes if writing a
 # staged change to iCloud fails, with a short delay between attempts.
-CALENDAR_WRITE_RETRIES = 2
+CALENDAR_WRITE_RETRIES = 1
 
 # Calendar to default to when no calendar_name is given. Must exactly
 # match (or uniquely partially match) one of your real iCloud calendar
@@ -392,6 +440,81 @@ DURATION_CATEGORY_ALIASES = {
     "call": "meetings", "calls": "meetings", "meeting": "meetings", "supervisor": "meetings",
     "chores": "household", "errands": "household", "cleaning": "household", "shopping": "household",
 }
+
+
+# ─────────────────────────────────────────────────────────────
+# Attire manager (attire_manager.py)
+# ─────────────────────────────────────────────────────────────
+
+ATTIRE_DATA_DIR = os.path.join(PROJECT_ROOT, "attire_data")
+
+# "accessories" is the one multi-item (list) slot; everything else is a
+# single string-or-None. See attire_manager.py's module docstring.
+ATTIRE_SLOTS = ("head", "top", "bottom", "feet", "accessories")
+
+MAX_CHARACTER_NAME_LENGTH = 200
+MAX_ATTIRE_ITEM_LENGTH = 200
+
+# Master switch for the post-turn attire sub-agent (attire_subagent.py).
+# Set False to fully disable it - no background pass gets spawned after a
+# turn, and (as a direct consequence) the next turn's wait-with-timeout
+# block in main.py's chat_completions has nothing to wait on, so it's
+# skipped too. Nothing else about the attire feature is affected: existing
+# attire_manager tools/data and the [PERSISTENT ATTIRE STATE] context block
+# still work exactly as before - this only stops NEW state from being
+# tracked automatically. Useful for isolating whether the sub-agent is
+# responsible for a slowdown/bug, or just to save a completion round-trip
+# per turn if you're not using attire tracking right now.
+ATTIRE_SUBAGENT_ENABLED = False
+
+# Post-turn attire sub-agent (attire_subagent.py) - a separate, one-shot
+# completion call against the same llama-server, run after every finished
+# turn and decoupled entirely from the main agent's own tool selection.
+# See main.py's chat_completions: the NEXT request waits on this (up to
+# this many seconds) before reading attire state for injection, but never
+# blocks longer than that - a slow/hung pass just means one turn of stale
+# state, not a frozen agent.
+ATTIRE_SUBAGENT_TIMEOUT_SECONDS = 15
+
+
+# ─────────────────────────────────────────────────────────────
+# iCloud Bridge (bridge_client.py) — EventKit-based fallback for
+# calendar_manager.py, used only when CalDAV itself is unreachable. See the
+# "BACKEND FALLBACK MODEL" note at the top of calendar_manager.py.
+# ─────────────────────────────────────────────────────────────
+
+# Master switch. When False, calendar_manager.py never attempts a bridge
+# fallback at all - a CalDAV connectivity failure just fails the way it
+# always has. Flip on once BRIDGE_URL/BRIDGE_TOKEN are set in .env and
+# the bridge has been reached at least once from this machine (e.g. via
+# the health-check curl in the bridge's own README).
+BRIDGE_ENABLED = True
+
+# Names of the environment variables bridge_client.py reads from .env -
+# same pattern as ICLOUD_USERNAME_ENV_VAR/ICLOUD_APP_PASSWORD_ENV_VAR
+# above. BRIDGE_URL is a Tailscale IP or MagicDNS hostname (e.g.
+# "http://100.x.x.x:8787") that could change if the Mac is ever
+# re-registered with Tailscale, so it lives in .env rather than here -
+# same reasoning as EXTRA_CORS_ORIGINS above: real addresses never end up
+# committed to the repo.
+BRIDGE_URL_ENV_VAR = "BRIDGE_URL"
+BRIDGE_TOKEN_ENV_VAR = "BRIDGE_TOKEN"
+
+# Per-request timeout (seconds) for calls to the bridge. Kept short-ish -
+# unlike caldav.icloud.com, the bridge is a Tailscale hop to a machine on
+# your own network, not a public server across the internet, so it
+# shouldn't normally be slow. A long timeout here would make the failover
+# itself feel sluggish on top of whatever CalDAV already spent timing out.
+BRIDGE_TIMEOUT_SECONDS = 15
+
+# Calendar to default to on the bridge when calendar_name isn't given.
+# Matched against EventKit calendar titles the same way CALENDAR_DEFAULT_
+# NAME is matched against CalDAV calendar names (exact, then unique
+# partial match) - set to the same value if your CalDAV and EventKit
+# calendars share a name, which they normally will since they're the same
+# iCloud account. Leave empty to just let the bridge's own
+# defaultCalendarForNewEvents() decide.
+BRIDGE_DEFAULT_CALENDAR_NAME = "Home"
 
 
 # ─────────────────────────────────────────────────────────────

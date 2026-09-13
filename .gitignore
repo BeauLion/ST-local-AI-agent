@@ -17,6 +17,7 @@ memory_data/
 
 calendar_data/
 
+attire_data/
 # Project manager data (projects.json - also personal data)
 project_data/
 
@@ -46,3 +47,9 @@ Thumbs.db
 calendar_data/context_cache.json
 
 audit_tool_tokens.py
+runtime_settings.json
+
+# Playwright's persistent Chromium profile for browser_scan_webpage - this
+# holds REAL session/consent cookies for whatever sites you've clicked
+# "Accept" on, exactly like a normal browser profile. Never commit this.
+browser_profile/

@@ -30,19 +30,27 @@ import numpy as np
 from ddgs import DDGS
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 
+import attire_manager
+import attire_subagent
 import calendar_manager
 import duration_manager
 import memory
 import project_manager
 from console_log import alog, flush as flush_console
+from attire_manager import AttireManagerError
 from calendar_manager import CalendarError
 from duration_manager import DurationError
 from project_manager import ProjectManagerError
 from prompt_log_engine import log_prompt, log_console, router as prompt_log_router
+from settings_engine import router as settings_router
+from model_engine import router as model_router
+import runtime_settings
+import model_manager
 from config import (
     AGENT_API_KEY,
+    ATTIRE_SUBAGENT_TIMEOUT_SECONDS,
     CORS_ALLOWED_ORIGINS,
     DELETE_FILE_ALLOWED_EXTENSIONS,
     DOCKER_CPU_COUNT,
@@ -57,10 +65,6 @@ from config import (
     SAFE_FILES_DIR,
     TOOL_SELECTION_ALWAYS_INCLUDE,
     TOOL_SELECTION_CONTEXT_CHAR_LIMIT,
-    TOOL_SELECTION_ENABLED,
-    TOOL_SELECTION_MIN_SCORE,
-    TOOL_SELECTION_RESCUE_SCORE,
-    TOOL_SELECTION_RESCUE_TOP_K,
     WRITE_FILE_ALLOWED_EXTENSIONS,
     WRITE_FILE_MAX_CHARS,
 )
@@ -70,15 +74,24 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # llama-server is now launched and owned by THIS process (moved out of
+    # start.py - see the comment at the top of the new start.py) so that
+    # /model/swap can stop and restart it on request. Blocking calls run in
+    # a thread so they don't freeze the event loop, though nothing else is
+    # being served yet at this point anyway.
+    await asyncio.to_thread(model_manager.startup)
     # Starts the calendar cache's background refresh thread once, when the
     # server actually comes up (not on every reload-triggered reimport -
     # see calendar_manager.start_background_refresh()'s own guard too).
     calendar_manager.start_background_refresh()
     yield
+    await asyncio.to_thread(model_manager.shutdown)
 
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(prompt_log_router)
+app.include_router(settings_router)
+app.include_router(model_router)
 
 
 # ---------------------------------------------------------------------------
@@ -653,9 +666,29 @@ def project_manager_create_task(args: dict) -> str:
         state = project_manager._load()
         project = project_manager.resolve_project(state, args.get("project"))
         task = project_manager.create_task(
-            project["id"], args.get("title", ""), notes=args.get("notes", "")
+            project["id"], args.get("title", ""), notes=args.get("notes", ""),
+            deadline=args.get("deadline", ""), duration=args.get("duration", ""),
+            effort=args.get("effort", ""), when=args.get("when", ""),
         )
-        return f"Created task {task['short_id']}: {task['title']}"
+        suffix = f" (due {task['deadline']})" if task["deadline"] else ""
+        return f"Created task {task['short_id']}: {task['title']}{suffix}"
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
+def project_manager_update_task_details(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        task = project_manager.get_task(project, args.get("task"))
+        if not task:
+            return "Error: Task not found or ambiguous. Call project_manager_get_overview and use an exact task ID."
+        updated = project_manager.update_task_details(
+            project["id"], task["id"],
+            title=args.get("title"), priority=args.get("priority"), deadline=args.get("deadline"),
+            duration=args.get("duration"), effort=args.get("effort"), when=args.get("when"),
+        )
+        return f"Updated {updated['short_id']} (“{updated['title']}”)."
     except ProjectManagerError as e:
         return f"Error: {e}"
 
@@ -725,6 +758,26 @@ def project_manager_batch_update(args: dict) -> str:
         return f"Error: {e}"
 
 
+def project_manager_set_gantt_dates(args: dict) -> str:
+    try:
+        state = project_manager._load()
+        project = project_manager.resolve_project(state, args.get("project"))
+        if args.get("clear"):
+            updated = project_manager.set_project_gantt_dates(project["id"], clear=True)
+            return f"Cleared Gantt dates for {updated['short_code']} \u2014 {updated['name']}."
+        updated = project_manager.set_project_gantt_dates(
+            project["id"], start=args.get("start"), end=args.get("end")
+        )
+        if updated["gantt_start"] and updated["gantt_end"]:
+            return (
+                f"Set {updated['short_code']} \u2014 {updated['name']} to run "
+                f"{updated['gantt_start']} \u2192 {updated['gantt_end']} on the Gantt chart."
+            )
+        return f"Updated Gantt date(s) for {updated['short_code']} \u2014 {updated['name']}; set the other end too to show it on the chart."
+    except ProjectManagerError as e:
+        return f"Error: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Duration tracking tools (duration_manager.py). Task completions log a
 # duration anchor automatically (see project_manager._apply_task_status) -
@@ -749,6 +802,100 @@ def duration_confirm_new_category(args: dict) -> str:
         return duration_manager.confirm_new_category(args.get("name", ""))
     except DurationError as e:
         return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Attire tracking tools (attire_manager.py). One global record per character
+# (not per chat), structured slots only, current state only - see
+# attire_manager.py's module docstring for the full design rationale.
+# ---------------------------------------------------------------------------
+
+def attire_manager_add_item(args: dict) -> str:
+    try:
+        record, added = attire_manager.add_item(
+            args.get("character_name", ""),
+            args.get("slot", ""),
+            args.get("item", ""),
+        )
+        if not added:
+            return f"No change needed - {record['name']}'s {args.get('slot')} already includes that."
+        return f"Added to {record['name']}'s {args.get('slot')}."
+    except AttireManagerError as e:
+        return f"Error: {e}"
+
+
+def attire_manager_remove_item(args: dict) -> str:
+    try:
+        record, removed = attire_manager.remove_item(
+            args.get("character_name", ""),
+            args.get("slot", ""),
+            args.get("item_hint", ""),
+        )
+        if removed is None:
+            return (
+                f"No change made - couldn't confidently match '{args.get('item_hint')}' "
+                f"to exactly one item in {record['name']}'s {args.get('slot')}."
+            )
+        return f"Removed '{removed}' from {record['name']}'s {args.get('slot')}."
+    except AttireManagerError as e:
+        return f"Error: {e}"
+
+
+def attire_manager_replace_slot(args: dict) -> str:
+    try:
+        record, changed = attire_manager.replace_slot(
+            args.get("character_name", ""),
+            args.get("slot", ""),
+            args.get("items", ""),
+        )
+        if not changed:
+            return f"No change needed - {record['name']}'s {args.get('slot')} already matches that."
+        return f"Replaced {record['name']}'s {args.get('slot')}."
+    except AttireManagerError as e:
+        return f"Error: {e}"
+
+
+def attire_manager_get(args: dict) -> str:
+    return attire_manager.get_attire_text(args.get("character_name", ""))
+
+
+# Holds the currently-running (or just-finished) post-turn attire pass, if
+# any. Set by _spawn_attire_subagent() at the end of a turn; consumed
+# (awaited-with-timeout, then cleared) at the top of the NEXT chat_completions
+# call. Single-user local server - one slot is enough, no queue needed.
+_attire_subagent_task: asyncio.Task | None = None
+
+# Separate from _attire_subagent_task above: a plain set holding a strong
+# reference to every attire sub-agent task for its ENTIRE lifetime, not
+# just until the next turn stops waiting on it. Needed because asyncio's
+# own docs warn that a Task with no strong reference anywhere may be
+# garbage-collected mid-execution, even while still pending - clearing
+# _attire_subagent_task to None on a timeout (see chat_completions below)
+# would otherwise leave a still-running task referenced nowhere at all.
+# Each task removes itself from this set via add_done_callback once it
+# actually finishes, so this never grows unbounded.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_attire_subagent(user_text: str, assistant_text: str) -> None:
+    """Fire-and-forget: kicks off the background attire pass and stores the
+    task so the next turn can wait on it if it isn't done yet.
+
+    No-ops entirely when ATTIRE_SUBAGENT_ENABLED is False - this is the
+    single choke point for the feature, so disabling it here also means
+    the wait-with-timeout block in chat_completions has nothing to wait
+    on (since _attire_subagent_task never gets set) and is skipped too.
+    Read live (not imported once at module load) so a flip in the
+    settings panel takes effect on the very next turn."""
+    if not runtime_settings.get("ATTIRE_SUBAGENT_ENABLED"):
+        return
+    global _attire_subagent_task
+    task = asyncio.create_task(
+        attire_subagent.run_attire_subagent(user_text, assistant_text)
+    )
+    _attire_subagent_task = task
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 TOOLS = [
@@ -1166,9 +1313,34 @@ TOOLS = [
                 "properties": {
                     "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
                     "title": {"type": "string", "description": "Short, concrete, verb-led task title."},
-                    "notes": {"type": "string", "description": "Optional. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task, put recognized tag lines at the very top, one per line: 'dur: 45m' (also '1h', '1h30m', '90'), 'effort: low'/'medium'/'high', 'when: morning'/'afternoon'/'evening' (optionally + 'weekday'/'weekend'). Any text after the tag lines is kept as freeform notes."},
+                    "notes": {"type": "string", "description": "Optional freeform notes."},
+                    "deadline": {"type": "string", "description": "Optional. When the task is due, as 'YYYY-MM-DD' (date only) or 'YYYY-MM-DDTHH:MM' (date and time). Never a time alone - always include the date. Only set this when the user gives an actual deadline, not a vague timeframe."},
+                    "duration": {"type": "string", "description": "Optional duration estimate, e.g. '45m', '1h30m', or '90'. Only set this when the user gives an actual estimate."},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high"], "description": "Optional effort level."},
+                    "when": {"type": "string", "description": "Optional preferred time window: 'morning'/'afternoon'/'evening', optionally followed by 'weekday'/'weekend' (e.g. 'afternoon weekend')."},
                 },
                 "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_update_task_details",
+            "description": "Change an existing task's title, priority, deadline, duration estimate, effort level, or preferred time window. Only set fields the user explicitly gives a new value for - omit everything else. For notes, use project_manager_update_task_notes instead; for status, use project_manager_update_task_status instead.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
+                    "task": {"type": "string", "description": "Existing task ID, short ID, or an unambiguous task title."},
+                    "title": {"type": "string", "description": "New title."},
+                    "priority": {"type": "string", "enum": ["low", "normal", "high"]},
+                    "deadline": {"type": "string", "description": "New deadline, 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM'. Pass an empty string to clear it."},
+                    "duration": {"type": "string", "description": "New duration estimate, e.g. '45m', '1h30m', or '90'. Pass an empty string to clear it."},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high"], "description": "New effort level. Pass an empty string to clear it."},
+                    "when": {"type": "string", "description": "New preferred time window, e.g. 'afternoon weekend'. Pass an empty string to clear it."},
+                },
+                "required": ["task"],
             },
         },
     },
@@ -1192,7 +1364,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "project_manager_update_task_notes",
-            "description": "Replace, append to, or clear the notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten. To record a duration estimate, effort level, or preferred time window so they show up automatically next to the task (not just when asked), put recognized tag lines at the very top of the text, one per line: 'dur: 45m' (also accepts '1h', '1h30m', '90'), 'effort: low' / 'effort: medium' / 'effort: high', and 'when: morning' / 'afternoon' / 'evening', optionally followed by 'weekday' or 'weekend' (e.g. 'when: afternoon weekend'). Any text after the tag lines is kept as freeform notes. Appending new tag lines only updates those specific tags and leaves the rest of the note (including other existing tags) intact - no need to replace the whole note to change one tag.",
+            "description": "Replace, append to, or clear the freeform notes of an existing task when the user explicitly asks. Use append for additional context and replace only when the user wants existing notes overwritten. For a duration estimate, effort level, deadline, or preferred time window, use project_manager_update_task_details instead - those are separate structured fields, not part of notes.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1234,20 +1406,41 @@ TOOLS = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "type": {"type": "string", "enum": ["create_task", "update_task_status", "update_task_notes"]},
-                                "title": {"type": "string", "description": "For create_task."},
-                                "priority": {"type": "string", "enum": ["low", "normal", "high"]},
-                                "notes": {"type": "string", "description": "For create_task. Optional tag lines at the top ('dur: 45m', 'effort: medium', 'when: afternoon weekend') show up automatically next to the task - see project_manager_update_task_notes for the exact syntax."},
-                                "task": {"type": "string", "description": "For status or note updates: task ID, short ID, or unambiguous title."},
+                                "type": {"type": "string", "enum": ["create_task", "update_task_details", "update_task_status", "update_task_notes"]},
+                                "title": {"type": "string", "description": "For create_task (required there) or update_task_details (new title)."},
+                                "priority": {"type": "string", "enum": ["low", "normal", "high"], "description": "For create_task or update_task_details."},
+                                "notes": {"type": "string", "description": "For create_task only. Optional freeform notes."},
+                                "deadline": {"type": "string", "description": "For create_task or update_task_details. 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM' - never a time alone. For update_task_details, an empty string clears it."},
+                                "duration": {"type": "string", "description": "For create_task or update_task_details. Duration estimate, e.g. '45m', '1h30m', or '90'. For update_task_details, an empty string clears it."},
+                                "effort": {"type": "string", "enum": ["low", "medium", "high"], "description": "For create_task or update_task_details. For update_task_details, an empty string clears it."},
+                                "when": {"type": "string", "description": "For create_task or update_task_details. Preferred time window, e.g. 'afternoon weekend'. For update_task_details, an empty string clears it."},
+                                "task": {"type": "string", "description": "For status, note, or detail updates: task ID, short ID, or unambiguous title."},
                                 "status": {"type": "string", "enum": ["pending", "active", "blocked", "done", "cancelled"]},
                                 "mode": {"type": "string", "enum": ["replace", "append", "clear"]},
-                                "text": {"type": "string", "description": "For update_task_notes. Same 'dur:'/'effort:'/'when:' tag syntax as project_manager_update_task_notes applies here."},
+                                "text": {"type": "string", "description": "For update_task_notes. Freeform note text."},
                             },
                             "required": ["type"],
                         },
                     },
                 },
                 "required": ["operations"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_manager_set_gantt_dates",
+            "description": "Set (or clear) the start/end calendar dates a project shows as a bar with on the Gantt chart at /gantt-chart. Only call this when the user explicitly gives a date range for a project's Gantt bar - never infer dates from task talk. A project only appears on the chart once both start and end are set.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project ID, short code, or name. Omit to use the focused project."},
+                    "start": {"type": "string", "description": "Start date, YYYY-MM-DD. Omit to leave unchanged."},
+                    "end": {"type": "string", "description": "End date, YYYY-MM-DD. Omit to leave unchanged."},
+                    "clear": {"type": "boolean", "description": "If true, remove both dates and hide this project from the Gantt chart. Ignores start/end."},
+                },
+                "required": [],
             },
         },
     },
@@ -1313,6 +1506,149 @@ TOOLS = [
     },
 ]
 
+# Extracted (not inlined into TOOLS above) so attire_subagent.py's separate
+# one-shot completion call can reuse these exact schemas instead of a
+# second hand-copied version that could silently drift from this one.
+ATTIRE_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_manager_update",
+            "description": (
+                "Record a change in the character's attire. Call this the moment the narrative describes ANY change to what a character is wearing"
+                " - full outfit changes as well as subtle/partial ones (loosening or removing a tie, unbuttoning a shirt, taking off shoes or an accessory,"
+                " a jacket coming off, one item being swapped for another). Only pass the slot(s) that changed; omit everything else. Pass an empty string for"
+                " a slot to mean it is now bare/nothing (e.g. shoes removed). If a slot already describes one or more items (e.g. feet: 'white socks'), and an "
+                "item is added (e.g. 'black sneakers are put on feet'), you MUST restate the FULL corrected value for that slot (e.g. feet: 'black sneakers and white socks')."
+                " If a slot shown above already describes more than one item (e.g. feet: 'black sneakers and white socks'), and only PART of that changes (e.g. just the socks come off),"
+                " you MUST restate the FULL corrected value for that slot (feet: 'black sneakers')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character whose attire changed, exactly as you refer to them."},
+                    "head": {"type": "string", "description": "Headwear, e.g. 'wide-brimmed hat'. Omit if unchanged; empty string to clear."},
+                    "top": {"type": "string", "description": "Upper-body garment, e.g. 'black leather jacket'. Omit if unchanged; empty string to clear."},
+                    "bottom": {"type": "string", "description": "Lower-body garment, e.g. 'ripped jeans'. Omit if unchanged; empty string to clear."},
+                    "feet": {"type": "string", "description": "Footwear, e.g. 'combat boots'. Omit if unchanged; empty string to clear."},
+                    "accessories": {"type": "string", "description": "Comma-separated list of accessories, e.g. 'silver necklace, fingerless gloves'. Omit if unchanged; empty string to clear all."},
+                },
+                "required": ["character_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_manager_get",
+            "description": (
+                "Look up a character's current attire. Usually unnecessary since a tracked "
+                "character's current attire is already shown to you automatically at the top "
+                "of the conversation - use this only if that wasn't shown (e.g. a brand-new "
+                "character never updated before) or you need to double-check before narrating."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character to look up, exactly as you refer to them."},
+                },
+                "required": ["character_name"],
+            },
+        },
+    },
+]
+# Deliberately NOT merged into TOOLS: attire tracking is handled entirely
+# by the post-turn attire_subagent.py pass, not by the main agent
+# mid-conversation. ATTIRE_TOOL_SCHEMAS stays defined here purely so
+# attire_subagent.py can import and reuse these exact schemas for its own
+# separate completion call - never added to what the main agent sees.
+#
+# v2 (see brainstorm-layered-clothing.md): three verbs instead of one
+# full-value update, so adding a layered item structurally cannot erase
+# anything else already in the slot - see attire_manager.py's docstring.
+ATTIRE_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_add_item",
+            "description": (
+                "Add one item to a slot WITHOUT touching anything else already there. Use this "
+                "whenever something is put on, layered, or added - e.g. shoes going on over socks, "
+                "a jacket going on over a shirt, a ring being put on. Never use this to describe an "
+                "item being removed or swapped."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character whose attire changed, exactly as you refer to them."},
+                    "slot": {"type": "string", "enum": list(attire_manager.ATTIRE_SLOTS), "description": "Which slot the item goes in."},
+                    "item": {"type": "string", "description": "The item being added, e.g. 'black leather jacket'."},
+                },
+                "required": ["character_name", "slot", "item"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_remove_item",
+            "description": (
+                "Remove one item from a slot. Use this when the narrative describes an item coming "
+                "off - taken off, removed, shrugged off, kicked off, etc. Only removes the ONE item "
+                "described; anything else in that slot is left untouched."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character whose attire changed, exactly as you refer to them."},
+                    "slot": {"type": "string", "enum": list(attire_manager.ATTIRE_SLOTS), "description": "Which slot to remove from."},
+                    "item_hint": {"type": "string", "description": "The item being removed, as described in the narrative, e.g. 'the jacket' or 'her shoes'."},
+                },
+                "required": ["character_name", "slot", "item_hint"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_replace_slot",
+            "description": (
+                "Wipe a slot and set it to a brand new value. ONLY use this for a genuine full "
+                "change - e.g. a character changes into a whole new outfit, or the scene explicitly "
+                "resets what someone is wearing. Do NOT use this to describe a single item coming "
+                "on or off - that silently deletes anything else in the slot. Use attire_add_item "
+                "or attire_remove_item for anything short of a full change."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character whose attire changed, exactly as you refer to them."},
+                    "slot": {"type": "string", "enum": list(attire_manager.ATTIRE_SLOTS), "description": "Which slot to replace."},
+                    "items": {"type": "string", "description": "Comma-separated full new contents of the slot, e.g. 'red sundress, sun hat'. Empty string clears it entirely."},
+                },
+                "required": ["character_name", "slot", "items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attire_manager_get",
+            "description": (
+                "Look up a character's current attire. Usually unnecessary since a tracked "
+                "character's current attire is already shown to you automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character_name": {"type": "string", "description": "The character to look up, exactly as you refer to them."},
+                },
+                "required": ["character_name"],
+            },
+        },
+    },
+]
+
 TOOL_FUNCTIONS = {
     "get_current_time": get_current_time,
     "calculate": calculate,
@@ -1343,10 +1679,12 @@ TOOL_FUNCTIONS = {
     "calendar_check_availability": calendar_check_availability,
     "project_manager_get_overview": project_manager_get_overview,
     "project_manager_create_task": project_manager_create_task,
+    "project_manager_update_task_details": project_manager_update_task_details,
     "project_manager_update_task_status": project_manager_update_task_status,
     "project_manager_update_task_notes": project_manager_update_task_notes,
     "project_manager_set_all_tasks_status": project_manager_set_all_tasks_status,
     "project_manager_batch_update": project_manager_batch_update,
+    "project_manager_set_gantt_dates": project_manager_set_gantt_dates,
     "duration_get_estimate": duration_get_estimate,
     "duration_correct_entry": duration_correct_entry,
     "duration_confirm_new_category": duration_confirm_new_category,
@@ -1376,8 +1714,10 @@ TOOL_GROUPS = {
     "calendar_delete_event": "calendar", "calendar_confirm_pending": "calendar",
     "calendar_cancel_pending": "calendar", "calendar_check_availability": "calendar",
     "project_manager_get_overview": "project", "project_manager_create_task": "project",
+    "project_manager_update_task_details": "project",
     "project_manager_update_task_status": "project", "project_manager_update_task_notes": "project",
     "project_manager_set_all_tasks_status": "project", "project_manager_batch_update": "project",
+    "project_manager_set_gantt_dates": "project",
     "duration_get_estimate": "duration", "duration_correct_entry": "duration",
     "duration_confirm_new_category": "duration",
 }
@@ -1483,7 +1823,11 @@ GROUP_INSTRUCTIONS = {
         "requests, use project_manager_set_all_tasks_status once instead of "
         "enumerating tasks. Project-manager changes apply immediately - "
         "there is no separate confirmation step, so only call these tools "
-        "when the user's intent is unambiguous."
+        "when the user's intent is unambiguous. Use "
+        "project_manager_set_gantt_dates only when the user explicitly "
+        "gives a start/end date range for a project's bar on the Gantt "
+        "chart - never infer dates from task due-by talk or duration "
+        "estimates, which are unrelated."
     ),
     "duration": (
         "Use duration_get_estimate whenever the user asks how long a "
@@ -1576,7 +1920,7 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
     """
     force_names = set(force_names or ())
 
-    if not TOOL_SELECTION_ENABLED:
+    if not runtime_settings.get("TOOL_SELECTION_ENABLED"):
         return TOOLS, {}, "disabled"
 
     text = (user_text or "").strip()
@@ -1588,7 +1932,8 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
     query_vec = np.array(memory.embed(text))
     scores = {name: float(query_vec @ vec) for name, vec in _TOOL_EMBEDDINGS.items()}
 
-    confident = {n for n, s in scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
+    min_score = runtime_settings.get("TOOL_SELECTION_MIN_SCORE")
+    confident = {n for n, s in scores.items() if s >= min_score}
 
     if confident:
         selected_names = _expand_to_groups(confident)   # was: selected_names = confident
@@ -1604,7 +1949,7 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
             prior_tail = prior_text[-TOOL_SELECTION_CONTEXT_CHAR_LIMIT:]
             combined_vec = np.array(memory.embed(f"{prior_tail} {text}"))
             combined_scores = {name: float(combined_vec @ vec) for name, vec in _TOOL_EMBEDDINGS.items()}
-            widened = {n for n, s in combined_scores.items() if s >= TOOL_SELECTION_MIN_SCORE}
+            widened = {n for n, s in combined_scores.items() if s >= min_score}
             if widened:
                 # Debug log reflects the query that actually decided this,
                 # not the (lower, inconclusive) single-message scores.
@@ -1621,8 +1966,8 @@ def select_tools(user_text: str, force_names: set | None = None, prior_assistant
             # rescues nothing at all).
             ranked = sorted(scores.items(), key=lambda kv: -kv[1])
             selected_names = {
-                n for n, s in ranked[:TOOL_SELECTION_RESCUE_TOP_K]
-                if s >= TOOL_SELECTION_RESCUE_SCORE
+                n for n, s in ranked[:runtime_settings.get("TOOL_SELECTION_RESCUE_TOP_K")]
+                if s >= runtime_settings.get("TOOL_SELECTION_RESCUE_SCORE")
             }
             tier = "rescue" if selected_names else "core_only"
 
@@ -1745,6 +2090,15 @@ async def api_update_project(project_id: str, request: Request):
             project = await asyncio.to_thread(project_manager.rename_project, project_id, body["name"])
         if "status" in body:
             project = await asyncio.to_thread(project_manager.set_project_status, project_id, body["status"])
+        if body.get("clear_gantt_dates"):
+            project = await asyncio.to_thread(
+                project_manager.set_project_gantt_dates, project_id, clear=True
+            )
+        elif "gantt_start" in body or "gantt_end" in body:
+            project = await asyncio.to_thread(
+                project_manager.set_project_gantt_dates, project_id,
+                start=body.get("gantt_start"), end=body.get("gantt_end"),
+            )
         if project is None:
             state = await asyncio.to_thread(project_manager._load)
             project = state["projects"].get(project_id)
@@ -1781,6 +2135,8 @@ async def api_create_task(project_id: str, request: Request):
             project_manager.create_task,
             project_id, body.get("title", ""),
             priority=body.get("priority", "normal"), notes=body.get("notes", ""),
+            deadline=body.get("deadline", ""), duration=body.get("duration", ""),
+            effort=body.get("effort", ""), when=body.get("when", ""),
         )
     except ProjectManagerError as e:
         _pm_error(e)
@@ -1793,11 +2149,13 @@ async def api_update_task(project_id: str, task_id: str, request: Request):
     try:
         task = None
         if "status" in body:
-            task = await asyncio.to_thread(project_manager.set_task_status, project_id, task_id, body["status"])
-        if any(k in body for k in ("title", "priority", "notes")):
+            task, _flag = await asyncio.to_thread(project_manager.set_task_status, project_id, task_id, body["status"])
+        if any(k in body for k in ("title", "priority", "notes", "deadline", "duration", "effort", "when")):
             task = await asyncio.to_thread(
                 project_manager.update_task_details, project_id, task_id,
                 title=body.get("title"), priority=body.get("priority"), notes=body.get("notes"),
+                deadline=body.get("deadline"), duration=body.get("duration"),
+                effort=body.get("effort"), when=body.get("when"),
             )
         if "notes_mode" in body:
             task = await asyncio.to_thread(
@@ -1878,6 +2236,66 @@ async def api_delete_memory(memory_id: str):
 async def memory_browser_page():
     html_path = Path(__file__).parent / "web" / "memory_browser.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+@app.get("/dashboard")
+async def dashboard_page():
+    """Combined prompt-log-viewer + settings-panel page, tabbed. Reuses
+    both pages' existing CSS/JS verbatim (served by prompt_log_engine.py
+    and settings_engine.py respectively) - this route only serves the
+    shell that tabs between them."""
+    html_path = Path(__file__).parent / "web" / "dashboard.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Gantt chart (frappe-gantt) - one bar per project with both gantt_start and
+# gantt_end set, coloured by task-completion progress. /gantt is plain JSON
+# already shaped as frappe-gantt Task rows (see project_manager.gantt_rows);
+# /gantt-chart serves the page that renders them. Both deliberately
+# unauthenticated, same as /projects - see handover-21 for why.
+# ---------------------------------------------------------------------------
+
+@app.get("/gantt")
+async def api_gantt():
+    state = await asyncio.to_thread(project_manager._load)
+    return {"rows": project_manager.gantt_rows(state)}
+
+
+@app.get("/gantt/{project_id}/children")
+async def api_gantt_children(project_id: str):
+    state = await asyncio.to_thread(project_manager._load)
+    project = state["projects"].get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    children = project_manager.get_child_projects(state, project)
+    return {"children": [
+        {"id": c["id"], "short_code": c["short_code"], "name": c["name"], "status": c["status"]}
+        for c in children
+    ]}
+
+
+@app.get("/gantt-chart")
+async def gantt_chart_page():
+    html_path = Path(__file__).parent / "web" / "gantt.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+# Vendored frappe-gantt (MIT) - kept as static files under web/ rather than
+# a CDN <script> tag, so the chart still works with no internet access at
+# all. Update by re-running `npm install frappe-gantt@<version> --no-save`
+# somewhere with network access and copying dist/frappe-gantt.umd.js +
+# dist/frappe-gantt.css over these two files.
+@app.get("/vendor/frappe-gantt.umd.js")
+async def gantt_lib_js():
+    js_path = Path(__file__).parent / "web" / "frappe-gantt.umd.js"
+    return Response(content=js_path.read_text(encoding="utf-8"), media_type="application/javascript")
+
+
+@app.get("/vendor/frappe-gantt.css")
+async def gantt_lib_css():
+    css_path = Path(__file__).parent / "web" / "frappe-gantt.css"
+    return Response(content=css_path.read_text(encoding="utf-8"), media_type="text/css")
 
 
 # ---------------------------------------------------------------------------
@@ -2192,6 +2610,20 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request):
+    # A model swap stops llama-server entirely for a window - fail fast
+    # with a clear reason instead of SillyTavern seeing a bare connection
+    # error and the user wondering what broke.
+    model_state = model_manager.status()
+    if model_state["phase"] != "ready":
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "message": f"llama-server is currently {model_state['phase']} "
+                           f"(model swap in progress?) - try again shortly.",
+                "type": "model_unavailable",
+            }},
+        )
+
     body = await request.json()
     client_wants_stream = body.get("stream", False)
 
@@ -2213,6 +2645,10 @@ async def chat_completions(request: Request):
     # to detect tool calls early), regardless of what the client asked for.
     upstream_body = dict(body)
     upstream_body["stream"] = True
+    upstream_body["temperature"] = runtime_settings.get("LLAMA_TEMP")
+    upstream_body["top_p"] = runtime_settings.get("LLAMA_TOP_P")
+    upstream_body["top_k"] = runtime_settings.get("LLAMA_TOP_K")
+    upstream_body["min_p"] = runtime_settings.get("LLAMA_MIN_P")
 
     # Dynamic tool selection: only send the tools (and matching usage
     # instructions) relevant to what the user actually asked, instead of
@@ -2233,9 +2669,48 @@ async def chat_completions(request: Request):
         (m.get("content") for m in reversed(body.get("messages", [])) if m.get("role") == "assistant"),
         "",
     )
+
+    # SillyTavern's own leading system message, if any (the character
+    # card). Extracted here - earlier than it used to be - because
+    # force_tool_names below needs it; the per-section token-count
+    # diagnostic further down reuses this same variable rather than
+    # re-extracting it.
+    character_card_text = None
+    if upstream_body["messages"] and upstream_body["messages"][0].get("role") == "system":
+        character_card_text = upstream_body["messages"][0].get("content") or ""
+
     force_tool_names = set()
     if calendar_manager.has_pending_change():
-        force_tool_names = {name for name, group in TOOL_GROUPS.items() if group == "calendar"}
+        force_tool_names |= {name for name, group in TOOL_GROUPS.items() if group == "calendar"}
+
+    # Post-turn attire sub-agent from the PREVIOUS turn: give it up to
+    # ATTIRE_SUBAGENT_TIMEOUT_SECONDS to finish before reading attire state
+    # below. asyncio.shield() means a timeout here doesn't cancel the task -
+    # it keeps running and will still write attire.json when it's done, just
+    # too late to be reflected in THIS turn's context.
+    global _attire_subagent_task
+    if _attire_subagent_task is not None:
+        pending_task, _attire_subagent_task = _attire_subagent_task, None
+        try:
+            await asyncio.wait_for(asyncio.shield(pending_task), timeout=ATTIRE_SUBAGENT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            alog(f"[ATTIRE-SUBAGENT] Still running after {ATTIRE_SUBAGENT_TIMEOUT_SECONDS}s - "
+                 f"proceeding with existing attire state for this turn.")
+        except Exception as e:
+            alog(f"[ATTIRE-SUBAGENT] Previous turn's pass raised: {e}")
+
+    # Still needed below (NOT for tool selection anymore) purely for the
+    # informational [PERSISTENT ATTIRE STATE] context block - attire is no
+    # longer a main-agent-selectable tool group, so there's nothing here
+    # to force in. Seeding a brand-new character from the card is also
+    # deliberately not attempted here anymore: attire_subagent.py only
+    # reacts to explicit changes in the last exchange, so an untracked
+    # character stays untracked until their outfit actually changes -
+    # accepted tradeoff, not a bug.
+    attire_state_now = attire_manager._load()
+    known_attire_match = attire_manager.find_character_names_in_text(
+        attire_state_now, character_card_text or ""
+    )
 
     selected_tools, tool_scores, tool_tier = select_tools(
         str(last_user_text or ""), force_tool_names, str(prior_assistant_text or "")
@@ -2280,6 +2755,19 @@ async def chat_completions(request: Request):
         messages_to_prepend.append({"role": "system", "content": project_state_text})
         prepend_sections.append(("project_state", project_state_text))
     alog(f"[AGENT] Project state text sent to model:\n{project_state_text or '(none)'}")
+
+    # Attire state for any already-tracked character mentioned in the
+    # character card - reuses attire_state_now/known_attire_match computed
+    # earlier for force_tool_names rather than reloading and re-scanning.
+    # Best-effort: zero or multiple name matches both just skip injection
+    # (see find_character_names_in_text's docstring) rather than guessing.
+    attire_state_text = attire_manager.build_context_text_for_ids(
+        attire_state_now, known_attire_match
+    )
+    if attire_state_text:
+        messages_to_prepend.append({"role": "system", "content": attire_state_text})
+        prepend_sections.append(("attire_state", attire_state_text))
+    alog(f"[AGENT] Attire state text sent to model:\n{attire_state_text or '(none)'}")
 
     # Read-only, local-file-only - see calendar_manager.get_cached_context()
     # docstring for why this never triggers a live CalDAV call.
@@ -2352,13 +2840,12 @@ async def chat_completions(request: Request):
 
     # Best-effort exact per-section token counts via llama-server's
     # /tokenize endpoint - purely diagnostic, printed to console to help
-    # spot which system-prompt section is worth trimming. "character_card"
-    # is SillyTavern's own leading system message, if any - inspected here
-    # for visibility only, never modified. A tokenize failure just skips
-    # this log line; it never blocks the actual turn.
-    character_card_text = None
-    if upstream_body["messages"] and upstream_body["messages"][0].get("role") == "system":
-        character_card_text = upstream_body["messages"][0].get("content") or ""
+    # spot which system-prompt section is worth trimming. character_card_text
+    # (SillyTavern's own leading system message, if any) was already
+    # extracted earlier in this function for force_tool_names - reused here
+    # rather than re-extracted, inspected only for visibility, never
+    # modified. A tokenize failure just skips this log line; it never
+    # blocks the actual turn.
 
     # The tools schema (this server's own TOOLS plus any client-registered
     # ones) is sent as JSON on every single request and rendered into the
@@ -2423,6 +2910,8 @@ async def chat_completions(request: Request):
             "choices": [{"index": 0, "message": final_message, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
+        if finish_reason == "stop":
+            _spawn_attire_subagent(str(last_user_text or ""), final_message.get("content") or "")
         return JSONResponse(content=final_data)
 
     # Client wants real streaming: forward each content delta to SillyTavern
@@ -2455,6 +2944,10 @@ async def chat_completions(request: Request):
                 yield sse({"index": 0, "delta": {}, "finish_reason": "tool_calls"})
                 yield b"data: [DONE]\n\n"
                 return
+
+            if kind == "done":
+                _spawn_attire_subagent(str(last_user_text or ""), payload.get("content") or "")
+                continue
             # "done" carries the full message for the non-streaming path only;
             # its content has already been sent as deltas above.
 

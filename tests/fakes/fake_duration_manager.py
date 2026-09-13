@@ -20,9 +20,9 @@ this only changes what project_manager.py itself sees when it calls
 duration_manager's own tests at all.
 
 parse_duration_minutes is a deliberate exception in HOW it's faked, not
-IN THAT it's faked: project_manager.py's "dur:" note-tag parsing
-(_parse_note_tags) needs SOME real-shaped parser to decide tag validity
-in its own tests. This fake ships its own small, deliberately-simplified
+IN THAT it's faked: project_manager.py's `duration` task field
+(_parse_task_duration) needs SOME real-shaped parser to decide validity in
+its own tests. This fake ships its own small, deliberately-simplified
 parser instead of reusing the genuine one, to keep project_manager's
 tests from silently depending on duration_manager's exact parsing edge
 cases - those are already covered in test_duration_parsing.py. This fake
