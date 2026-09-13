@@ -51,6 +51,123 @@
     margin-bottom: 20px;
   }
   .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .panel-header h2 { margin: 0 0 12px; }
+  .panel-add-toggle {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+    margin-bottom: 12px;
+  }
+  .panel-add-toggle:hover { color: var(--text); border-color: var(--accent); }
+  .panel-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+    position: relative;
+  }
+  .panel-header-actions .panel-add-toggle,
+  .panel-header-actions .panel-edit-toggle,
+  .panel-header-actions .panel-filter-toggle { margin-bottom: 0; }
+  .panel-edit-toggle {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .panel-edit-toggle:hover { color: var(--text); }
+  .panel-edit-toggle.active {
+    background: var(--ok);
+    border-color: var(--ok);
+    color: #fff;
+  }
+  .panel-filter-toggle {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .panel-filter-toggle:hover { color: var(--text); border-color: var(--accent); }
+  .panel-filter-toggle.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .filter-dropdown {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 10px;
+    width: 240px;
+    max-height: 320px;
+    overflow-y: auto;
+    z-index: 1500;
+  }
+  .filter-dropdown[hidden] { display: none; }
+  .filter-dropdown-actions {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .filter-dropdown-actions button {
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .filter-dropdown-actions button:hover { text-decoration: underline; }
+  .filter-dropdown-list { display: flex; flex-direction: column; gap: 6px; }
+  .filter-dropdown-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .filter-dropdown-item input { flex: 0 0 auto; }
 
   #ganttEmpty { color: var(--muted); font-size: 13px; padding: 12px 0; }
 
@@ -199,6 +316,29 @@
   .task-status.cancelled { background: rgba(154,156,163,0.12); color: var(--muted); }
   .task-status.paused { background: rgba(154,156,163,0.18); color: var(--muted); }
   .task-status.completed { background: rgba(76,175,125,0.18); color: var(--ok); }
+  .project-info { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+  .project-info-row { display: flex; flex-direction: column; gap: 2px; }
+  .project-info-row .label { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .project-info-row .value { font-size: 13px; color: var(--text); }
+  .project-info-children { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .project-info-children li {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 12px;
+  }
+  .project-info-row .edit-input,
+  .project-info-row .edit-select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+    font-family: inherit;
+    width: 100%;
+    box-sizing: border-box;
+  }
 
   /* the chart itself grows to fit every rendered row; .gantt-container (inside)
      handles its own horizontal scrolling, so this wrapper just sizes/borders it */
@@ -283,6 +423,34 @@
     line-height: 1;
   }
   .board-add-toggle:hover { color: var(--text); border-color: var(--accent); }
+  .board-delete-toggle {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+  }
+  .board-delete-toggle:hover { color: var(--text); border-color: var(--danger); }
+  .board-delete-toggle.active {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #fff;
+  }
+  .board-cards.delete-mode .board-card {
+    cursor: pointer;
+  }
+  .board-cards.delete-mode .board-card:hover {
+    outline: 2px solid var(--danger);
+    outline-offset: -2px;
+  }
 
   /* --- new task modal --- */
   .task-modal-overlay {
@@ -336,6 +504,25 @@
     color: #fff;
   }
   .task-modal button:hover { opacity: 0.9; }
+  .task-modal .field-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .task-modal .field-row .field { flex: 1 1 auto; margin-bottom: 0; }
+  .task-modal .child-toggle {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+    padding-top: 18px;
+  }
+  .task-modal select:disabled { color: var(--muted); opacity: 0.6; cursor: not-allowed; }
+  .task-modal .date-row { display: flex; gap: 10px; }
+  .task-modal .date-row .field { flex: 1 1 0; }
   .board {
     display: flex;
     gap: 12px;
@@ -544,7 +731,21 @@
   </div>
 
   <div class="panel">
-    <h2>Chart</h2>
+    <div class="panel-header">
+      <h2>Chart</h2>
+      <div class="panel-header-actions">
+        <button type="button" class="panel-add-toggle" id="newProjectToggle" title="New project">&#43;</button>
+        <button type="button" class="panel-edit-toggle" id="chartEditToggle" title="Edit project" aria-pressed="false">&#9998;</button>
+        <button type="button" class="panel-filter-toggle" id="ganttFilterToggle" title="Filter projects" aria-expanded="false">&#128269;</button>
+        <div class="filter-dropdown" id="ganttFilterDropdown" hidden>
+          <div class="filter-dropdown-actions">
+            <button type="button" id="ganttFilterShowAll">Show all</button>
+            <button type="button" id="ganttFilterHideAll">Hide all</button>
+          </div>
+          <div class="filter-dropdown-list" id="ganttFilterList"></div>
+        </div>
+      </div>
+    </div>
     <div id="ganttEmpty" hidden>No projects have both a start and end date set yet — use the form above to add one.</div>
     <div class="chart-area" id="chartArea">
       <div class="task-sidebar" id="taskSidebar">
@@ -575,6 +776,7 @@
       <h2>Project Board</h2>
       <div class="board-header-actions">
         <button type="button" class="board-add-toggle" id="boardAddToggle" title="Add task">&#43;</button>
+        <button type="button" class="board-delete-toggle" id="boardDeleteToggle" title="Delete tasks" aria-pressed="false">&#8722;</button>
         <button type="button" class="board-edit-toggle" id="boardEditToggle" title="Edit tasks" aria-pressed="false">&#9998;</button>
       </div>
     </div>
@@ -605,6 +807,40 @@
   </div>
 </div>
 
+<div class="task-modal-overlay" id="newProjectModalOverlay" hidden>
+  <div class="task-modal">
+    <h3>New Project</h3>
+    <div class="field">
+      <label for="newProjectName">Name</label>
+      <input type="text" id="newProjectName" placeholder="Project name">
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="newProjectParentSelect">Parent project</label>
+        <select id="newProjectParentSelect" disabled></select>
+      </div>
+      <label class="child-toggle">
+        <input type="checkbox" id="newProjectChildCheckbox">
+        Child project
+      </label>
+    </div>
+    <div class="date-row">
+      <div class="field">
+        <label for="newProjectStart">Start date</label>
+        <input type="date" id="newProjectStart">
+      </div>
+      <div class="field">
+        <label for="newProjectEnd">End date</label>
+        <input type="date" id="newProjectEnd">
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" id="newProjectCancelBtn">Cancel</button>
+      <button type="button" class="primary" id="newProjectCreateBtn">Create</button>
+    </div>
+  </div>
+</div>
+
 <script src="/vendor/frappe-gantt.umd.js"></script>
 <script>
 (function () {
@@ -624,6 +860,8 @@
   const board = document.getElementById("board");
   const boardHint = document.getElementById("boardHint");
   const boardEditToggle = document.getElementById("boardEditToggle");
+  const boardDeleteToggle = document.getElementById("boardDeleteToggle");
+  const chartEditToggle = document.getElementById("chartEditToggle");
   let ganttInstance = null;
   let projectsById = {};
   let currentViewMode = "Week";
@@ -631,6 +869,13 @@
   let dragLabelEl = null;
   let boardProjectId = null;
   let boardEditMode = false;
+  let boardDeleteMode = false;
+  let chartEditMode = false;
+  const PROJECT_STATUSES = [
+    { key: "active", label: "Active" },
+    { key: "paused", label: "Paused" },
+    { key: "completed", label: "Completed" },
+  ];
   const TASK_STATUSES = [
     { key: "pending", label: "Pending" },
     { key: "active", label: "Active" },
@@ -685,6 +930,42 @@
     return date.toLocaleString(undefined, opts);
   }
 
+  function parseLocalDate(value) {
+    // "YYYY-MM-DD" parsed as local midnight (see formatDeadline's note on
+    // why `new Date(value)` directly is wrong here).
+    if (!value) return null;
+    const [y, m, d] = value.split("-").map(Number);
+    const date = new Date(y, m - 1, d);
+    return isNaN(date.getTime()) ? null : date;
+  }
+
+  function formatWeeks(totalDays) {
+    const days = Math.round(totalDays);
+    const weeks = Math.floor(days / 7);
+    const remDays = days % 7;
+    const weeksPart = `${weeks} week${weeks === 1 ? "" : "s"}`;
+    if (remDays === 0) return weeksPart;
+    const daysPart = `${remDays} day${remDays === 1 ? "" : "s"}`;
+    return weeks === 0 ? daysPart : `${weeksPart}, ${daysPart}`;
+  }
+
+  function projectWeeksInfo(project) {
+    const start = parseLocalDate(project.gantt_start);
+    const end = parseLocalDate(project.gantt_end);
+    if (!start || !end) return { total: "Not set", remaining: "Not set" };
+    const msPerDay = 24 * 60 * 60 * 1000;
+    const totalDays = Math.max(0, (end - start) / msPerDay);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    // Before the project starts, "remaining" is the whole project - counting
+    // down from today would overstate it since today < start.
+    const remainingMs = today < start ? end - start : end - today;
+    return {
+      total: formatWeeks(totalDays),
+      remaining: remainingMs <= 0 ? "0 days (past end date)" : formatWeeks(remainingMs / msPerDay),
+    };
+  }
+
   function formatDurationInput(minutes) {
     // Mirrors project_manager._format_duration_tag's "1h30m"/"2h"/"45m"
     // shape - the edit-mode duration input round-trips through this same
@@ -729,65 +1010,260 @@
     endInput.value = (p && p.gantt_end) || "";
   }
 
-  async function showProjectTasks(projectId) {
-    taskSidebarContent.innerHTML = '<p class="hint">Loading tasks\u2026</p>';
-    try {
-      const childRes = await fetch(`/gantt/${projectId}/children`);
-      if (childRes.ok) {
-        const { children } = await childRes.json();
-        if (children.length) {
-          const parent = projectsById[projectId];
-          const header = parent
-            ? `<h3>${parent.short_code} <span class="proj-code">\u2014 ${parent.name}</span></h3>`
-            : "";
-          const items = children.map((c) => `<li>
-            <span class="task-title">${c.short_code} \u2014 ${c.name}</span>
-            <div class="task-meta"><span class="task-status ${c.status}">${c.status}</span></div>
-          </li>`).join("");
-          taskSidebarContent.innerHTML = header + '<p class="hint">Child projects</p>' + `<ul class="task-list">${items}</ul>`;
-          return;
-        }
-      }
-    } catch (e) {
-      // Children lookup failing shouldn't block the normal task view below.
+  const newProjectToggle = document.getElementById("newProjectToggle");
+  const newProjectModalOverlay = document.getElementById("newProjectModalOverlay");
+  const newProjectName = document.getElementById("newProjectName");
+  const newProjectParentSelect = document.getElementById("newProjectParentSelect");
+  const newProjectChildCheckbox = document.getElementById("newProjectChildCheckbox");
+  const newProjectStart = document.getElementById("newProjectStart");
+  const newProjectEnd = document.getElementById("newProjectEnd");
+  const newProjectCancelBtn = document.getElementById("newProjectCancelBtn");
+  const newProjectCreateBtn = document.getElementById("newProjectCreateBtn");
+
+  function openNewProjectModal() {
+    newProjectName.value = "";
+    newProjectStart.value = "";
+    newProjectEnd.value = "";
+    newProjectChildCheckbox.checked = false;
+    newProjectParentSelect.disabled = true;
+    newProjectParentSelect.innerHTML = "";
+    const sorted = Object.values(projectsById).sort((a, b) => a.name.localeCompare(b.name));
+    for (const p of sorted) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = `${p.short_code} — ${p.name}`;
+      newProjectParentSelect.appendChild(opt);
     }
+    newProjectModalOverlay.hidden = false;
+    newProjectName.focus();
+  }
+
+  function closeNewProjectModal() {
+    newProjectModalOverlay.hidden = true;
+  }
+
+  newProjectToggle.addEventListener("click", openNewProjectModal);
+  newProjectCancelBtn.addEventListener("click", closeNewProjectModal);
+  newProjectModalOverlay.addEventListener("click", (e) => {
+    if (e.target === newProjectModalOverlay) closeNewProjectModal();
+  });
+  newProjectChildCheckbox.addEventListener("change", () => {
+    newProjectParentSelect.disabled = !newProjectChildCheckbox.checked;
+  });
+
+  newProjectCreateBtn.addEventListener("click", async () => {
+    const rawName = newProjectName.value.trim();
+    if (!rawName) {
+      showStatus("Enter a project name.", false);
+      return;
+    }
+    let finalName = rawName;
+    if (newProjectChildCheckbox.checked) {
+      const parent = projectsById[newProjectParentSelect.value];
+      if (!parent) {
+        showStatus("Select a parent project.", false);
+        return;
+      }
+      finalName = `${parent.short_code}-${rawName}`;
+    }
+    try {
+      const res = await fetch("/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: finalName }),
+      });
+      if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+      const project = await res.json();
+      if (newProjectStart.value || newProjectEnd.value) {
+        const patchRes = await fetch(`/projects/${project.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gantt_start: newProjectStart.value, gantt_end: newProjectEnd.value }),
+        });
+        if (!patchRes.ok) throw new Error((await patchRes.json()).detail || "Request failed");
+      }
+      closeNewProjectModal();
+      showStatus("Project created.", true);
+      await loadProjects();
+      await loadGantt();
+    } catch (err) {
+      showStatus(err.message, false);
+    }
+  });
+
+  const ganttFilterToggle = document.getElementById("ganttFilterToggle");
+  const ganttFilterDropdown = document.getElementById("ganttFilterDropdown");
+  const ganttFilterList = document.getElementById("ganttFilterList");
+  const ganttFilterShowAll = document.getElementById("ganttFilterShowAll");
+  const ganttFilterHideAll = document.getElementById("ganttFilterHideAll");
+
+  function setGanttFilterOpen(open) {
+    ganttFilterDropdown.hidden = !open;
+    ganttFilterToggle.classList.toggle("active", open);
+    ganttFilterToggle.setAttribute("aria-expanded", String(open));
+  }
+
+  ganttFilterToggle.addEventListener("click", () => setGanttFilterOpen(ganttFilterDropdown.hidden));
+  document.addEventListener("click", (e) => {
+    if (ganttFilterDropdown.hidden) return;
+    if (e.target === ganttFilterToggle || ganttFilterDropdown.contains(e.target)) return;
+    setGanttFilterOpen(false);
+  });
+  ganttFilterShowAll.addEventListener("click", () => {
+    hiddenProjectIds.clear();
+    saveHiddenProjectIds();
+    renderGanttFilterList();
+    renderGanttChart();
+  });
+  ganttFilterHideAll.addEventListener("click", () => {
+    hiddenProjectIds = new Set(allGanttRows.map((r) => r.id));
+    saveHiddenProjectIds();
+    renderGanttFilterList();
+    renderGanttChart();
+  });
+
+  async function showProjectInfo(projectId) {
+    taskSidebarContent.innerHTML = '<p class="hint">Loading project\u2026</p>';
     try {
       const res = await fetch(`/projects/${projectId}`);
       if (!res.ok) throw new Error("Could not load that project.");
       const project = await res.json();
-      const tasks = Object.values(project.tasks || {});
       const header = `<h3>${project.short_code} <span class="proj-code">\u2014 ${project.name}</span></h3>`;
-      if (!tasks.length) {
-        taskSidebarContent.innerHTML = header + '<p class="hint">No tasks in this project.</p>';
+
+      let children = [];
+      try {
+        const childRes = await fetch(`/gantt/${projectId}/children`);
+        if (childRes.ok) ({ children } = await childRes.json());
+      } catch (e) {
+        // Children lookup failing shouldn't block the rest of the info view.
+      }
+
+      const childrenHtml = children.length
+        ? `<div class="project-info-row">
+            <span class="label">Child projects</span>
+            <ul class="project-info-children">${children.map((c) => `<li>
+              <span class="task-title">${c.short_code} \u2014 ${c.name}</span>
+              <div class="task-meta"><span class="task-status ${c.status}">${c.status}</span></div>
+            </li>`).join("")}</ul>
+          </div>`
+        : `<div class="project-info-row">
+            <span class="label">Child projects</span>
+            <span class="value">None</span>
+          </div>`;
+
+      const weeksInfo = projectWeeksInfo(project);
+
+      if (!chartEditMode) {
+        const rows = [
+          { label: "Full name", value: project.name },
+          { label: "Status", value: `<span class="task-status ${project.status}">${project.status}</span>` },
+          { label: "Start date", value: project.gantt_start ? formatDeadline(project.gantt_start) : "Not set" },
+          { label: "End date", value: project.gantt_end ? formatDeadline(project.gantt_end) : "Not set" },
+          { label: "Total weeks", value: weeksInfo.total },
+          { label: "Weeks remaining", value: weeksInfo.remaining },
+        ];
+        const rowsHtml = rows.map((r) => `<div class="project-info-row">
+          <span class="label">${r.label}</span>
+          <span class="value">${r.value}</span>
+        </div>`).join("");
+        taskSidebarContent.innerHTML = header + `<div class="project-info">${rowsHtml}${childrenHtml}</div>`;
         return;
       }
-      tasks.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
-      const items = tasks.map((t) => {
-        const doneLine = t.status === "done" && t.completed_at
-          ? `<div class="task-meta"><span>Completed</span><span>${formatDate(t.completed_at)}</span></div>`
-          : "";
-        const deadlineLine = t.deadline
-          ? `<div class="task-meta"><span>Due</span><span>${formatDeadline(t.deadline)}</span></div>`
-          : "";
-        const properties = formatTaskProperties(t);
-        const propertiesLine = properties
-          ? `<div class="task-meta"><span>${properties}</span></div>`
-          : "";
-        return `<li>
-          <span class="task-title">${t.title}</span>
-          <div class="task-meta">
-            <span class="task-status ${t.status}">${t.status}</span>
-          </div>
-          ${deadlineLine}
-          ${propertiesLine}
-          ${doneLine}
-        </li>`;
-      }).join("");
-      taskSidebarContent.innerHTML = header + `<ul class="task-list">${items}</ul>`;
+
+      taskSidebarContent.innerHTML = header + `<div class="project-info">${childrenHtml}</div>`;
+      const infoBox = taskSidebarContent.querySelector(".project-info");
+
+      const nameRow = document.createElement("div");
+      nameRow.className = "project-info-row";
+      nameRow.innerHTML = '<span class="label">Full name</span>';
+      const nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.className = "edit-input";
+      nameInput.value = project.name;
+      nameInput.addEventListener("change", () => saveProjectField(projectId, { name: nameInput.value }));
+      nameRow.appendChild(nameInput);
+
+      const statusRow = document.createElement("div");
+      statusRow.className = "project-info-row";
+      statusRow.innerHTML = '<span class="label">Status</span>';
+      const statusSelect = document.createElement("select");
+      statusSelect.className = "edit-select";
+      for (const s of PROJECT_STATUSES) {
+        const opt = document.createElement("option");
+        opt.value = s.key;
+        opt.textContent = s.label;
+        statusSelect.appendChild(opt);
+      }
+      statusSelect.value = project.status;
+      statusSelect.addEventListener("change", () => saveProjectField(projectId, { status: statusSelect.value }));
+      statusRow.appendChild(statusSelect);
+
+      const startRow = document.createElement("div");
+      startRow.className = "project-info-row";
+      startRow.innerHTML = '<span class="label">Start date</span>';
+      const startInputEl = document.createElement("input");
+      startInputEl.type = "date";
+      startInputEl.className = "edit-input";
+      startInputEl.value = project.gantt_start || "";
+      startInputEl.addEventListener("change", () => saveProjectField(projectId, { gantt_start: startInputEl.value }));
+      startRow.appendChild(startInputEl);
+
+      const endRow = document.createElement("div");
+      endRow.className = "project-info-row";
+      endRow.innerHTML = '<span class="label">End date</span>';
+      const endInputEl = document.createElement("input");
+      endInputEl.type = "date";
+      endInputEl.className = "edit-input";
+      endInputEl.value = project.gantt_end || "";
+      endInputEl.addEventListener("change", () => saveProjectField(projectId, { gantt_end: endInputEl.value }));
+      endRow.appendChild(endInputEl);
+
+      const weeksRow = document.createElement("div");
+      weeksRow.className = "project-info-row";
+      weeksRow.innerHTML = `<span class="label">Total weeks</span><span class="value">${weeksInfo.total}</span>`;
+      const remainingRow = document.createElement("div");
+      remainingRow.className = "project-info-row";
+      remainingRow.innerHTML = `<span class="label">Weeks remaining</span><span class="value">${weeksInfo.remaining}</span>`;
+
+      const fragment = document.createDocumentFragment();
+      fragment.appendChild(nameRow);
+      fragment.appendChild(statusRow);
+      fragment.appendChild(startRow);
+      fragment.appendChild(endRow);
+      fragment.appendChild(weeksRow);
+      fragment.appendChild(remainingRow);
+      infoBox.insertBefore(fragment, infoBox.firstChild);
     } catch (e) {
       taskSidebarContent.innerHTML = `<p class="hint">${e.message}</p>`;
     }
   }
+
+  async function saveProjectField(projectId, patch) {
+    try {
+      const res = await fetch(`/projects/${projectId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+      showStatus("Saved.", true);
+      await loadProjects();
+      await loadGantt();
+      await showProjectInfo(projectId);
+    } catch (err) {
+      showStatus(err.message, false);
+    }
+  }
+
+  function setChartEditMode(enabled) {
+    chartEditMode = enabled;
+    chartEditToggle.classList.toggle("active", enabled);
+    chartEditToggle.setAttribute("aria-pressed", String(enabled));
+    chartEditToggle.title = enabled ? "Editing project (click to lock)" : "Edit project";
+    if (boardProjectId) showProjectInfo(boardProjectId);
+  }
+
+  chartEditToggle.addEventListener("click", () => setChartEditMode(!chartEditMode));
 
   async function loadBoard(projectId) {
     boardProjectId = projectId;
@@ -823,10 +1299,21 @@
     boardEditToggle.classList.toggle("active", enabled);
     boardEditToggle.setAttribute("aria-pressed", String(enabled));
     boardEditToggle.title = enabled ? "Editing tasks (click to lock)" : "Edit tasks";
+    if (enabled) setBoardDeleteMode(false, { skipReload: true });
     if (boardProjectId) loadBoard(boardProjectId);
   }
 
+  function setBoardDeleteMode(enabled, opts) {
+    boardDeleteMode = enabled;
+    boardDeleteToggle.classList.toggle("active", enabled);
+    boardDeleteToggle.setAttribute("aria-pressed", String(enabled));
+    boardDeleteToggle.title = enabled ? "Deleting tasks (click to lock)" : "Delete tasks";
+    if (enabled) setBoardEditMode(false, { skipReload: true });
+    if (!(opts && opts.skipReload) && boardProjectId) loadBoard(boardProjectId);
+  }
+
   boardEditToggle.addEventListener("click", () => setBoardEditMode(!boardEditMode));
+  boardDeleteToggle.addEventListener("click", () => setBoardDeleteMode(!boardDeleteMode));
 
   const boardAddToggle = document.getElementById("boardAddToggle");
   const taskModalOverlay = document.getElementById("taskModalOverlay");
@@ -1049,32 +1536,48 @@
           card.appendChild(whenWrap);
           card.appendChild(priorityLabel);
         } else {
-          card.draggable = true;
           const flag = t.priority === "high" ? '<span class="card-priority-flag" title="High priority">&#10071;</span>' : "";
           const note = t.notes ? `<span class="card-note">${t.notes}</span>` : "";
           const deadline = t.deadline ? `<span class="card-deadline">Due ${formatDeadline(t.deadline)}</span>` : "";
           const properties = formatTaskProperties(t);
           const propertiesLine = properties ? `<span class="card-properties">${properties}</span>` : "";
           card.innerHTML = `${flag}<span class="card-title">${t.title}</span>${deadline}${propertiesLine}${note}`;
-          card.addEventListener("dragstart", (e) => {
-            card.classList.add("dragging");
-            e.dataTransfer.setData("text/plain", t.id);
-            e.dataTransfer.effectAllowed = "move";
-          });
-          card.addEventListener("dragend", () => card.classList.remove("dragging"));
+          if (boardDeleteMode) {
+            card.draggable = false;
+            card.addEventListener("click", async () => {
+              if (!confirm(`Delete task "${t.title}"?`)) return;
+              try {
+                const res = await fetch(`/projects/${boardProjectId}/tasks/${t.id}`, { method: "DELETE" });
+                if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
+                showStatus("Task deleted.", true);
+                await loadBoard(boardProjectId);
+              } catch (err) {
+                showStatus(err.message, false);
+              }
+            });
+          } else {
+            card.draggable = true;
+            card.addEventListener("dragstart", (e) => {
+              card.classList.add("dragging");
+              e.dataTransfer.setData("text/plain", t.id);
+              e.dataTransfer.effectAllowed = "move";
+            });
+            card.addEventListener("dragend", () => card.classList.remove("dragging"));
+          }
         }
         cards.appendChild(card);
       }
+      if (boardDeleteMode) cards.classList.add("delete-mode");
       col.appendChild(cards);
 
       col.addEventListener("dragover", (e) => {
-        if (boardEditMode) return;
+        if (boardEditMode || boardDeleteMode) return;
         e.preventDefault();
         col.classList.add("drag-over");
       });
       col.addEventListener("dragleave", () => col.classList.remove("drag-over"));
       col.addEventListener("drop", async (e) => {
-        if (boardEditMode) return;
+        if (boardEditMode || boardDeleteMode) return;
         e.preventDefault();
         col.classList.remove("drag-over");
         const taskId = e.dataTransfer.getData("text/plain");
@@ -1177,13 +1680,33 @@
     }, 300);
   }
 
-  async function loadGantt() {
-    const res = await fetch("/gantt");
-    const data = await res.json();
-    const rows = data.rows || [];
-    ganttEmpty.hidden = rows.length > 0;
-    chartArea.style.display = rows.length ? "flex" : "none";
-    if (!rows.length) return;
+  let allGanttRows = [];
+  let hiddenProjectIds = new Set();
+  try {
+    const saved = JSON.parse(localStorage.getItem("gantt.hiddenProjectIds") || "[]");
+    hiddenProjectIds = new Set(Array.isArray(saved) ? saved : []);
+  } catch (e) {}
+
+  function saveHiddenProjectIds() {
+    try { localStorage.setItem("gantt.hiddenProjectIds", JSON.stringify(Array.from(hiddenProjectIds))); } catch (e) {}
+  }
+
+  function renderGanttChart() {
+    const rows = allGanttRows.filter((r) => !hiddenProjectIds.has(r.id));
+    if (!allGanttRows.length) {
+      ganttEmpty.textContent = "No projects have both a start and end date set yet — use the form above to add one.";
+      ganttEmpty.hidden = false;
+      chartArea.style.display = "none";
+      return;
+    }
+    if (!rows.length) {
+      ganttEmpty.textContent = "All projects are hidden by the current filter.";
+      ganttEmpty.hidden = false;
+      chartArea.style.display = "none";
+      return;
+    }
+    ganttEmpty.hidden = true;
+    chartArea.style.display = "flex";
     if (ganttInstance) {
       ganttInstance.refresh(rows);
     } else {
@@ -1195,12 +1718,49 @@
           document.querySelectorAll(".bar-wrapper.selected").forEach((el) => el.classList.remove("selected"));
           const wrapper = document.querySelector(`.bar-wrapper[data-id="${task.id}"]`);
           if (wrapper) wrapper.classList.add("selected");
-          showProjectTasks(task.id);
+          showProjectInfo(task.id);
           loadBoard(task.id);
         },
         on_date_change: (task, start, end) => saveBarDates(task, start, end),
       });
     }
+  }
+
+  function renderGanttFilterList() {
+    ganttFilterList.innerHTML = "";
+    for (const row of allGanttRows) {
+      const label = document.createElement("label");
+      label.className = "filter-dropdown-item";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = !hiddenProjectIds.has(row.id);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) hiddenProjectIds.delete(row.id);
+        else hiddenProjectIds.add(row.id);
+        saveHiddenProjectIds();
+        renderGanttChart();
+      });
+      label.appendChild(checkbox);
+      label.appendChild(document.createTextNode(row.name));
+      ganttFilterList.appendChild(label);
+    }
+  }
+
+  async function loadGantt() {
+    const res = await fetch("/gantt");
+    const data = await res.json();
+    allGanttRows = data.rows || [];
+    const knownIds = new Set(allGanttRows.map((r) => r.id));
+    let pruned = false;
+    for (const id of Array.from(hiddenProjectIds)) {
+      if (!knownIds.has(id)) {
+        hiddenProjectIds.delete(id);
+        pruned = true;
+      }
+    }
+    if (pruned) saveHiddenProjectIds();
+    renderGanttFilterList();
+    renderGanttChart();
   }
 
   function setDatesPanelCollapsed(collapsed) {
