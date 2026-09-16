@@ -53,3 +53,6 @@ runtime_settings.json
 # holds REAL session/consent cookies for whatever sites you've clicked
 # "Accept" on, exactly like a normal browser profile. Never commit this.
 browser_profile/
+
+#Claude md file
+CLAUDE.md

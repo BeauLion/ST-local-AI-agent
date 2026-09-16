@@ -2281,6 +2281,18 @@ async def gantt_chart_page():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
+@app.get("/gantt.css")
+async def gantt_chart_css():
+    css_path = Path(__file__).parent / "web" / "gantt.css"
+    return Response(content=css_path.read_text(encoding="utf-8"), media_type="text/css")
+
+
+@app.get("/gantt.js")
+async def gantt_chart_js():
+    js_path = Path(__file__).parent / "web" / "gantt.js"
+    return Response(content=js_path.read_text(encoding="utf-8"), media_type="application/javascript")
+
+
 # Vendored frappe-gantt (MIT) - kept as static files under web/ rather than
 # a CDN <script> tag, so the chart still works with no internet access at
 # all. Update by re-running `npm install frappe-gantt@<version> --no-save`

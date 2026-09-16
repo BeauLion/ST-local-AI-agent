@@ -1,0 +1,622 @@
+:root {
+  --bg: #1e1f24;
+  --panel: #26282f;
+  --border: #383a42;
+  --text: #e6e6e6;
+  --muted: #9a9ca3;
+  --accent: #5b8cff;
+  --danger: #e0555f;
+  --ok: #4caf7d;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+}
+.wrap { max-width: 1800px; margin: 0 auto; }
+header h1 { font-size: 20px; margin: 0 0 4px; }
+header .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+
+.status {
+  position: fixed; /* position of the status massages such as "saved" */
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+  z-index: 2000;
+  background: var(--panel);
+}
+.status.ok { background: rgba(76,175,125,0.12); color: var(--ok); }
+.status.err { background: rgba(224,85,95,0.12); color: var(--danger); }
+.status[hidden] { display: none; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+.panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.panel-header h2 { margin: 0 0 12px; }
+
+/* --- small square icon-buttons that sit in a panel header (add / edit /
+   filter / delete toggles) - one shared shape, only color-on-active differs --- */
+.icon-toggle {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+.icon-toggle:hover { color: var(--text); border-color: var(--accent); }
+.icon-toggle.icon-toggle-lg { font-size: 15px; }
+
+.icon-toggle.active-ok { background: var(--ok); border-color: var(--ok); color: #fff; }
+.icon-toggle.active-accent { background: var(--accent); border-color: var(--accent); color: #fff; }
+.icon-toggle.active-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.icon-toggle.active-danger:hover { border-color: var(--danger); }
+
+.panel-add-toggle,
+.panel-edit-toggle,
+.panel-filter-toggle,
+.board-add-toggle,
+.board-delete-toggle,
+.board-edit-toggle { margin-bottom: 12px; }
+.panel-header-actions .panel-add-toggle,
+.panel-header-actions .panel-edit-toggle,
+.panel-header-actions .panel-filter-toggle,
+.board-header-actions .board-add-toggle,
+.board-header-actions .board-delete-toggle,
+.board-header-actions .board-edit-toggle { margin-bottom: 0; }
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  position: relative;
+}
+
+.filter-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  padding: 10px;
+  width: 240px;
+  max-height: 320px;
+  overflow-y: auto;
+  z-index: 1500;
+}
+.filter-dropdown[hidden] { display: none; }
+.filter-dropdown-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.filter-dropdown-actions button {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+.filter-dropdown-actions button:hover { text-decoration: underline; }
+.filter-dropdown-list { display: flex; flex-direction: column; gap: 6px; }
+.filter-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.filter-dropdown-item input { flex: 0 0 auto; }
+
+#ganttEmpty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+
+/* --- collapsible panel header (used by the "Set project dates" panel) --- */
+.panel-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  cursor: pointer;
+  text-align: left;
+}
+.panel-toggle .chevron {
+  display: inline-block;
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+.panel-toggle[aria-expanded="false"] .chevron { transform: rotate(-90deg); }
+.panel-toggle[aria-expanded="false"] { margin-bottom: 0; }
+
+/* --- date-setting form --- */
+.date-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+.date-form[hidden] { display: none; }
+.date-form .field { display: flex; flex-direction: column; gap: 4px; }
+.date-form label { font-size: 11px; color: var(--muted); }
+.date-form select, .date-form input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.date-form button {
+  border: none;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.date-form .save { background: var(--accent); color: white; }
+.date-form .clear { background: transparent; color: var(--danger); border: 1px solid var(--border); }
+
+/* --- bar colours, matched to project_manager._gantt_bar_class ---
+   Selectors include .bar-wrapper (not just the status class) so their
+   specificity (4 classes) beats frappe-gantt.css's own
+   ".gantt .bar-wrapper .bar" rule (3 classes), which also sets `fill` -
+   without the extra .bar-wrapper here, the vendor rule's higher
+   specificity would silently win and every bar would render in its
+   default colour (--g-bar-color) regardless of status. */
+.gantt .bar-wrapper.gantt-bar-low .bar { fill: #4a4d57; }
+.gantt .bar-wrapper.gantt-bar-mid .bar { fill: #c9922c; }
+.gantt .bar-wrapper.gantt-bar-high .bar { fill: #5b8cff; }
+.gantt .bar-wrapper.gantt-bar-done .bar { fill: #4caf7d; }
+.gantt .bar-wrapper.gantt-bar-paused .bar { fill: #6b6d76; }
+.gantt .bar-wrapper.gantt-bar-low .bar-progress,
+.gantt .bar-wrapper.gantt-bar-mid .bar-progress,
+.gantt .bar-wrapper.gantt-bar-high .bar-progress,
+.gantt .bar-wrapper.gantt-bar-done .bar-progress,
+.gantt .bar-wrapper.gantt-bar-paused .bar-progress { fill: rgba(255,255,255,0.35); }
+
+/* thickened border on the bar clicked most recently, to show it's selected.
+   ".gantt" prefix bumps specificity above frappe-gantt.css's own
+   ".gantt .bar-wrapper .bar" rule (also sets stroke/stroke-width) - without
+   it this would only win by tying on specificity and then on <link> load
+   order, which is fragile. */
+.gantt .bar-wrapper.selected .bar {
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-top: 10px; flex-wrap: wrap; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+/* --- chart area: task sidebar (left) + resizable chart (right) --- */
+.chart-area { display: flex; gap: 16px; align-items: stretch; }
+
+.task-sidebar {
+  position: relative;
+  width: 260px;
+  flex: 0 0 260px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  padding-top: 30px;
+  overflow-y: auto;
+  background: var(--bg);
+  transition: flex-basis 0.15s ease, width 0.15s ease, padding 0.15s ease;
+}
+.task-sidebar.collapsed {
+  width: 28px;
+  flex: 0 0 28px;
+  padding: 12px 0 0;
+  overflow: hidden;
+}
+.task-sidebar.collapsed .task-sidebar-content { display: none; }
+.sidebar-toggle {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  width: 20px;
+  height: 20px;
+  line-height: 1;
+  font-size: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sidebar-toggle:hover { color: var(--text); }
+.task-sidebar.collapsed .sidebar-toggle {
+  position: static;
+  margin: 0 auto;
+}
+.task-sidebar h3 {
+  font-size: 12px;
+  margin: 0 0 4px;
+  color: var(--text);
+}
+.task-sidebar .proj-code { color: var(--muted); font-weight: normal; }
+.task-sidebar .hint { color: var(--muted); font-size: 12px; }
+.task-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.task-list li {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+}
+.task-title { display: block; margin-bottom: 4px; }
+.task-meta { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11px; }
+.task-status {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: .03em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  display: inline-block;
+}
+.task-status.pending { background: rgba(154,156,163,0.18); color: var(--muted); }
+.task-status.active { background: rgba(91,140,255,0.18); color: var(--accent); }
+.task-status.blocked { background: rgba(224,85,95,0.18); color: var(--danger); }
+.task-status.done { background: rgba(76,175,125,0.18); color: var(--ok); }
+.task-status.cancelled { background: rgba(154,156,163,0.12); color: var(--muted); }
+.task-status.paused { background: rgba(154,156,163,0.18); color: var(--muted); }
+.task-status.completed { background: rgba(76,175,125,0.18); color: var(--ok); }
+.project-info { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+.project-info-row { display: flex; flex-direction: column; gap: 2px; }
+.project-info-row .label { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.project-info-row .value { font-size: 13px; color: var(--text); }
+.project-info-children { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.project-info-children li {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+}
+.project-info-row .edit-input,
+.project-info-row .edit-select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* the chart itself grows to fit every rendered row; .gantt-container (inside)
+   handles its own horizontal scrolling, so this wrapper just sizes/borders it */
+.chart-scroll {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.zoom-controls {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+.zoom-controls button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.zoom-controls button:hover { filter: brightness(1.15); }
+.zoom-controls button.active {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+/* --- project board (kanban) --- */
+#boardPanel .hint { color: var(--muted); font-size: 12px; }
+.board-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.board-panel-header h2 { margin: 0; }
+.board-panel-header .board-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.board-cards.delete-mode .board-card {
+  cursor: pointer;
+}
+.board-cards.delete-mode .board-card:hover {
+  outline: 2px solid var(--danger);
+  outline-offset: -2px;
+}
+
+/* --- new task modal --- */
+.task-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+}
+.task-modal-overlay[hidden] { display: none; }
+.task-modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  width: 380px;
+  max-width: calc(100vw - 32px);
+}
+.task-modal h3 { margin: 0 0 14px; font-size: 15px; }
+.task-modal .field { margin-bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
+.task-modal label { font-size: 12px; color: var(--muted); }
+.task-modal input[type="text"],
+.task-modal select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 13px;
+}
+.task-modal .modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+.task-modal button {
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.task-modal button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.task-modal button:hover { opacity: 0.9; }
+.task-modal .field-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.task-modal .field-row .field { flex: 1 1 auto; margin-bottom: 0; }
+.task-modal .child-toggle {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  padding-top: 18px;
+}
+.task-modal select:disabled { color: var(--muted); opacity: 0.6; cursor: not-allowed; }
+.task-modal .date-row { display: flex; gap: 10px; }
+.task-modal .date-row .field { flex: 1 1 0; }
+.board {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+}
+.board-col {
+  flex: 1 1 0;
+  min-width: 160px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.board-col.drag-over {
+  border-color: var(--accent);
+  background: rgba(91,140,255,0.06);
+}
+.board-col-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+  padding: 2px 2px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.board-col-count {
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 1px 7px;
+  font-size: 11px;
+}
+.board-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 40px;
+}
+.board-card {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+  cursor: grab;
+}
+.board-card.dragging { opacity: 0.4; }
+.board-card .card-title { display: block; margin-bottom: 4px; padding-right: 14px; }
+.board-card .card-note {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+.board-card .card-deadline {
+  display: block;
+  color: var(--accent);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.board-card .card-properties {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.board-card .card-priority-flag {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+.board-card.editing { cursor: default; }
+.board-card .card-title-input,
+.board-card .card-note-input {
+  display: block;
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+  font-family: inherit;
+  margin-bottom: 6px;
+  box-sizing: border-box;
+}
+.board-card .card-note-input { resize: vertical; min-height: 40px; }
+.board-card .card-deadline-wrap {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.board-card .card-deadline-wrap input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+.board-card .card-deadline-date-input { flex: 1 1 60%; }
+.board-card .card-deadline-time-input { flex: 1 1 40%; }
+.board-card .card-duration-input,
+.board-card .card-effort-select {
+  display: block;
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-family: inherit;
+  margin-bottom: 6px;
+  box-sizing: border-box;
+}
+.board-card .card-when-wrap {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.board-card .card-when-wrap select {
+  flex: 1 1 50%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+.board-card .card-priority-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* floating date label shown while dragging a bar's edge handle */
+.bar-drag-label {
+  position: fixed;
+  display: none;
+  background: var(--accent);
+  color: white;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 1000;
+}
+.bar-drag-label::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-top-color: var(--accent);
+}
