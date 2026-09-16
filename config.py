@@ -314,7 +314,7 @@ CORS_ALLOWED_ORIGINS = ["http://localhost:8000"] + _extra_origins_list
 
 # iCloud's CalDAV entry point. Same URL regardless of which calendar(s)
 # your account has - principal discovery happens from here.
-ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
+CALDAV_SERVER_URL = "https://localhost:5232"
 
 # IANA timezone name used to localize any naive date/time the model writes
 # to the calendar (create/edit). A named zone (not a fixed UTC offset) is
@@ -326,7 +326,7 @@ CALENDAR_TIMEZONE = "Europe/Amsterdam"
 # Per-request timeout (seconds) for all CalDAV calls to iCloud. Previously
 # unset, which let a single stalled request hang on whatever the caldav
 # library's internal default is (~120s) with no way to recover from it.
-CALDAV_TIMEOUT_SECONDS = 30
+CALDAV_TIMEOUT_SECONDS = 10
 
 # When True, every raw HTTP request calendar_manager sends to the CalDAV
 # server (PROPFIND/REPORT/PUT/DELETE - method, URL, headers, body) is
@@ -352,8 +352,8 @@ CALENDAR_DEFAULT_NAME = "Home"
 # Names of the environment variables calendar_manager.py reads credentials
 # from (via a .env file in PROJECT_ROOT - see .env.example). Secrets never
 # go in this file.
-ICLOUD_USERNAME_ENV_VAR = "ICLOUD_USERNAME"
-ICLOUD_APP_PASSWORD_ENV_VAR = "ICLOUD_APP_PASSWORD"
+CALDAV_USERNAME_ENV_VAR = "CALDAV_USERNAME"
+CALDAV_PASSWORD_ENV_VAR = "CALDAV_PASSWORD"
 
 # How many days ahead calendar_list_events looks by default when the model
 # doesn't specify an end date.
@@ -488,7 +488,7 @@ ATTIRE_SUBAGENT_TIMEOUT_SECONDS = 15
 # always has. Flip on once BRIDGE_URL/BRIDGE_TOKEN are set in .env and
 # the bridge has been reached at least once from this machine (e.g. via
 # the health-check curl in the bridge's own README).
-BRIDGE_ENABLED = True
+BRIDGE_ENABLED = False
 
 # Names of the environment variables bridge_client.py reads from .env -
 # same pattern as ICLOUD_USERNAME_ENV_VAR/ICLOUD_APP_PASSWORD_ENV_VAR

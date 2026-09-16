@@ -106,9 +106,9 @@ from config import (
     CALENDAR_UID_LOOKUP_LOOKAHEAD_DAYS,
     CALENDAR_UID_LOOKUP_LOOKBACK_DAYS,
     CALENDAR_WRITE_RETRIES,
-    ICLOUD_APP_PASSWORD_ENV_VAR,
-    ICLOUD_CALDAV_URL,
-    ICLOUD_USERNAME_ENV_VAR,
+    CALDAV_PASSWORD_ENV_VAR,
+    CALDAV_SERVER_URL,
+    CALDAV_USERNAME_ENV_VAR,
     PROJECT_ROOT,
 )
 
@@ -193,13 +193,12 @@ _cached_calendars = None  # list of caldav Calendar objects, cached per-process
 
 
 def _get_credentials() -> tuple[str, str]:
-    username = os.environ.get(ICLOUD_USERNAME_ENV_VAR)
-    password = os.environ.get(ICLOUD_APP_PASSWORD_ENV_VAR)
+    username = os.environ.get(CALDAV_USERNAME_ENV_VAR)
+    password = os.environ.get(CALDAV_PASSWORD_ENV_VAR)
     if not username or not password:
         raise CalendarError(
-            f"iCloud credentials not found. Copy .env.example to .env in the "
-            f"project root and fill in {ICLOUD_USERNAME_ENV_VAR} and "
-            f"{ICLOUD_APP_PASSWORD_ENV_VAR}, then restart the agent server."
+            f"Calendar credentials not found. Fill in {CALDAV_USERNAME_ENV_VAR} "
+            f"and {CALDAV_PASSWORD_ENV_VAR} in .env, then restart the agent server."
         )
     return username, password
 
@@ -262,20 +261,18 @@ def _get_client() -> caldav.DAVClient:
             username, password = _get_credentials()
             try:
                 client = caldav.DAVClient(
-                    url=ICLOUD_CALDAV_URL, username=username, password=password,
+                    url=CALDAV_SERVER_URL, username=username, password=password,
                     timeout=CALDAV_TIMEOUT_SECONDS,
+                    ssl_verify_cert=False,
                 )
                 _wrap_request_logging(client)
-                client.principal()  # forces a round-trip now, not on first real use
+                client.principal()
             except Exception as e:
                 msg = (
-                    f"Could not connect to iCloud calendar: {e}. Double-check the "
-                    f"Apple ID and app-specific password in .env, and that the "
-                    f"app-specific password hasn't been revoked."
+                    f"Could not connect to the calendar server: {e}. Double-check "
+                    f"the username/password in .env, and that Radicale is running."
                 )
                 if _is_connectivity_exc(e):
-                    alog(f"[Calendar] CalDAV connectivity error ({type(e).__name__}: {e}) while "
-                         f"connecting - will attempt iCloud bridge fallback if enabled.")
                     raise CalendarConnectivityError(msg)
                 raise CalendarError(msg)
             _cached_client = client
@@ -294,12 +291,10 @@ def _get_calendars(refresh: bool = False):
         # Drop the cached client so the next call reconnects fresh.
         _reset_client()
         if _is_connectivity_exc(e):
-            alog(f"[Calendar] CalDAV connectivity error ({type(e).__name__}: {e}) while "
-                 f"listing calendars - will attempt iCloud bridge fallback if enabled.")
-            raise CalendarConnectivityError(f"Could not list iCloud calendars: {e}")
-        raise CalendarError(f"Could not list iCloud calendars: {e}")
+            raise CalendarConnectivityError(f"Could not list calendars: {e}")
+        raise CalendarError(f"Could not list calendars: {e}")
     if not calendars:
-        raise CalendarError("No calendars found on this iCloud account.")
+        raise CalendarError("No calendars found on this calendar server.")
     _cached_calendars = calendars
     return calendars
 
