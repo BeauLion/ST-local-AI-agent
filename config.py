@@ -40,6 +40,9 @@ MEMORY_DATA_DIR = os.path.join(PROJECT_ROOT, "memory_data")
 # Where project_manager.py stores its JSON file (projects.json).
 PROJECT_DATA_DIR = os.path.join(PROJECT_ROOT, "project_data")
 
+# Where persona_manager.py stores its JSON file (personas.json).
+PERSONA_DATA_DIR = os.path.join(PROJECT_ROOT, "persona_data")
+
 
 # ─────────────────────────────────────────────────────────────
 # llama-server (the local inference engine, port 8080)

@@ -1,0 +1,270 @@
+/* Floating chat widget - drop /chat_widget.css + /chat_widget.js into any
+   page in web/ that defines the standard --bg/--panel/--border/--text/
+   --muted/--accent variables (see gantt.css). Self-contained: creates its
+   own DOM, doesn't require any markup in the host page. */
+
+.cw-fab {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+  font-size: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+  transition: transform 0.15s ease;
+}
+.cw-fab:hover { transform: scale(1.06); }
+
+.cw-panel {
+  position: fixed;
+  right: 24px;
+  bottom: 92px;
+  width: 340px;
+  height: 460px;
+  max-height: calc(100vh - 120px);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.45);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 3000;
+  font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+}
+.cw-panel[hidden] { display: none; }
+
+.cw-header {
+  padding: 10px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+}
+.cw-header .cw-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.cw-header button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+.cw-header button:hover { color: var(--text); }
+
+.cw-tabs {
+  flex: none;
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.cw-tab {
+  flex: 1;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 8px 0;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.cw-tab:hover { color: var(--text); }
+.cw-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.cw-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.cw-view[hidden] { display: none; }
+
+.cw-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cw-msg {
+  max-width: 85%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.cw-msg.user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+}
+.cw-msg.assistant {
+  align-self: flex-start;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.cw-msg.error {
+  align-self: flex-start;
+  background: rgba(224,85,95,0.12);
+  color: var(--danger, #e0555f);
+  border: 1px solid var(--danger, #e0555f);
+}
+.cw-msg.pending { color: var(--muted); font-style: italic; }
+
+.cw-inputRow {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  padding: 10px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+.cw-inputRow textarea {
+  flex: 1;
+  resize: none;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 13px;
+  font-family: inherit;
+  height: 36px;
+  max-height: 100px;
+}
+.cw-inputRow button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 0 14px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.cw-inputRow button:disabled { opacity: 0.5; cursor: default; }
+
+.cw-view-personas {
+  padding: 10px 12px;
+  overflow-y: auto;
+  gap: 8px;
+}
+
+.cw-personaList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cw-personaRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.cw-personaRow.selected { border-color: var(--accent); }
+
+.cw-personaName {
+  flex: 1;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 2px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cw-personaRow.selected .cw-personaName { color: var(--accent); font-weight: 600; }
+
+.cw-personaActions {
+  display: flex;
+  gap: 2px;
+  flex: none;
+}
+.cw-personaActions button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.cw-personaActions button:hover { color: var(--text); }
+
+.cw-personaEmpty { color: var(--muted); font-size: 13px; margin: 4px 0; }
+
+.cw-personaFooter { margin-top: 8px; }
+.cw-personaAddBtn {
+  width: 100%;
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  padding: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.cw-personaAddBtn:hover { color: var(--text); border-color: var(--accent); }
+
+.cw-personaForm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px;
+}
+.cw-personaForm input,
+.cw-personaForm textarea {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+}
+.cw-personaForm textarea { resize: vertical; min-height: 70px; }
+
+.cw-personaFormActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.cw-personaFormActions button {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.cw-personaFormActions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
