@@ -352,7 +352,61 @@ header .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
   border-color: var(--accent);
 }
 
-/* --- project board (kanban) --- */
+/* --- project board (kanban), with the task-planner sidebar to its left --- */
+.board-area { display: flex; gap: 16px; align-items: stretch; }
+.board-area #boardPanel { flex: 1; min-width: 0; margin-bottom: 0; }
+#taskPlanner .task-planner-total {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+}
+#taskPlanner .task-planner-total .value { color: var(--accent); font-weight: 600; }
+.task-planner-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.task-planner-list li {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.task-planner-list li:hover { border-color: var(--accent); }
+.task-planner-list .task-planner-project { color: var(--muted); font-size: 11px; }
+
+.task-planner-schedule {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.task-planner-schedule .field { display: flex; flex-direction: column; gap: 4px; }
+.task-planner-schedule .field-row { display: flex; gap: 10px; }
+.task-planner-schedule .field-row .field { flex: 1 1 0; }
+.task-planner-schedule label { font-size: 11px; color: var(--muted); }
+.task-planner-schedule select, .task-planner-schedule input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.task-planner-schedule .save {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.task-planner-schedule .save:hover { opacity: 0.9; }
+
 #boardPanel .hint { color: var(--muted); font-size: 12px; }
 .board-panel-header {
   display: flex;
@@ -498,6 +552,12 @@ header .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
   cursor: grab;
 }
 .board-card.dragging { opacity: 0.4; }
+.board-card.plan-selectable { cursor: pointer; }
+.board-card.plan-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  background: rgba(91,140,255,0.10);
+}
 .board-card .card-title { display: block; margin-bottom: 4px; padding-right: 14px; }
 .board-card .card-note {
   display: block;

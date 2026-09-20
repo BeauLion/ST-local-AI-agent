@@ -16,7 +16,11 @@
   const boardHint = document.getElementById("boardHint");
   const boardEditToggle = document.getElementById("boardEditToggle");
   const boardDeleteToggle = document.getElementById("boardDeleteToggle");
+  const boardPlanToggle = document.getElementById("boardPlanToggle");
   const chartEditToggle = document.getElementById("chartEditToggle");
+  const taskPlanner = document.getElementById("taskPlanner");
+  const taskPlannerContent = document.getElementById("taskPlannerContent");
+  const taskPlannerToggle = document.getElementById("taskPlannerToggle");
   let ganttInstance = null;
   let projectsById = {};
   let currentViewMode = "Week";
@@ -26,6 +30,11 @@
   let boardEditMode = false;
   let boardDeleteMode = false;
   let chartEditMode = false;
+  let planMode = false;
+  // taskId -> { task, projectId }. Selections persist across project/board
+  // switches (planning mode can select cards from multiple projects' boards,
+  // one at a time, since only one board renders at once).
+  let selectedTasks = new Map();
   const PROJECT_STATUSES = [
     { key: "active", label: "Active" },
     { key: "paused", label: "Paused" },
@@ -471,7 +480,10 @@
     boardEditToggle.classList.toggle("active-ok", enabled);
     boardEditToggle.setAttribute("aria-pressed", String(enabled));
     boardEditToggle.title = enabled ? "Editing tasks (click to lock)" : "Edit tasks";
-    if (enabled) setBoardDeleteMode(false, { skipReload: true });
+    if (enabled) {
+      setBoardDeleteMode(false, { skipReload: true });
+      setPlanMode(false, { skipReload: true });
+    }
     if (boardProjectId) loadBoard(boardProjectId);
   }
 
@@ -480,12 +492,106 @@
     boardDeleteToggle.classList.toggle("active-danger", enabled);
     boardDeleteToggle.setAttribute("aria-pressed", String(enabled));
     boardDeleteToggle.title = enabled ? "Deleting tasks (click to lock)" : "Delete tasks";
-    if (enabled) setBoardEditMode(false, { skipReload: true });
+    if (enabled) {
+      setBoardEditMode(false, { skipReload: true });
+      setPlanMode(false, { skipReload: true });
+    }
     if (!(opts && opts.skipReload) && boardProjectId) loadBoard(boardProjectId);
+  }
+
+  function setPlanMode(enabled, opts) {
+    planMode = enabled;
+    boardPlanToggle.classList.toggle("active-accent", enabled);
+    boardPlanToggle.setAttribute("aria-pressed", String(enabled));
+    boardPlanToggle.title = enabled ? "Planning mode (click to exit)" : "Planning mode";
+    if (enabled) {
+      setBoardEditMode(false, { skipReload: true });
+      setBoardDeleteMode(false, { skipReload: true });
+    }
+    if (!(opts && opts.skipReload) && boardProjectId) loadBoard(boardProjectId);
+  }
+
+  function taskSelectionKey(projectId, taskId) {
+    return `${projectId}:${taskId}`;
+  }
+
+  function toggleTaskSelection(projectId, task) {
+    const key = taskSelectionKey(projectId, task.id);
+    if (selectedTasks.has(key)) {
+      selectedTasks.delete(key);
+    } else {
+      selectedTasks.set(key, { task, projectId });
+    }
+    renderTaskPlanner();
+  }
+
+  function renderTaskPlanner() {
+    if (!selectedTasks.size) {
+      taskPlannerContent.innerHTML = '<h3>Task Planner</h3><p class="hint">Turn on planning mode and select task cards to see them here.</p>';
+      return;
+    }
+    const items = Array.from(selectedTasks.values());
+    let totalMinutes = 0;
+    const listHtml = items.map(({ task: t, projectId }) => {
+      if (t.duration_minutes != null) totalMinutes += t.duration_minutes;
+      const project = projectsById[projectId];
+      const projectLabel = project ? `${project.short_code} — ${project.name}` : projectId;
+      const properties = formatTaskProperties(t);
+      const propertiesLine = properties ? `<div class="task-meta"><span>${properties}</span></div>` : "";
+      return `<li data-project-id="${projectId}" data-task-id="${t.id}">
+        <span class="task-title">${t.title}</span>
+        <div class="task-planner-project">${projectLabel}</div>
+        <div class="task-meta"><span class="task-status ${t.status}">${t.status}</span></div>
+        ${propertiesLine}
+      </li>`;
+    }).join("");
+    const totalLabel = totalMinutes ? formatDurationInput(totalMinutes) : "0m";
+    taskPlannerContent.innerHTML = `<h3>Task Planner</h3>
+      <ul class="task-planner-list">${listHtml}</ul>
+      <div class="task-planner-total">Total time: <span class="value">${totalLabel}</span></div>`;
+    taskPlannerContent.querySelectorAll(".task-planner-list li").forEach((li) => {
+      li.addEventListener("click", () => {
+        const projectId = li.dataset.projectId;
+        const taskId = li.dataset.taskId;
+        const entry = selectedTasks.get(taskSelectionKey(projectId, taskId));
+        if (!entry) return;
+        toggleTaskSelection(projectId, entry.task);
+        if (projectId === boardProjectId) loadBoard(boardProjectId);
+      });
+    });
   }
 
   boardEditToggle.addEventListener("click", () => setBoardEditMode(!boardEditMode));
   boardDeleteToggle.addEventListener("click", () => setBoardDeleteMode(!boardDeleteMode));
+  boardPlanToggle.addEventListener("click", () => setPlanMode(!planMode));
+
+  const plannerDate = document.getElementById("plannerDate");
+  const plannerStartTime = document.getElementById("plannerStartTime");
+  const plannerEndTime = document.getElementById("plannerEndTime");
+  const plannerScheduleBtn = document.getElementById("plannerScheduleBtn");
+
+  plannerScheduleBtn.addEventListener("click", () => {
+    if (!selectedTasks.size) {
+      showStatus("Select tasks in the planner first.", false);
+      return;
+    }
+    if (!plannerDate.value || !plannerStartTime.value || !plannerEndTime.value) {
+      showStatus("Set a date, start time, and end time.", false);
+      return;
+    }
+    const dateLabel = formatDeadline(plannerDate.value);
+    const taskList = Array.from(selectedTasks.values()).map(({ task, projectId }) => {
+      const project = projectsById[projectId];
+      const projectCode = project ? project.short_code : projectId;
+      return `${task.title} of project ${projectCode}`;
+    }).join(", ");
+    const prompt = `Make a schedule for ${dateLabel} from ${plannerStartTime.value} to ${plannerEndTime.value} with the following tasks: ${taskList}.`;
+    if (window.chatWidget && window.chatWidget.pasteToInput) {
+      window.chatWidget.pasteToInput(prompt);
+    } else {
+      showStatus("Chat widget isn't available.", false);
+    }
+  });
 
   const boardAddToggle = document.getElementById("boardAddToggle");
   const taskModalOverlay = document.getElementById("taskModalOverlay");
@@ -686,6 +792,14 @@
           showStatus(err.message, false);
         }
       });
+    } else if (planMode) {
+      card.draggable = false;
+      card.classList.add("plan-selectable");
+      if (selectedTasks.has(taskSelectionKey(boardProjectId, t.id))) card.classList.add("plan-selected");
+      card.addEventListener("click", () => {
+        toggleTaskSelection(boardProjectId, t);
+        card.classList.toggle("plan-selected");
+      });
     } else {
       card.draggable = true;
       card.addEventListener("dragstart", (e) => {
@@ -722,13 +836,13 @@
       col.appendChild(cards);
 
       col.addEventListener("dragover", (e) => {
-        if (boardEditMode || boardDeleteMode) return;
+        if (boardEditMode || boardDeleteMode || planMode) return;
         e.preventDefault();
         col.classList.add("drag-over");
       });
       col.addEventListener("dragleave", () => col.classList.remove("drag-over"));
       col.addEventListener("drop", async (e) => {
-        if (boardEditMode || boardDeleteMode) return;
+        if (boardEditMode || boardDeleteMode || planMode) return;
         e.preventDefault();
         col.classList.remove("drag-over");
         const taskId = e.dataTransfer.getData("text/plain");
@@ -924,6 +1038,17 @@
     setSidebarCollapsed(!taskSidebar.classList.contains("collapsed"));
   });
 
+  function setTaskPlannerCollapsed(collapsed) {
+    taskPlanner.classList.toggle("collapsed", collapsed);
+    taskPlannerToggle.textContent = collapsed ? "▶" : "◀";
+    taskPlannerToggle.title = collapsed ? "Expand" : "Collapse";
+    try { localStorage.setItem("gantt.taskPlannerCollapsed", collapsed ? "1" : "0"); } catch (e) {}
+  }
+
+  taskPlannerToggle.addEventListener("click", () => {
+    setTaskPlannerCollapsed(!taskPlanner.classList.contains("collapsed"));
+  });
+
   projectSelect.addEventListener("change", fillDatesFromSelection);
   zoomOutBtn.addEventListener("click", () => setViewMode("Month"));
   zoomInBtn.addEventListener("click", () => setViewMode("Week"));
@@ -970,6 +1095,9 @@
     let sidebarCollapsed = false;
     try { sidebarCollapsed = localStorage.getItem("gantt.sidebarCollapsed") === "1"; } catch (e) {}
     setSidebarCollapsed(sidebarCollapsed);
+    let taskPlannerCollapsed = false;
+    try { taskPlannerCollapsed = localStorage.getItem("gantt.taskPlannerCollapsed") === "1"; } catch (e) {}
+    setTaskPlannerCollapsed(taskPlannerCollapsed);
     zoomOutBtn.classList.toggle("active", currentViewMode === "Month");
     zoomInBtn.classList.toggle("active", currentViewMode === "Week");
     await loadProjects();

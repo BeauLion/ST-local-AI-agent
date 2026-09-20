@@ -60,10 +60,129 @@
   function addBubble(role, text) {
     const el = document.createElement("div");
     el.className = "cw-msg " + role;
-    el.textContent = text;
+    if (role === "assistant") {
+      el.classList.add("cw-md");
+      el.innerHTML = renderMarkdown(text);
+    } else {
+      el.textContent = text;
+    }
     messagesEl.appendChild(el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return el;
+  }
+
+  // ------------------------- Minimal markdown renderer -------------------------
+  // Small, dependency-free subset (headers, bold/italic, inline/fenced code,
+  // links, lists, blockquotes, paragraphs) - enough for typical model output
+  // without pulling in a vendored library. Input is HTML-escaped up front so
+  // nothing the model writes (including raw HTML) is interpreted as markup.
+
+  function escapeHtml(s) {
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function renderInline(text) {
+    text = text.replace(/`([^`]+)`/g, (m, c) => `<code>${c}</code>`);
+    text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    text = text.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    text = text.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    text = text.replace(/(^|[^\w])_([^_]+)_(?!\w)/g, "$1<em>$2</em>");
+    text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return text;
+  }
+
+  function renderMarkdown(raw) {
+    const lines = escapeHtml(raw).split(/\r?\n/);
+    let html = "";
+    let i = 0;
+    let listBuffer = null; // { type: "ul"|"ol", items: [] }
+
+    function flushList() {
+      if (!listBuffer) return;
+      const tag = listBuffer.type;
+      html += `<${tag}>${listBuffer.items.map((it) => `<li>${renderInline(it)}</li>`).join("")}</${tag}>`;
+      listBuffer = null;
+    }
+
+    while (i < lines.length) {
+      const line = lines[i];
+
+      const fence = line.match(/^```(\w*)\s*$/);
+      if (fence) {
+        flushList();
+        const codeLines = [];
+        i++;
+        while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+          codeLines.push(lines[i]);
+          i++;
+        }
+        i++; // skip closing fence (if any)
+        html += `<pre><code>${codeLines.join("\n")}</code></pre>`;
+        continue;
+      }
+
+      if (!line.trim()) {
+        flushList();
+        i++;
+        continue;
+      }
+
+      const header = line.match(/^(#{1,6})\s+(.*)$/);
+      if (header) {
+        flushList();
+        const level = header[1].length;
+        html += `<h${level}>${renderInline(header[2])}</h${level}>`;
+        i++;
+        continue;
+      }
+
+      if (/^&gt;\s?/.test(line)) {
+        flushList();
+        const quoteLines = [];
+        while (i < lines.length && /^&gt;\s?/.test(lines[i])) {
+          quoteLines.push(lines[i].replace(/^&gt;\s?/, ""));
+          i++;
+        }
+        html += `<blockquote>${renderInline(quoteLines.join(" "))}</blockquote>`;
+        continue;
+      }
+
+      const ul = line.match(/^[-*]\s+(.*)$/);
+      if (ul) {
+        if (!listBuffer || listBuffer.type !== "ul") { flushList(); listBuffer = { type: "ul", items: [] }; }
+        listBuffer.items.push(ul[1]);
+        i++;
+        continue;
+      }
+
+      const ol = line.match(/^\d+\.\s+(.*)$/);
+      if (ol) {
+        if (!listBuffer || listBuffer.type !== "ol") { flushList(); listBuffer = { type: "ol", items: [] }; }
+        listBuffer.items.push(ol[1]);
+        i++;
+        continue;
+      }
+
+      flushList();
+      const paraLines = [line];
+      i++;
+      while (
+        i < lines.length && lines[i].trim() &&
+        !/^```/.test(lines[i]) && !/^#{1,6}\s/.test(lines[i]) &&
+        !/^[-*]\s+/.test(lines[i]) && !/^\d+\.\s+/.test(lines[i]) && !/^&gt;/.test(lines[i])
+      ) {
+        paraLines.push(lines[i]);
+        i++;
+      }
+      html += `<p>${renderInline(paraLines.join("<br>"))}</p>`;
+    }
+    flushList();
+    return html;
   }
 
   function setOpen(open) {
@@ -306,4 +425,20 @@
     editingPersonaId = "new";
     renderPersonas();
   };
+
+  // Public API for other widgets on the page (e.g. gantt.js's task planner)
+  // to hand off a prompt: opens the panel on the chat tab and fills the
+  // input, leaving it to the user to review and hit send.
+  function pasteToInput(text) {
+    setOpen(true);
+    tabButtons.forEach((b) => b.classList.toggle("active", b.dataset.tab === "chat"));
+    viewChat.hidden = false;
+    viewPersonas.hidden = true;
+    textarea.value = text;
+    textarea.style.height = "36px";
+    textarea.style.height = Math.min(textarea.scrollHeight, 100) + "px";
+    textarea.focus();
+  }
+
+  window.chatWidget = { pasteToInput };
 })();

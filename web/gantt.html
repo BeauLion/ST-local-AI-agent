@@ -78,17 +78,44 @@
     </div>
   </div>
 
-  <div class="panel" id="boardPanel">
-    <div class="board-panel-header">
-      <h2>Project Board</h2>
-      <div class="board-header-actions">
-        <button type="button" class="icon-toggle icon-toggle-lg board-add-toggle" id="boardAddToggle" title="Add task">&#43;</button>
-        <button type="button" class="icon-toggle board-delete-toggle" id="boardDeleteToggle" title="Delete tasks" aria-pressed="false">&#8722;</button>
-        <button type="button" class="icon-toggle board-edit-toggle" id="boardEditToggle" title="Edit tasks" aria-pressed="false">&#9998;</button>
+  <div class="board-area" id="boardArea">
+    <div class="task-sidebar" id="taskPlanner">
+      <button type="button" class="sidebar-toggle" id="taskPlannerToggle" title="Collapse">&#9664;</button>
+      <div class="task-sidebar-content" id="taskPlannerContent">
+        <h3>Task Planner</h3>
+        <p class="hint">Turn on planning mode and select task cards to see them here.</p>
+      </div>
+      <div class="task-sidebar-content task-planner-schedule" id="taskPlannerSchedule">
+        <div class="field">
+          <label for="plannerDate">Date</label>
+          <input type="date" id="plannerDate">
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="plannerStartTime">Start time</label>
+            <input type="time" id="plannerStartTime">
+          </div>
+          <div class="field">
+            <label for="plannerEndTime">End time</label>
+            <input type="time" id="plannerEndTime">
+          </div>
+        </div>
+        <button type="button" class="save" id="plannerScheduleBtn">Send to chat</button>
       </div>
     </div>
-    <p class="hint" id="boardHint">Select a project bar in the chart above to see its board here.</p>
-    <div class="board" id="board" hidden></div>
+    <div class="panel" id="boardPanel">
+      <div class="board-panel-header">
+        <h2>Project Board</h2>
+        <div class="board-header-actions">
+          <button type="button" class="icon-toggle icon-toggle-lg board-add-toggle" id="boardAddToggle" title="Add task">&#43;</button>
+          <button type="button" class="icon-toggle board-plan-toggle" id="boardPlanToggle" title="Planning mode" aria-pressed="false">&#128203;</button>
+          <button type="button" class="icon-toggle board-delete-toggle" id="boardDeleteToggle" title="Delete tasks" aria-pressed="false">&#8722;</button>
+          <button type="button" class="icon-toggle board-edit-toggle" id="boardEditToggle" title="Edit tasks" aria-pressed="false">&#9998;</button>
+        </div>
+      </div>
+      <p class="hint" id="boardHint">Select a project bar in the chart above to see its board here.</p>
+      <div class="board" id="board" hidden></div>
+    </div>
   </div>
 </div>
 
