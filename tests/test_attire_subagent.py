@@ -38,7 +38,7 @@ import pytest
 import attire_manager as am
 import attire_subagent as sa
 import console_log
-from config import AGENT_API_KEY, LLAMA_SERVER_URL
+from config import LLAMA_API_KEY, LLAMA_SERVER_URL
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,21 @@ def test_posts_to_the_configured_llama_server_chat_endpoint(tmp_attire_file, fak
 
 def test_sends_the_configured_api_key_as_a_bearer_header(tmp_attire_file, fake_llama_client, fake_main_module):
     _run("hello", "hi there")
-    assert fake_llama_client.init_kwargs["headers"]["Authorization"] == f"Bearer {AGENT_API_KEY}"
+    assert fake_llama_client.init_kwargs["headers"]["Authorization"] == f"Bearer {LLAMA_API_KEY}"
+
+
+def test_leaves_model_unset_on_the_local_backend(tmp_attire_file, fake_llama_client, fake_main_module, monkeypatch):
+    monkeypatch.setattr(sa.model_manager, "request_model", lambda: None)
+    _run("hello", "hi there")
+    _, body = fake_llama_client.calls[0]
+    assert "model" not in body
+
+
+def test_sends_the_active_llama_swap_model(tmp_attire_file, fake_llama_client, fake_main_module, monkeypatch):
+    monkeypatch.setattr(sa.model_manager, "request_model", lambda: "gemma-12b")
+    _run("hello", "hi there")
+    _, body = fake_llama_client.calls[0]
+    assert body["model"] == "gemma-12b"
 
 
 def test_request_is_non_streaming_with_auto_tool_choice(tmp_attire_file, fake_llama_client, fake_main_module):

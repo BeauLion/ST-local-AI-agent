@@ -26,22 +26,30 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # twice (here and in calendar_manager.py) is harmless - it's idempotent.
 load_dotenv(Path(PROJECT_ROOT) / ".env")
 
+# Root folder for ALL of the agent's on-disk state (every *_data/ folder,
+# agent_files/, prompt_logs/, model_state.json, runtime_settings.json).
+# Defaults to PROJECT_ROOT, i.e. exactly where it always lived. The Docker
+# image sets DATA_ROOT=/data so all state lands in one mounted volume
+# instead of inside the (throwaway) container filesystem.
+DATA_ROOT = os.path.abspath(os.getenv("DATA_ROOT", PROJECT_ROOT))
+os.makedirs(DATA_ROOT, exist_ok=True)
+
 # Full path to your llama-server.exe (llama.cpp build). Update this if you
 # ever move or reinstall llama.cpp.
 LLAMA_SERVER_EXE = os.path.join(PROJECT_ROOT, "llama.cpp", "llama-server.exe")
 
 # Sandboxed folder the write_file/read_file/list_files/search_documents
-# tools are restricted to. Relative to PROJECT_ROOT.
-SAFE_FILES_DIR = os.path.join(PROJECT_ROOT, "agent_files")
+# tools are restricted to. Relative to DATA_ROOT.
+SAFE_FILES_DIR = os.path.join(DATA_ROOT, "agent_files")
 
 # Where memory.py stores its JSON files (memories.json, doc_index.json).
-MEMORY_DATA_DIR = os.path.join(PROJECT_ROOT, "memory_data")
+MEMORY_DATA_DIR = os.path.join(DATA_ROOT, "memory_data")
 
 # Where project_manager.py stores its JSON file (projects.json).
-PROJECT_DATA_DIR = os.path.join(PROJECT_ROOT, "project_data")
+PROJECT_DATA_DIR = os.path.join(DATA_ROOT, "project_data")
 
 # Where persona_manager.py stores its JSON file (personas.json).
-PERSONA_DATA_DIR = os.path.join(PROJECT_ROOT, "persona_data")
+PERSONA_DATA_DIR = os.path.join(DATA_ROOT, "persona_data")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -50,7 +58,36 @@ PERSONA_DATA_DIR = os.path.join(PROJECT_ROOT, "persona_data")
 
 LLAMA_SERVER_HOST = "0.0.0.0"
 LLAMA_SERVER_PORT = 8080
-LLAMA_SERVER_URL = f"http://localhost:{LLAMA_SERVER_PORT}"
+
+# How the agent reaches its model:
+#   "local"      - model_manager.py launches and owns llama-server itself
+#                  (LLAMA_SERVER_EXE on this machine), as it always has.
+#   "llama-swap" - llama-server runs on ANOTHER machine behind llama-swap
+#                  (https://github.com/mostlygeek/llama-swap), which loads
+#                  models on demand by the request's "model" field. The
+#                  agent never starts/stops a process; /model/swap just
+#                  changes which llama-swap model name requests go to. The
+#                  model list, -ngl/-c/-md flags etc. then live in
+#                  llama-swap's own config.yaml on that machine (see
+#                  deploy/llama-swap/config.example.yaml), not here.
+LLAMA_BACKEND = os.getenv("LLAMA_BACKEND", "local")
+
+# Base URL of llama-server ("local") or of llama-swap ("llama-swap"), e.g.
+# "http://100.x.x.x:8080" over Tailscale. Lives in .env for the remote
+# case, same reasoning as BRIDGE_URL below: real addresses never get
+# committed to the repo.
+LLAMA_SERVER_URL = os.getenv("LLAMA_SERVER_URL", f"http://localhost:{LLAMA_SERVER_PORT}")
+
+# "llama-swap" only: the model name (a key under `models:` in llama-swap's
+# config.yaml) to use on first boot and for POST /model/reset. Empty means
+# "whichever model llama-swap lists first". After a swap, the choice
+# persists to llama_swap_state.json, same as model_state.json for "local".
+LLAMA_SWAP_DEFAULT_MODEL = os.getenv("LLAMA_SWAP_DEFAULT_MODEL", "")
+
+# "llama-swap" only: how often (seconds) the agent re-checks that llama-swap
+# is reachable, so /model/status and the chat endpoint's 503 gate reflect
+# the remote machine going down/coming back without a restart here.
+LLAMA_SWAP_POLL_SECONDS = 10
 
 # The exact model to pull/run via llama.cpp's -hf shorthand.
 #LLAMA_MODEL_REPO = "Qwen/Qwen2.5-14B-Instruct-GGUF:Q4_K_M"
@@ -107,8 +144,8 @@ def build_llama_server_command(
         "--min-p", str(LLAMA_MIN_P),
         #"--reasoning-format", LLAMA_REASONING_FORMAT,
     ]
-    if AGENT_API_KEY:
-        cmd += ["--api-key", AGENT_API_KEY]
+    if LLAMA_API_KEY:
+        cmd += ["--api-key", LLAMA_API_KEY]
     if LLAMA_USE_JINJA:
         cmd.append("--jinja")
     return cmd
@@ -152,6 +189,13 @@ AGENT_SERVER_PORT = 8100
 # main.py. Deliberately NOT applied to /projects - see handover-21.
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
 
+# Bearer key the agent sends to llama-server/llama-swap (and passes as
+# --api-key when launching llama-server itself in "local" mode). Defaults to
+# AGENT_API_KEY, which is how it has always worked. Set it separately once
+# the model runs on another machine, so a leaked SillyTavern key doesn't
+# also open up the model server.
+LLAMA_API_KEY = os.getenv("LLAMA_API_KEY") or AGENT_API_KEY
+
 # Ceiling on how many tool-call round-trips the agent will do before
 # forcing a final answer, to prevent infinite tool-calling loops.
 MAX_TOOL_ITERATIONS = 8
@@ -162,7 +206,7 @@ MAX_TOOL_ITERATIONS = 8
 # ─────────────────────────────────────────────────────────────
 
 # Folder where the exact request body sent to llama-server gets logged.
-PROMPT_LOG_DIR = os.path.join(PROJECT_ROOT, "prompt_logs")
+PROMPT_LOG_DIR = os.path.join(DATA_ROOT, "prompt_logs")
 
 # One log file is created per server run (a "session"). Every request to
 # llama-server appends one entry - full messages array, tools schema, and
@@ -392,7 +436,7 @@ CALENDAR_BATCH_DEFAULT_DURATION_MINUTES = 30
 # prompt) — NOT used by any read/write tool, which stay live. See
 # calendar_manager.refresh_cache()/get_cached_context() and handover-17
 # for why this boundary matters.
-CALENDAR_DATA_DIR = os.path.join(PROJECT_ROOT, "calendar_data")
+CALENDAR_DATA_DIR = os.path.join(DATA_ROOT, "calendar_data")
 CALENDAR_CACHE_FILE = os.path.join(CALENDAR_DATA_DIR, "context_cache.json")
 
 # How often the background timer refreshes the cache, and how far ahead
@@ -409,7 +453,7 @@ CALENDAR_CACHE_MAX_EVENTS_IN_CONTEXT = 15
 # Task duration tracking (duration_manager.py)
 # ─────────────────────────────────────────────────────────────
 
-DURATION_DATA_DIR = os.path.join(PROJECT_ROOT, "duration_data")
+DURATION_DATA_DIR = os.path.join(DATA_ROOT, "duration_data")
 
 # Confidence-state thresholds by entry count per category (see
 # brainstorm-task-duration-tracking.md - three states, not a hard cutoff).
@@ -449,7 +493,7 @@ DURATION_CATEGORY_ALIASES = {
 # Attire manager (attire_manager.py)
 # ─────────────────────────────────────────────────────────────
 
-ATTIRE_DATA_DIR = os.path.join(PROJECT_ROOT, "attire_data")
+ATTIRE_DATA_DIR = os.path.join(DATA_ROOT, "attire_data")
 
 # "accessories" is the one multi-item (list) slot; everything else is a
 # single string-or-None. See attire_manager.py's module docstring.

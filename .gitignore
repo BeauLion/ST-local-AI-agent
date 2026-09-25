@@ -59,3 +59,8 @@ browser_profile/
 
 #Claude md file
 CLAUDE.md
+# Docker: mounted state volume (personal data, see docker-compose.yml) and
+# model-selection state files
+docker-data/
+model_state.json
+llama_swap_state.json

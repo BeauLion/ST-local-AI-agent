@@ -9,6 +9,11 @@ model without a manual restart. Mirrors settings_engine.py's pattern.
                          (ngl/context/md/spec_type optional - omitted ones
                          keep whatever's currently running)
   POST /model/reset    -> swap back to config.py's own LLAMA_* defaults
+                          (LLAMA_SWAP_DEFAULT_MODEL on the llama-swap backend)
+
+On the llama-swap backend (config.LLAMA_BACKEND), /model/presets lists the
+models configured in llama-swap itself instead of config.MODEL_PRESETS, and
+a swap only needs "repo" (= the llama-swap model name).
 
 Swap and reset both return immediately with {"status": "swapping"} - the
 actual stop/start/health-check happens in a background task. Poll
@@ -19,6 +24,7 @@ done, and whether it landed on the requested model or rolled back.
 import asyncio
 from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
@@ -47,13 +53,19 @@ async def model_status():
 
 @router.get("/model/presets")
 async def model_presets():
+    if config.LLAMA_BACKEND == "llama-swap":
+        try:
+            names = await asyncio.to_thread(model_manager.list_remote_models)
+        except (httpx.HTTPError, ValueError, KeyError):
+            return []
+        return [{"label": name, "repo": name} for name in names]
     return getattr(config, "MODEL_PRESETS", [])
 
 
-def _run_swap_in_background(**kwargs):
+def _run_in_background(fn, **kwargs):
     async def _run():
         async with _swap_lock:
-            await asyncio.to_thread(model_manager.swap, **kwargs)
+            await asyncio.to_thread(fn, **kwargs)
     asyncio.create_task(_run())
 
 
@@ -65,7 +77,7 @@ async def model_swap(request: Request):
     body = await request.json()
 
     if "preset" in body:
-        presets = getattr(config, "MODEL_PRESETS", [])
+        presets = await model_presets()
         match = next((p for p in presets if p.get("label") == body["preset"]), None)
         if match is None:
             raise HTTPException(400, f"Unknown preset: {body['preset']}")
@@ -87,7 +99,7 @@ async def model_swap(request: Request):
             "spec_type": body.get("spec_type"),
         }
 
-    _run_swap_in_background(**kwargs)
+    _run_in_background(model_manager.swap, **kwargs)
     return {"status": "swapping", "target": kwargs}
 
 
@@ -96,11 +108,5 @@ async def model_reset():
     if _swap_lock.locked():
         raise HTTPException(409, "A model swap is already in progress.")
 
-    _run_swap_in_background(
-        repo=config.LLAMA_MODEL_REPO,
-        ngl=config.LLAMA_NGL,
-        context=config.LLAMA_CONTEXT,
-        md=config.LLAMA_MD,
-        spec_type=config.LLAMA_SPEC_TYPE,
-    )
-    return {"status": "swapping", "target": "config.py defaults"}
+    _run_in_background(model_manager.reset)
+    return {"status": "swapping", "target": "default model"}

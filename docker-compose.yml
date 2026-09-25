@@ -1,0 +1,34 @@
+# Runs the agent server in a container. The model runs elsewhere, behind
+# llama-swap (see deploy/llama-swap/config.example.yaml) - put its address
+# in .env as LLAMA_SERVER_URL.
+#
+#   docker compose up -d --build
+#   docker compose logs -f agent
+services:
+  agent:
+    build: .
+    image: st-local-agent:latest
+    container_name: st-local-agent
+    init: true
+    ports:
+      - "8100:8100"
+    # Secrets and machine-specific addresses (CALDAV_*, AGENT_API_KEY,
+    # LLAMA_SERVER_URL, LLAMA_API_KEY, BRIDGE_*, ...) - never baked into the image.
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Europe/Amsterdam}
+    volumes:
+      # All personal state: *_data/, agent_files/, prompt_logs/,
+      # runtime_settings.json, llama_swap_state.json.
+      - ./docker-data:/data
+      # run_python starts its sandbox containers on the HOST's Docker via
+      # this socket. Note: this gives the agent container full control of
+      # the host's Docker daemon. Remove this line (and group_add) to
+      # disable run_python instead - it then just reports Docker as
+      # unavailable.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Lets the non-root "agent" user open the socket. 0 fits Docker Desktop;
+    # on a Linux host set DOCKER_SOCKET_GID to `stat -c %g /var/run/docker.sock`.
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
+    restart: unless-stopped

@@ -62,7 +62,8 @@ import json
 import httpx
 
 import attire_manager
-from config import AGENT_API_KEY, LLAMA_SERVER_URL
+import model_manager
+from config import LLAMA_SERVER_URL
 from console_log import alog
 from prompt_log_engine import log_prompt, log_console
 
@@ -194,6 +195,9 @@ async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
         # tuned budget for legitimate output.
         "max_tokens": 500,
     }
+    # llama-swap backend: same model the main agent is on (see agent_loop).
+    if (active_model := model_manager.request_model()) is not None:
+        body["model"] = active_model
 
     # iteration is always 0 - this is a single one-shot pass, not a
     # multi-round loop, so there's no meaningful iteration to track.
@@ -214,7 +218,7 @@ async def run_attire_subagent(user_text: str, assistant_text: str) -> None:
         # with a client-side cancellation, surfacing as an empty-message
         # exception here and a "cancel task" line in llama-server's log.
         async with httpx.AsyncClient(
-            timeout=None, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}
+            timeout=None, headers=model_manager.llama_headers()
         ) as client:
             resp = await client.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json=body)
             resp.raise_for_status()

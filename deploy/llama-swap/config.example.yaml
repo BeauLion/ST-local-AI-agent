@@ -1,0 +1,48 @@
+# llama-swap config for the GPU machine (NOT part of the agent image).
+# https://github.com/mostlygeek/llama-swap
+#
+# Copy to config.yaml next to llama-swap on the GPU machine and run e.g.:
+#   llama-swap --config config.yaml --listen 0.0.0.0:8080
+# Then on the agent side, in .env:
+#   LLAMA_SERVER_URL=http://<gpu-machine>:8080
+#   LLAMA_SWAP_DEFAULT_MODEL=gemma-12b
+#
+# Each key under `models:` is a model NAME - that's what shows up as a
+# preset in the agent's Model tab, what /model/swap takes, and what the
+# agent sends as "model" in every request. The flags below mirror
+# config.build_llama_server_command(); sampling params (temp/top-p/...) are
+# sent per request by the agent anyway, these are just server defaults.
+#
+# Keep port 8080 off the public internet (Tailscale/LAN only). If you set
+# --api-key on the llama-server commands, set the same value as
+# LLAMA_API_KEY in the agent's .env.
+
+# Seconds llama-swap waits for a model to become healthy. A first-time -hf
+# download can take a while - keep this generous. (The agent gives up on a
+# swap after its own LLAMA_SWAP_TIMEOUT_SECONDS, 180 by default, and keeps
+# the previous model selected; raise that in config.py for big downloads.)
+healthCheckTimeout: 600
+
+models:
+  "gemma-12b":
+    cmd: >
+      /path/to/llama-server
+      --port ${PORT}
+      -hf HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced
+      -md /path/to/mtp-gemma-4-12B-it.gguf
+      --spec-type draft-mtp
+      -ngl 99
+      -c 32768
+      -fa on
+      --jinja
+      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0
+
+  "qwen3-14b":
+    cmd: >
+      /path/to/llama-server
+      --port ${PORT}
+      -hf Qwen/Qwen3-14B-GGUF:Q4_K_M
+      -ngl 99
+      -c 32768
+      -fa on
+      --jinja

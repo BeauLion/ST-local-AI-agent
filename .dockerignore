@@ -1,0 +1,14 @@
+# Allowlist: exclude everything, then re-include only what the agent needs
+# at runtime. Anything new added to the repo stays OUT of the image unless
+# it's listed here - dev tools, tests, personal data and secrets can't leak
+# in by accident.
+*
+
+!requirements.txt
+!*.py
+!web/
+
+# Dev/one-off scripts (match !*.py above, so excluded again explicitly)
+start.py
+audit_tool_tokens.py
+migrate_task_tags.py

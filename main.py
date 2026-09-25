@@ -14,9 +14,10 @@ Run with:
 """
 
 import asyncio
+import io
 import json
 import re
-import tempfile
+import tarfile
 import threading
 import time
 import uuid
@@ -78,7 +79,9 @@ from contextlib import asynccontextmanager
 async def lifespan(app: FastAPI):
     # llama-server is now launched and owned by THIS process (moved out of
     # start.py - see the comment at the top of the new start.py) so that
-    # /model/swap can stop and restart it on request. Blocking calls run in
+    # /model/swap can stop and restart it on request - or, on the
+    # llama-swap backend, just checks the remote machine and starts a
+    # reachability poller (see model_manager.py). Blocking calls run in
     # a thread so they don't freeze the event loop, though nothing else is
     # being served yet at this point anyway.
     await asyncio.to_thread(model_manager.startup)
@@ -382,43 +385,52 @@ def run_python(args: dict) -> str:
     except Exception as e:
         return f"Error: Docker isn't available ({e}). Is Docker Desktop running?"
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        script_path = Path(tmp_dir) / "snippet.py"
-        script_path.write_text(code, encoding="utf-8")
+    # The snippet is copied INTO the container (put_archive) rather than
+    # bind-mounted from a temp dir: a bind-mount path is resolved by the
+    # Docker daemon on the HOST, so when this agent itself runs in a
+    # container (talking to the host daemon via /var/run/docker.sock), its
+    # own temp dir doesn't exist there and /sandbox would come up empty.
+    code_bytes = code.encode("utf-8")
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        info = tarfile.TarInfo("snippet.py")
+        info.size = len(code_bytes)
+        info.mode = 0o444
+        tar.addfile(info, io.BytesIO(code_bytes))
 
-        container = None
-        try:
-            container = client.containers.run(
-                DOCKER_IMAGE,
-                command=["python", "/sandbox/snippet.py"],
-                volumes={tmp_dir: {"bind": "/sandbox", "mode": "ro"}},
-                working_dir="/sandbox",
-                network_disabled=DOCKER_NETWORK_DISABLED,   # no internet access from inside
-                mem_limit=DOCKER_MEM_LIMIT,
-                nano_cpus=DOCKER_CPU_COUNT * 1_000_000_000,  # capped at DOCKER_CPU_COUNT CPU core(s)
-                detach=True,
-            )
-            result = container.wait(timeout=DOCKER_TIMEOUT_SECONDS)
-            exit_code = result.get("StatusCode", 1)
-            logs = container.logs().decode("utf-8", errors="replace")[-3000:]
-        except docker.errors.ImageNotFound:
-            return f"Error: {DOCKER_IMAGE} image not found. Run 'docker pull {DOCKER_IMAGE}' once."
-        except Exception as e:
-            # Covers the daemon being stopped/restarted mid-session, a crashed
-            # container, etc. Drop the cached client so the *next* call
-            # reconnects fresh instead of reusing one pointed at a dead daemon.
-            _docker_client = None
-            return f"Error running sandboxed code: {e}. If Docker Desktop was closed or restarted, try again."
-        finally:
-            if container is not None:
-                try:
-                    container.remove(force=True)
-                except Exception:
-                    pass
+    container = None
+    try:
+        container = client.containers.create(
+            DOCKER_IMAGE,
+            command=["python", "/tmp/snippet.py"],
+            working_dir="/tmp",
+            network_disabled=DOCKER_NETWORK_DISABLED,   # no internet access from inside
+            mem_limit=DOCKER_MEM_LIMIT,
+            nano_cpus=DOCKER_CPU_COUNT * 1_000_000_000,  # capped at DOCKER_CPU_COUNT CPU core(s)
+        )
+        container.put_archive("/tmp", archive.getvalue())
+        container.start()
+        result = container.wait(timeout=DOCKER_TIMEOUT_SECONDS)
+        exit_code = result.get("StatusCode", 1)
+        logs = container.logs().decode("utf-8", errors="replace")[-3000:]
+    except docker.errors.ImageNotFound:
+        return f"Error: {DOCKER_IMAGE} image not found. Run 'docker pull {DOCKER_IMAGE}' once."
+    except Exception as e:
+        # Covers the daemon being stopped/restarted mid-session, a crashed
+        # container, etc. Drop the cached client so the *next* call
+        # reconnects fresh instead of reusing one pointed at a dead daemon.
+        _docker_client = None
+        return f"Error running sandboxed code: {e}. If Docker Desktop was closed or restarted, try again."
+    finally:
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
 
-        if exit_code != 0:
-            return f"Exit code {exit_code}. Output:\n{logs}"
-        return logs or "(no output, nothing was printed)"
+    if exit_code != 0:
+        return f"Exit code {exit_code}. Output:\n{logs}"
+    return logs or "(no output, nothing was printed)"
 
 
 def read_file(args: dict) -> str:
@@ -2027,7 +2039,7 @@ def verify_api_key(authorization: str = Header(default="")):
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models():
-    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as client:
+    async with httpx.AsyncClient(headers=model_manager.llama_headers()) as client:
         resp = await client.get(f"{LLAMA_SERVER_URL}/v1/models")
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
@@ -2377,7 +2389,7 @@ async def _count_tokens(client: httpx.AsyncClient, text: str) -> int | None:
     if not text:
         return 0
     try:
-        resp = await client.post(f"{LLAMA_SERVER_URL}/tokenize", json={"content": text})
+        resp = await client.post(model_manager.llama_url("/tokenize"), json={"content": text})
         resp.raise_for_status()
         return len(resp.json().get("tokens", []))
     except Exception as e:
@@ -2416,7 +2428,7 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
     happens, the server-owned tools simply get called again next turn once
     the client resolves its half and sends the follow-up request.
     """
-    async with httpx.AsyncClient(timeout=None, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as client:
+    async with httpx.AsyncClient(timeout=None, headers=model_manager.llama_headers()) as client:
         for iteration in range(MAX_TOOL_ITERATIONS):
             content = ""
             thinking = ""
@@ -2708,11 +2720,12 @@ async def chat_completions(request: Request):
     # error and the user wondering what broke.
     model_state = model_manager.status()
     if model_state["phase"] != "ready":
+        reason = model_state.get("last_error") or "model swap in progress?"
         return JSONResponse(
             status_code=503,
             content={"error": {
                 "message": f"llama-server is currently {model_state['phase']} "
-                           f"(model swap in progress?) - try again shortly.",
+                           f"({reason}) - try again shortly.",
                 "type": "model_unavailable",
             }},
         )
@@ -2738,6 +2751,11 @@ async def chat_completions(request: Request):
     # to detect tool calls early), regardless of what the client asked for.
     upstream_body = dict(body)
     upstream_body["stream"] = True
+    # llama-swap backend: route to the model /model/swap selected, not to
+    # whatever "model" SillyTavern happened to send. None on the local
+    # backend, where llama-server has exactly one model and ignores it.
+    if (active_model := model_manager.request_model()) is not None:
+        upstream_body["model"] = active_model
     upstream_body["temperature"] = runtime_settings.get("LLAMA_TEMP")
     upstream_body["top_p"] = runtime_settings.get("LLAMA_TOP_P")
     upstream_body["top_k"] = runtime_settings.get("LLAMA_TOP_K")
@@ -2971,7 +2989,7 @@ async def chat_completions(request: Request):
         ("tools_schema", tools_schema_text),
     ] + prepend_sections
 
-    async with httpx.AsyncClient(timeout=10.0, headers={"Authorization": f"Bearer {AGENT_API_KEY}"}) as tokenize_client:
+    async with httpx.AsyncClient(timeout=10.0, headers=model_manager.llama_headers()) as tokenize_client:
         counts = await asyncio.gather(
             *(_count_tokens(tokenize_client, text) for _, text in sections)
         )
@@ -2982,7 +3000,7 @@ async def chat_completions(request: Request):
     known_total = sum(c for c in counts if c is not None)
     alog(
         f"[AGENT] System prompt section sizes (tokens): {breakdown} "
-        f"| known total: {known_total} / {LLAMA_CONTEXT} context"
+        f"| known total: {known_total} / {model_manager.status().get('context') or LLAMA_CONTEXT} context"
     )
 
     upstream_body["messages"] = messages_to_prepend + upstream_body["messages"]

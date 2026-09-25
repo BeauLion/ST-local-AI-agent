@@ -35,7 +35,7 @@ from pathlib import Path
 import config
 
 _LOCK = threading.Lock()
-_OVERRIDES_PATH = Path(config.PROJECT_ROOT) / "runtime_settings.json"
+_OVERRIDES_PATH = Path(config.DATA_ROOT) / "runtime_settings.json"
 
 # ─────────────────────────────────────────────────────────────
 # Schema: name -> metadata. "default" is read from config.py so this file
