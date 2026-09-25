@@ -38,11 +38,13 @@ import calendar_manager
 import duration_manager
 import memory
 import project_manager
+import persona_manager
 from console_log import alog, flush as flush_console
 from attire_manager import AttireManagerError
 from calendar_manager import CalendarError
 from duration_manager import DurationError
 from project_manager import ProjectManagerError
+from persona_manager import PersonaManagerError
 from prompt_log_engine import log_prompt, log_console, router as prompt_log_router
 from settings_engine import router as settings_router
 from model_engine import router as model_router
@@ -2281,6 +2283,18 @@ async def gantt_chart_page():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
+@app.get("/gantt.css")
+async def gantt_chart_css():
+    css_path = Path(__file__).parent / "web" / "gantt.css"
+    return Response(content=css_path.read_text(encoding="utf-8"), media_type="text/css")
+
+
+@app.get("/gantt.js")
+async def gantt_chart_js():
+    js_path = Path(__file__).parent / "web" / "gantt.js"
+    return Response(content=js_path.read_text(encoding="utf-8"), media_type="application/javascript")
+
+
 # Vendored frappe-gantt (MIT) - kept as static files under web/ rather than
 # a CDN <script> tag, so the chart still works with no internet access at
 # all. Update by re-running `npm install frappe-gantt@<version> --no-save`
@@ -2296,6 +2310,21 @@ async def gantt_lib_js():
 async def gantt_lib_css():
     css_path = Path(__file__).parent / "web" / "frappe-gantt.css"
     return Response(content=css_path.read_text(encoding="utf-8"), media_type="text/css")
+
+
+# Floating chat widget (fab icon + popup panel) - shared static files any
+# web/ page can opt into via a <link>/<script> tag; see chat_widget.js for
+# what it talks to.
+@app.get("/chat_widget.css")
+async def chat_widget_css():
+    css_path = Path(__file__).parent / "web" / "chat_widget.css"
+    return Response(content=css_path.read_text(encoding="utf-8"), media_type="text/css")
+
+
+@app.get("/chat_widget.js")
+async def chat_widget_js():
+    js_path = Path(__file__).parent / "web" / "chat_widget.js"
+    return Response(content=js_path.read_text(encoding="utf-8"), media_type="application/javascript")
 
 
 # ---------------------------------------------------------------------------
@@ -2608,6 +2637,70 @@ async def agent_loop(upstream_body: dict, section_labels: list[str] | None = Non
         yield ("done", {"role": "assistant", "content": bail_message})
 
 
+# ---------------------------------------------------------------------------
+# Persona manager HTTP API - what the chat widget's Personas tab talks to.
+# Same trust boundary as /projects above: plain REST, no API-key gate, since
+# it's local-UI clicks rather than a model-facing endpoint.
+# ---------------------------------------------------------------------------
+
+def _persona_error(e: PersonaManagerError):
+    raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/personas")
+async def api_list_personas():
+    return await asyncio.to_thread(persona_manager.list_personas)
+
+
+@app.post("/personas")
+async def api_create_persona(request: Request):
+    body = await request.json()
+    try:
+        persona = await asyncio.to_thread(
+            persona_manager.create_persona, body.get("name", ""), body.get("content", "")
+        )
+    except PersonaManagerError as e:
+        _persona_error(e)
+    return persona
+
+
+@app.patch("/personas/{persona_id}")
+async def api_update_persona(persona_id: str, request: Request):
+    body = await request.json()
+    try:
+        persona = await asyncio.to_thread(
+            persona_manager.update_persona, persona_id,
+            name=body.get("name"), content=body.get("content"),
+        )
+    except PersonaManagerError as e:
+        _persona_error(e)
+    return persona
+
+
+@app.delete("/personas/{persona_id}")
+async def api_delete_persona(persona_id: str):
+    try:
+        await asyncio.to_thread(persona_manager.delete_persona, persona_id)
+    except PersonaManagerError as e:
+        _persona_error(e)
+    return {"deleted": persona_id}
+
+
+@app.post("/personas/select")
+async def api_select_persona(request: Request):
+    body = await request.json()
+    try:
+        await asyncio.to_thread(persona_manager.select_persona, body.get("persona_id"))
+    except PersonaManagerError as e:
+        _persona_error(e)
+    return await asyncio.to_thread(persona_manager.list_personas)
+
+
+# /webchat/completions is the same handler as /v1/chat/completions, just
+# registered without verify_api_key - it's what the web/ pages' own floating
+# chat widget calls, same local-UI trust boundary as /projects above (not
+# SillyTavern-facing, so the Bearer-key gate meant for that client doesn't apply).
+@app.post("/webchat/completions")
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request):
     # A model swap stops llama-server entirely for a window - fail fast
@@ -2724,6 +2817,17 @@ async def chat_completions(request: Request):
     }
     messages_to_prepend = [tool_instruction]
     prepend_sections = [("tool_instruction", tool_instruction["content"])]
+
+    # Chat-widget-only: the persona picked in the widget's Personas tab is
+    # sent as an extra system message. Scoped to /webchat/* so it never
+    # changes what SillyTavern (/v1/chat/completions) sees - personas are a
+    # widget concept, not something the SillyTavern character-card flow
+    # knows about.
+    if request.url.path.startswith("/webchat"):
+        selected_persona = persona_manager.get_selected_persona()
+        if selected_persona:
+            messages_to_prepend.append({"role": "system", "content": selected_persona["content"]})
+            prepend_sections.append(("persona", selected_persona["content"]))
 
     # Inject the real current date/time on EVERY request, the same pattern
     # used for project state and memory recall below. Previously the model
